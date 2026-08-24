@@ -75,11 +75,11 @@ def test_empty_tables_raises():
 
 def test_deployment_settings_default_to_none_when_absent():
     config = parse_config(VALID_YAML)
-    assert config.s3_bucket is None
-    assert config.s3_prefix is None
-    assert config.state_table is None
-    assert config.fetch_size is None
-    assert config.fail_fast is None
+    assert config.landing.bucket is None
+    assert config.landing.prefix == "landing"  # sensible default, not None
+    assert config.state.table is None
+    assert config.defaults.fetch_size is None
+    assert config.defaults.fail_fast is None
 
 
 def test_unknown_checkpoint_type_is_rejected():
@@ -149,8 +149,49 @@ defaults:
   fail_fast: false
 """
     )
-    assert config.s3_bucket == "my-landing-bucket"
-    assert config.s3_prefix == "custom-prefix"
-    assert config.state_table == "my-state-table"
-    assert config.fetch_size == 12345
-    assert config.fail_fast is False
+    assert config.landing.bucket == "my-landing-bucket"
+    assert config.landing.prefix == "custom-prefix"
+    assert config.state.table == "my-state-table"
+    assert config.defaults.fetch_size == 12345
+    assert config.defaults.fail_fast is False
+
+
+def test_yaml_section_names_are_the_public_contract():
+    """
+    The YAML shape is what lives in S3 and is edited by hand -- renaming a
+    section silently breaks every deployed config, and the failure mode is a
+    setting reverting to its default rather than an error. The internal
+    dataclass layout may change freely; these key names may not.
+    """
+    config = parse_config(VALID_YAML + """
+landing:
+  bucket: b
+  prefix: p
+
+state:
+  table: t
+
+defaults:
+  fetch_size: 123
+  fail_fast: false
+
+bronze:
+  database: d
+  location: s3://x/bronze
+  athena_output: s3://x/results/
+""")
+    assert config.landing.bucket == "b"
+    assert config.landing.prefix == "p"
+    assert config.state.table == "t"
+    assert config.defaults.fetch_size == 123
+    assert config.defaults.fail_fast is False
+    assert config.bronze.database == "d"
+
+
+def test_landing_prefix_defaults_without_a_landing_section():
+    # An absent section must not mean an absent default -- prefix has a
+    # sensible one, and a None here would build "None/<source>/..." paths.
+    config = parse_config(VALID_YAML)
+    assert config.landing.prefix == "landing"
+    assert config.landing.bucket is None
+    assert config.state.table is None

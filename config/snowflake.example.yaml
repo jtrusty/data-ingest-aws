@@ -54,7 +54,16 @@ state:
   table: my-ingestion-watermarks
 
 defaults:
-  fetch_size: 50000
+  # Rows per source batch. 10k, not a larger round number: a 1.3M-row full
+  # load of a wide fact table was OOM-killed (exit 137) at 50k on a Glue
+  # Python Shell job and completed at 10k. Python Shell is capped at
+  # 1 DPU / 16 GB and cannot be scaled up, so this is the main lever.
+  # Raise it only with a real run behind it.
+  fetch_size: 10000
+
+  # Stop the whole job at the first table failure. Tables that already
+  # committed keep their checkpoints; the failed one and everything after it
+  # retry on the next execution.
   fail_fast: true
 
 tables:

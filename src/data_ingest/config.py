@@ -58,6 +58,40 @@ class TableConfig:
 
 
 @dataclass(frozen=True)
+class LandingConfig:
+    """
+    Where extracted data lands, and how it is written.
+
+    A cohesive block rather than loose fields on IngestionConfig, matching
+    BronzeConfig -- each layer of the pipeline owns its own settings, so
+    landing-scoped options (output file sizing, S3 encryption) have an
+    obvious home instead of accumulating on the top-level config.
+    """
+
+    bucket: Optional[str] = None
+    prefix: str = "landing"
+
+
+@dataclass(frozen=True)
+class StateConfig:
+    """DynamoDB checkpoint store. See "DynamoDB state table contract" in README.md."""
+
+    table: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DefaultsConfig:
+    """
+    Execution policy. Every field here is also overridable per-run via a CLI
+    argument, since these are the knobs an operator reaches for during an
+    ad-hoc retry.
+    """
+
+    fetch_size: Optional[int] = None
+    fail_fast: Optional[bool] = None
+
+
+@dataclass(frozen=True)
 class BronzeConfig:
     """
     Landing -> Iceberg Bronze settings. Optional: a config without a
@@ -115,21 +149,16 @@ class IngestionConfig:
         """
         return f"{self.source_name}_{self.source_type}"
 
-    # Optional deployment-shape settings. These may ALSO be passed as Glue
-    # job CLI args (--state-table, --s3-bucket, ...); pipeline.run_job()
-    # resolves CLI-arg > this config > built-in default, so a CLI arg is
-    # only needed for a one-off override (e.g. an ad-hoc retry), not as
-    # boilerplate on every job/environment. Keeping these here (rather than
-    # requiring them on every `terraform apply`'s default_arguments) is
-    # deliberate: they're config for THIS source, and each environment
-    # already gets its own --config-uri (different table sets, lookback,
-    # etc), so there's no new dev/prod coupling introduced by having the
-    # bucket/state-table live alongside it.
-    s3_bucket: Optional[str] = None
-    s3_prefix: Optional[str] = None
-    state_table: Optional[str] = None
-    fetch_size: Optional[int] = None
-    fail_fast: Optional[bool] = None
+    # Deployment-shape settings, grouped per pipeline layer so each layer
+    # owns its own knobs. Every one of these may ALSO be passed as a Glue job
+    # CLI arg; run_job() resolves CLI-arg > this config > built-in default, so
+    # a CLI arg is only needed for a one-off override (an ad-hoc retry), not
+    # as boilerplate on every job definition. Keeping them here is deliberate:
+    # they're config for THIS source, and each environment already gets its
+    # own --config-uri, so nothing new couples dev and prod.
+    landing: LandingConfig = field(default_factory=LandingConfig)
+    state: StateConfig = field(default_factory=StateConfig)
+    defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
 
     # None when the config has no `bronze:` section -- ingestion to landing
     # works standalone, and Bronze is opt-in per source.
@@ -303,22 +332,25 @@ def parse_config(raw_text):
 
     # All optional -- see IngestionConfig for why these live here instead
     # of being required Glue job arguments.
-    landing = data.get("landing") or {}
-    state = data.get("state") or {}
-    defaults = data.get("defaults") or {}
-    bronze = _parse_bronze(data.get("bronze"))
+    landing_data = data.get("landing") or {}
+    state_data = data.get("state") or {}
+    defaults_data = data.get("defaults") or {}
 
     return IngestionConfig(
         source_name=source["name"],
         source_type=source["type"],
         connection=ConnectionConfig(secret_id=connection["secret_id"]),
         tables=tables,
-        s3_bucket=landing.get("bucket"),
-        s3_prefix=landing.get("prefix"),
-        state_table=state.get("table"),
-        fetch_size=defaults.get("fetch_size"),
-        fail_fast=defaults.get("fail_fast"),
-        bronze=bronze,
+        landing=LandingConfig(
+            bucket=landing_data.get("bucket"),
+            prefix=landing_data.get("prefix") or "landing",
+        ),
+        state=StateConfig(table=state_data.get("table")),
+        defaults=DefaultsConfig(
+            fetch_size=defaults_data.get("fetch_size"),
+            fail_fast=defaults_data.get("fail_fast"),
+        ),
+        bronze=_parse_bronze(data.get("bronze")),
     )
 
 

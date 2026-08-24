@@ -55,8 +55,8 @@ def run_bronze_job(argv=None):
             f"{args.config_uri!r}, or pass --bronze-database and --athena-output."
         )
 
-    s3_bucket = _resolve(args.s3_bucket, config.s3_bucket, None)
-    s3_prefix = _resolve(args.s3_prefix, config.s3_prefix, "landing")
+    s3_bucket = _resolve(args.s3_bucket, config.landing.bucket, None)
+    s3_prefix = _resolve(args.s3_prefix, config.landing.prefix, "landing")
     database = _resolve(args.bronze_database, bronze.database if bronze else None, None)
     athena_output = _resolve(args.athena_output, bronze.athena_output if bronze else None, None)
     workgroup = _resolve(
@@ -66,7 +66,7 @@ def run_bronze_job(argv=None):
         args.processed_runs_table, bronze.processed_runs_table if bronze else None, None
     )
     fail_fast = _resolve_bool(
-        args.fail_fast, config.fail_fast, True, arg_name="--fail-fast / defaults.fail_fast"
+        args.fail_fast, config.defaults.fail_fast, True, arg_name="--fail-fast / defaults.fail_fast"
     )
 
     missing = [
