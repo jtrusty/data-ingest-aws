@@ -138,11 +138,8 @@ def test_deployment_settings_parsed_when_present():
         VALID_YAML
         + """
 landing:
-  bucket: my-landing-bucket
-  prefix: custom-prefix
-
-state:
-  table: my-state-table
+  location: s3://my-landing-bucket/custom-prefix
+  checkpoint_table: my-state-table
 
 defaults:
   fetch_size: 12345
@@ -165,8 +162,7 @@ def test_yaml_section_names_are_the_public_contract():
     """
     config = parse_config(VALID_YAML + """
 landing:
-  bucket: b
-  prefix: p
+  location: s3://b/p
   checkpoint_table: t
 
 defaults:
@@ -202,7 +198,7 @@ def test_checkpoint_table_lives_under_landing():
     """
     config = parse_config(VALID_YAML + """
 landing:
-  bucket: b
+  location: s3://b/landing
   checkpoint_table: my-checkpoints
 
 bronze:
@@ -213,28 +209,6 @@ bronze:
 """)
     assert config.landing.checkpoint_table == "my-checkpoints"
     assert config.bronze.processed_runs_table == "my-processed-runs"
-
-
-def test_deprecated_state_table_still_works():
-    # A deployed config must not break mid-flight just because the key moved.
-    config = parse_config(VALID_YAML + """
-state:
-  table: legacy-table
-""")
-    assert config.landing.checkpoint_table == "legacy-table"
-
-
-def test_setting_both_spellings_is_rejected():
-    # Two spellings for one setting is how a config drifts out of sync with
-    # itself; only one can win, so refuse rather than silently pick.
-    with pytest.raises(ConfigurationError, match="Remove `state.table`"):
-        parse_config(VALID_YAML + """
-landing:
-  checkpoint_table: new-table
-
-state:
-  table: old-table
-""")
 
 
 def test_shipped_example_config_parses_and_exercises_every_section():
@@ -293,25 +267,6 @@ bronze:
 """)
     assert config.landing.bucket == "raw-zone"
     assert config.bronze.location_root == "s3://curated-zone/bronze"
-
-
-def test_deprecated_bucket_prefix_still_works():
-    config = parse_config(VALID_YAML + """
-landing:
-  bucket: legacy-bucket
-  prefix: landing
-""")
-    assert config.landing.bucket == "legacy-bucket"
-    assert config.landing.prefix == "landing"
-
-
-def test_setting_both_location_and_bucket_is_rejected():
-    with pytest.raises(ConfigurationError, match="Keep only `location`"):
-        parse_config(VALID_YAML + """
-landing:
-  location: s3://a/landing
-  bucket: b
-""")
 
 
 def test_landing_location_must_be_an_s3_uri():

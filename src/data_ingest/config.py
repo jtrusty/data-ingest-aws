@@ -15,9 +15,6 @@ import yaml
 
 from data_ingest.checkpoints import _TYPE_REGISTRY
 from data_ingest.exceptions import ConfigurationError
-from data_ingest.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -286,43 +283,17 @@ def _parse_checkpoint(data):
 
 
 def _resolve_landing_location(landing_data):
-    """
-    Accept `location` (preferred) or the older `bucket` + `prefix` pair.
-
-    The split form predates bronze and its single `location`; keeping it
-    working means a deployed config does not break, but only one spelling may
-    be present -- two ways to say the same thing is how a config drifts out
-    of sync with itself.
-    """
+    """Validate landing.location. Required; run_job names the CLI override."""
     location = landing_data.get("location")
-    bucket = landing_data.get("bucket")
-    prefix = landing_data.get("prefix")
-
-    if location and (bucket or prefix):
+    if location is None:
+        # Absent is legal here -- run_job reports it as a missing required
+        # setting alongside the --s3-bucket override that can supply it.
+        return None
+    if not str(location).startswith("s3://"):
         raise ConfigurationError(
-            "landing sets BOTH `location` and the deprecated `bucket`/`prefix`. "
-            "Keep only `location` (e.g. s3://my-bucket/landing)."
+            f"landing.location must be an s3:// URI, got {location!r}"
         )
-
-    if location:
-        if not str(location).startswith("s3://"):
-            raise ConfigurationError(
-                f"landing.location must be an s3:// URI, got {location!r}"
-            )
-        return location
-
-    if bucket:
-        logger.warning(
-            "Config uses the deprecated `landing.bucket`/`landing.prefix`; replace "
-            "them with a single `landing.location: s3://%s/%s` to match "
-            "bronze.location.",
-            bucket, (prefix or "landing").strip("/"),
-        )
-        return f"s3://{bucket}/{(prefix or 'landing').strip('/')}"
-
-    # Neither present: run_job reports this as a missing required setting,
-    # with the CLI override named alongside it.
-    return None
+    return location
 
 
 def _parse_bronze(data):
@@ -415,26 +386,7 @@ def parse_config(raw_text):
     landing_data = data.get("landing") or {}
     defaults_data = data.get("defaults") or {}
 
-    # `state.table` was the original home for the checkpoint table, before
-    # each pipeline layer owned its own state. Still accepted so a deployed
-    # config keeps working, but warned about: two spellings for one setting
-    # is exactly how a config drifts out of sync with its documentation.
     landing_location = _resolve_landing_location(landing_data)
-    checkpoint_table = landing_data.get("checkpoint_table")
-    legacy_state = (data.get("state") or {}).get("table")
-    if legacy_state and not checkpoint_table:
-        logger.warning(
-            "Config uses the deprecated `state.table`; move it to "
-            "`landing.checkpoint_table`. The checkpoint is landing's state, and "
-            "keeping it there matches bronze.processed_runs_table."
-        )
-        checkpoint_table = legacy_state
-    elif legacy_state and checkpoint_table:
-        raise ConfigurationError(
-            "Config sets BOTH `landing.checkpoint_table` and the deprecated "
-            "`state.table`. Remove `state.table` -- leaving both invites them to "
-            "drift apart, and only one can win."
-        )
 
     return IngestionConfig(
         source_name=source["name"],
@@ -443,7 +395,7 @@ def parse_config(raw_text):
         tables=tables,
         landing=LandingConfig(
             location=landing_location,
-            checkpoint_table=checkpoint_table,
+            checkpoint_table=landing_data.get("checkpoint_table"),
         ),
         defaults=DefaultsConfig(
             fetch_size=defaults_data.get("fetch_size"),

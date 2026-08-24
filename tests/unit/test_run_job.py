@@ -99,11 +99,8 @@ def test_missing_bucket_and_state_table_raises_configuration_error(config_path):
 
 YAML_DEPLOYMENT_SETTINGS = """
 landing:
-  bucket: yaml-landing-bucket
-  prefix: custom-landing-prefix
-
-state:
-  table: yaml-state-table
+  location: s3://yaml-landing-bucket/custom-landing-prefix
+  checkpoint_table: yaml-state-table
 
 defaults:
   fetch_size: 12345
