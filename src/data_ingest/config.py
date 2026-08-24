@@ -58,6 +58,33 @@ class TableConfig:
 
 
 @dataclass(frozen=True)
+class BronzeConfig:
+    """
+    Landing -> Iceberg Bronze settings. Optional: a config without a
+    `bronze:` section ingests to landing and stops there.
+
+    Note what is NOT here. The merge identity -- primary_key plus the
+    checkpoint column -- already exists on each TableConfig because
+    ingestion needs it, and it is exactly the dedup key Bronze needs. So
+    onboarding a table to Bronze requires no new per-table configuration.
+
+    This section is source-agnostic on purpose: once a run is Parquet plus
+    a valid _manifest.json under the landing layout, Bronze does not care
+    whether Snowflake, a REST API, or a CSV drop produced it.
+    """
+
+    database: str          # Glue Data Catalog database holding the Iceberg tables
+    location: str          # s3://<bucket>/bronze -- Iceberg table root
+    athena_output: str     # s3://... -- where Athena writes query results
+    athena_workgroup: str = "primary"
+    processed_runs_table: Optional[str] = None  # DynamoDB; None = re-merge every run
+
+    @property
+    def location_root(self):
+        return self.location.rstrip("/")
+
+
+@dataclass(frozen=True)
 class ConnectionConfig:
     # Only a Secrets Manager pointer -- actual credentials never live in
     # this config (see "Secrets vs config" in README.md). Database/schema/table mappings are
@@ -103,6 +130,10 @@ class IngestionConfig:
     state_table: Optional[str] = None
     fetch_size: Optional[int] = None
     fail_fast: Optional[bool] = None
+
+    # None when the config has no `bronze:` section -- ingestion to landing
+    # works standalone, and Bronze is opt-in per source.
+    bronze: Optional[BronzeConfig] = None
 
     def get_table(self, name):
         for table in self.tables:
@@ -185,6 +216,33 @@ def _parse_checkpoint(data):
     )
 
 
+def _parse_bronze(data):
+    """Parse the optional `bronze:` section. None when absent."""
+    if not data:
+        return None
+
+    required = ["database", "location", "athena_output"]
+    missing = [field_name for field_name in required if not data.get(field_name)]
+    if missing:
+        raise ConfigurationError(
+            f"bronze section is missing required field(s): {', '.join(missing)}"
+        )
+
+    for uri_field in ("location", "athena_output"):
+        if not str(data[uri_field]).startswith("s3://"):
+            raise ConfigurationError(
+                f"bronze.{uri_field} must be an s3:// URI, got {data[uri_field]!r}"
+            )
+
+    return BronzeConfig(
+        database=data["database"],
+        location=data["location"],
+        athena_output=data["athena_output"],
+        athena_workgroup=data.get("athena_workgroup", "primary"),
+        processed_runs_table=data.get("processed_runs_table"),
+    )
+
+
 def _parse_table(data):
     required = ["name", "database", "schema", "table", "primary_key"]
     missing = [field_name for field_name in required if field_name not in data]
@@ -248,6 +306,7 @@ def parse_config(raw_text):
     landing = data.get("landing") or {}
     state = data.get("state") or {}
     defaults = data.get("defaults") or {}
+    bronze = _parse_bronze(data.get("bronze"))
 
     return IngestionConfig(
         source_name=source["name"],
@@ -259,6 +318,7 @@ def parse_config(raw_text):
         state_table=state.get("table"),
         fetch_size=defaults.get("fetch_size"),
         fail_fast=defaults.get("fail_fast"),
+        bronze=bronze,
     )
 
 
