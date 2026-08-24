@@ -46,12 +46,22 @@ connection:
 # --fail-fast); a CLI arg wins when present. Setting them here means the
 # job definition only needs --config-uri, and CLI args stay reserved for
 # one-off overrides such as an ad-hoc retry.
+# Each pipeline layer owns the same two things: where its data goes, and
+# where its own state is tracked. landing.checkpoint_table and
+# bronze.processed_runs_table are the same idea one layer apart.
 landing:
   bucket: my-data-lake-bucket
   prefix: landing
 
-state:
-  table: my-ingestion-watermarks
+  # DynamoDB table holding extraction checkpoints -- how far into the source
+  # each table has been read. Named checkpoint_table rather than
+  # watermark_table because a watermark is only one kind of checkpoint; a
+  # REST source uses a cursor, a full-load source has none.
+  #
+  # Key schema: source_key (HASH), table_name (RANGE), TTL DISABLED.
+  # A TTL here silently deletes checkpoints and every affected table then
+  # does a full reload. See README "DynamoDB state table contract".
+  checkpoint_table: my-ingestion-checkpoints
 
 defaults:
   # Rows per source batch. 10k, not a larger round number: a 1.3M-row full
@@ -65,6 +75,23 @@ defaults:
   # committed keep their checkpoints; the failed one and everything after it
   # retry on the next execution.
   fail_fast: true
+
+# Optional. Omit this section entirely to ingest to landing and stop there;
+# Bronze is opt-in per source.
+#
+# bronze:
+#   database: bronze_acme                    # Glue Data Catalog database
+#   location: s3://my-data-lake-bucket/bronze
+#   athena_output: s3://my-data-lake-bucket/athena-results/
+#   athena_workgroup: primary
+#
+#   # DynamoDB table recording which landing runs have been merged. Key
+#   # schema: table_key (HASH), run_id (RANGE).
+#   #
+#   # Optional: without it every committed run is re-merged on every pass,
+#   # which is CORRECT -- the MERGE deduplicates on primary_key + watermark,
+#   # so re-merging inserts nothing -- but the cost grows with history.
+#   processed_runs_table: bronze-processed-runs
 
 tables:
     # `name` is this table's IDENTITY -- the second half of the pair, after

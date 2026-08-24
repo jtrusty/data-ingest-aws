@@ -77,7 +77,7 @@ def test_deployment_settings_default_to_none_when_absent():
     config = parse_config(VALID_YAML)
     assert config.landing.bucket is None
     assert config.landing.prefix == "landing"  # sensible default, not None
-    assert config.state.table is None
+    assert config.landing.checkpoint_table is None
     assert config.defaults.fetch_size is None
     assert config.defaults.fail_fast is None
 
@@ -151,7 +151,7 @@ defaults:
     )
     assert config.landing.bucket == "my-landing-bucket"
     assert config.landing.prefix == "custom-prefix"
-    assert config.state.table == "my-state-table"
+    assert config.landing.checkpoint_table == "my-state-table"
     assert config.defaults.fetch_size == 12345
     assert config.defaults.fail_fast is False
 
@@ -167,9 +167,7 @@ def test_yaml_section_names_are_the_public_contract():
 landing:
   bucket: b
   prefix: p
-
-state:
-  table: t
+  checkpoint_table: t
 
 defaults:
   fetch_size: 123
@@ -182,7 +180,7 @@ bronze:
 """)
     assert config.landing.bucket == "b"
     assert config.landing.prefix == "p"
-    assert config.state.table == "t"
+    assert config.landing.checkpoint_table == "t"
     assert config.defaults.fetch_size == 123
     assert config.defaults.fail_fast is False
     assert config.bronze.database == "d"
@@ -194,4 +192,46 @@ def test_landing_prefix_defaults_without_a_landing_section():
     config = parse_config(VALID_YAML)
     assert config.landing.prefix == "landing"
     assert config.landing.bucket is None
-    assert config.state.table is None
+    assert config.landing.checkpoint_table is None
+
+
+def test_checkpoint_table_lives_under_landing():
+    """
+    Structural symmetry: each pipeline layer owns its destination AND its
+    state table. landing.checkpoint_table mirrors bronze.processed_runs_table.
+    """
+    config = parse_config(VALID_YAML + """
+landing:
+  bucket: b
+  checkpoint_table: my-checkpoints
+
+bronze:
+  database: d
+  location: s3://x/bronze
+  athena_output: s3://x/results/
+  processed_runs_table: my-processed-runs
+""")
+    assert config.landing.checkpoint_table == "my-checkpoints"
+    assert config.bronze.processed_runs_table == "my-processed-runs"
+
+
+def test_deprecated_state_table_still_works():
+    # A deployed config must not break mid-flight just because the key moved.
+    config = parse_config(VALID_YAML + """
+state:
+  table: legacy-table
+""")
+    assert config.landing.checkpoint_table == "legacy-table"
+
+
+def test_setting_both_spellings_is_rejected():
+    # Two spellings for one setting is how a config drifts out of sync with
+    # itself; only one can win, so refuse rather than silently pick.
+    with pytest.raises(ConfigurationError, match="Remove `state.table`"):
+        parse_config(VALID_YAML + """
+landing:
+  checkpoint_table: new-table
+
+state:
+  table: old-table
+""")

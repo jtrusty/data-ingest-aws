@@ -405,14 +405,14 @@ def run_job(argv=None, expected_source_type=None):
     # if passed, otherwise fall back to the YAML's landing/state/defaults
     # sections, otherwise a hardcoded default. See parse_job_args().
     s3_bucket = _resolve(args.s3_bucket, config.landing.bucket, None)
-    state_table = _resolve(args.state_table, config.state.table, None)
+    state_table = _resolve(args.state_table, config.landing.checkpoint_table, None)
     s3_prefix = _resolve(args.s3_prefix, config.landing.prefix, "landing")
     fetch_size = _resolve(args.fetch_size, config.defaults.fetch_size, DEFAULT_FETCH_SIZE)
     fail_fast = _resolve_bool(args.fail_fast, config.defaults.fail_fast, True, arg_name="--fail-fast / defaults.fail_fast")
 
     missing = [
         name
-        for name, value in [("--s3-bucket / landing.bucket", s3_bucket), ("--state-table / state.table", state_table)]
+        for name, value in [("--s3-bucket / landing.bucket", s3_bucket), ("--state-table / landing.checkpoint_table", state_table)]
         if value is None
     ]
     if missing:

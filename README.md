@@ -168,14 +168,14 @@ the YAML.
 
 Only `--config-uri` is required. `--state-table`, `--s3-bucket`,
 `--s3-prefix`, `--fetch-size`, and `--fail-fast` can instead be set once in
-the config YAML's `state`/`landing`/`defaults` sections (see
+the config YAML's `landing`/`defaults` sections (see
 `config/snowflake.example.yaml`) — a CLI arg always wins if passed, so these exist
 for one-off overrides (an ad-hoc retry with a different `--fetch-size`),
 not as required boilerplate on every job definition.
 
 ```
 --config-uri     s3://<bucket>/ingestion-config/acme_snowflake.yaml (required)
---state-table    data-platform-ingestion-state                   (optional -- falls back to config YAML's state.table)
+--state-table    data-platform-checkpoints                       (optional -- falls back to config YAML's landing.checkpoint_table)
 --s3-bucket      <data-bucket>                                   (optional -- falls back to config YAML's landing.bucket)
 --s3-prefix      landing                                         (optional -- falls back to config YAML's landing.prefix, default "landing")
 --tables         all | orders | orders,customers        (default "all")
@@ -183,7 +183,7 @@ not as required boilerplate on every job definition.
 --fail-fast      true | false                                    (optional -- falls back to config YAML's defaults.fail_fast, default true)
 ```
 
-`--state-table`/`--s3-bucket` (from either source) are the only ones that
+`--state-table` / `--s3-bucket` (from either source) are the only ones that
 are actually required — the job fails fast with a clear `ConfigurationError`
 at startup if neither the CLI arg nor the config YAML provides them.
 

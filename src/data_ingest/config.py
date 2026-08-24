@@ -15,6 +15,9 @@ import yaml
 
 from data_ingest.checkpoints import _TYPE_REGISTRY
 from data_ingest.exceptions import ConfigurationError
+from data_ingest.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -60,23 +63,30 @@ class TableConfig:
 @dataclass(frozen=True)
 class LandingConfig:
     """
-    Where extracted data lands, and how it is written.
+    Where extracted data lands, how it is written, and where its extraction
+    state lives.
 
     A cohesive block rather than loose fields on IngestionConfig, matching
     BronzeConfig -- each layer of the pipeline owns its own settings, so
     landing-scoped options (output file sizing, S3 encryption) have an
     obvious home instead of accumulating on the top-level config.
+
+    `checkpoint_table` lives here for the same reason bronze keeps
+    `processed_runs_table` in its own block: the checkpoint is the LANDING
+    layer's state -- how far extraction has progressed into landing -- not a
+    free-floating concern. Each layer owns its resources and its state
+    tracking together.
+
+    Named checkpoint_table, not watermark_table: the framework's abstraction
+    is a Checkpoint, and a watermark is only one kind. A REST source uses a
+    cursor and a full-load source has none, so baking "watermark" into the
+    config key would be a lie for every non-timestamp source. See
+    data_ingest.checkpoints.
     """
 
     bucket: Optional[str] = None
     prefix: str = "landing"
-
-
-@dataclass(frozen=True)
-class StateConfig:
-    """DynamoDB checkpoint store. See "DynamoDB state table contract" in README.md."""
-
-    table: Optional[str] = None
+    checkpoint_table: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -157,7 +167,6 @@ class IngestionConfig:
     # they're config for THIS source, and each environment already gets its
     # own --config-uri, so nothing new couples dev and prod.
     landing: LandingConfig = field(default_factory=LandingConfig)
-    state: StateConfig = field(default_factory=StateConfig)
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
 
     # None when the config has no `bronze:` section -- ingestion to landing
@@ -333,8 +342,27 @@ def parse_config(raw_text):
     # All optional -- see IngestionConfig for why these live here instead
     # of being required Glue job arguments.
     landing_data = data.get("landing") or {}
-    state_data = data.get("state") or {}
     defaults_data = data.get("defaults") or {}
+
+    # `state.table` was the original home for the checkpoint table, before
+    # each pipeline layer owned its own state. Still accepted so a deployed
+    # config keeps working, but warned about: two spellings for one setting
+    # is exactly how a config drifts out of sync with its documentation.
+    checkpoint_table = landing_data.get("checkpoint_table")
+    legacy_state = (data.get("state") or {}).get("table")
+    if legacy_state and not checkpoint_table:
+        logger.warning(
+            "Config uses the deprecated `state.table`; move it to "
+            "`landing.checkpoint_table`. The checkpoint is landing's state, and "
+            "keeping it there matches bronze.processed_runs_table."
+        )
+        checkpoint_table = legacy_state
+    elif legacy_state and checkpoint_table:
+        raise ConfigurationError(
+            "Config sets BOTH `landing.checkpoint_table` and the deprecated "
+            "`state.table`. Remove `state.table` -- leaving both invites them to "
+            "drift apart, and only one can win."
+        )
 
     return IngestionConfig(
         source_name=source["name"],
@@ -344,8 +372,8 @@ def parse_config(raw_text):
         landing=LandingConfig(
             bucket=landing_data.get("bucket"),
             prefix=landing_data.get("prefix") or "landing",
+            checkpoint_table=checkpoint_table,
         ),
-        state=StateConfig(table=state_data.get("table")),
         defaults=DefaultsConfig(
             fetch_size=defaults_data.get("fetch_size"),
             fail_fast=defaults_data.get("fail_fast"),
