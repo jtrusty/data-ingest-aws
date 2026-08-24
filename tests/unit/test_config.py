@@ -391,3 +391,87 @@ def test_the_error_lists_the_keys_that_are_valid():
     # Naming the alternatives is what turns the error into a fix.
     with pytest.raises(ConfigurationError, match="fetch_size"):
         parse_config(VALID_YAML + "defaults:\n  fetch_sizee: 10\n")
+
+
+# --------------------------------------------------------------------------
+# Migration
+#
+# The gap that let a broken deploy through: every fixture was written AFTER
+# the rename, so removing backwards compatibility had no test that could
+# fail. A config deployed against an older version is a real input, and it
+# needs a fixture that looks like one.
+#
+# When a key moves, add its old spelling here. The requirement is not that
+# old configs keep working -- it is that they fail at parse time naming the
+# replacement, rather than surfacing later as a missing-setting error about
+# some different key.
+# --------------------------------------------------------------------------
+
+CONFIG_AS_DEPLOYED_BEFORE_THE_LAYER_REFACTOR = """
+source:
+  name: acme
+  type: snowflake
+
+connection:
+  secret_id: acme-secret
+
+landing:
+  bucket: my-data-lake
+  prefix: landing
+
+state:
+  table: my-watermarks
+
+defaults:
+  fetch_size: 50000
+  fail_fast: true
+
+tables:
+  - name: order_fact
+    database: D
+    schema: S
+    table: T
+    primary_key: [ORDER_KEY]
+    checkpoint:
+      type: watermark
+      column: UPDATED_AT
+"""
+
+
+def test_a_previously_valid_config_fails_with_actionable_guidance():
+    with pytest.raises(ConfigurationError) as exc_info:
+        parse_config(CONFIG_AS_DEPLOYED_BEFORE_THE_LAYER_REFACTOR)
+
+    message = str(exc_info.value)
+    # Names the stale key AND its replacement -- not just "something is
+    # missing", which is what sent someone looking in the wrong place.
+    assert "landing.bucket" in message
+    assert "landing.location" in message
+
+
+def test_the_failure_happens_at_parse_time():
+    """
+    Before any AWS call. A config error discovered after Secrets Manager and
+    DynamoDB have been touched is a worse error: it looks like a permissions
+    or resource problem rather than a typo.
+    """
+    with pytest.raises(ConfigurationError):
+        parse_config(CONFIG_AS_DEPLOYED_BEFORE_THE_LAYER_REFACTOR)
+
+
+def test_every_problem_is_reported_at_once():
+    """
+    This config lives in S3 and is edited by hand, so each error costs an
+    edit-upload-rerun cycle. Reporting one problem at a time turns a config
+    three keys out of date into three round trips -- and several stale keys
+    at once is the normal case after a rename, not an edge case.
+    """
+    with pytest.raises(ConfigurationError) as exc_info:
+        parse_config(CONFIG_AS_DEPLOYED_BEFORE_THE_LAYER_REFACTOR.replace(
+            "  fetch_size: 50000", "  fetch_sizee: 50000"
+        ))
+
+    message = str(exc_info.value)
+    for expected in ("state", "landing.bucket", "landing.prefix", "defaults.fetch_sizee"):
+        assert expected in message, f"{expected} missing from the combined report"
+    assert "4 problems" in message

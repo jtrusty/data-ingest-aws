@@ -315,22 +315,24 @@ _RENAMED_KEYS = {
 }
 
 
-def _reject_unknown_keys(section, data, known):
+def _collect_unknown_keys(section, data, known, problems):
     """
-    Fail on any key we do not recognize.
+    Append a description of every unrecognized key to `problems`.
 
-    Silently ignoring unknown keys is a bad trade for a config edited by hand
-    and deployed to S3: a typo, or a key left behind after a rename, reverts
-    that setting to its default and the job either behaves subtly differently
-    or fails much later complaining about something else entirely. Better to
-    refuse at parse time, before anything has been touched.
+    Accumulating rather than raising on the first one is deliberate. This
+    config lives in S3 and is edited by hand, so each error costs an
+    edit-upload-rerun cycle; reporting one problem at a time turns a config
+    that is three keys out of date into three round trips. A config carrying
+    several stale keys is exactly the normal case after a rename.
+
+    Silently ignoring unknown keys would be worse still: a typo, or a key
+    left behind after a rename, reverts that setting to its default and the
+    job either behaves subtly differently or fails much later complaining
+    about something else entirely.
     """
-    unknown = sorted(set(data) - set(known))
-    if not unknown:
+    if not isinstance(data, dict):
         return
-
-    problems = []
-    for key in unknown:
+    for key in sorted(set(data) - set(known)):
         replacement = _RENAMED_KEYS.get((section, key))
         where = key if section == "<root>" else f"{section}.{key}"
         if replacement:
@@ -341,7 +343,15 @@ def _reject_unknown_keys(section, data, known):
                 f"(known: {', '.join(sorted(known))})"
             )
 
-    raise ConfigurationError("; ".join(problems))
+
+def _raise_if_problems(problems):
+    if not problems:
+        return
+    if len(problems) == 1:
+        raise ConfigurationError(problems[0])
+    raise ConfigurationError(
+        "Configuration has %d problems:\n  - %s" % (len(problems), "\n  - ".join(problems))
+    )
 
 
 def _duplicates(values):
@@ -360,11 +370,6 @@ def _parse_checkpoint(data):
     if "checkpoint" not in data:
         raise ConfigurationError(f"Table '{table_name}' is missing 'checkpoint'")
     checkpoint = data["checkpoint"]
-    _reject_unknown_keys(
-        f"tables[{table_name}].checkpoint", checkpoint,
-        {"type", "column", "lookback_minutes"},
-    )
-
     if "type" not in checkpoint:
         raise ConfigurationError(f"Table '{table_name}' checkpoint is missing 'type'")
 
@@ -449,12 +454,6 @@ def _parse_bronze(data):
     if not data:
         return None
 
-    _reject_unknown_keys(
-        "bronze", data,
-        {"database", "location", "athena_output", "athena_workgroup",
-         "processed_runs_table", "partition_by"},
-    )
-
     required = ["database", "location", "athena_output"]
     missing = [field_name for field_name in required if not data.get(field_name)]
     if missing:
@@ -492,10 +491,6 @@ def _parse_bronze(data):
 
 
 def _parse_table(data):
-    _reject_unknown_keys(
-        f"tables[{data.get('name', '?')}]", data,
-        {"name", "database", "schema", "table", "primary_key", "checkpoint"},
-    )
     required = ["name", "database", "schema", "table", "primary_key"]
     missing = [field_name for field_name in required if field_name not in data]
     if missing:
@@ -521,15 +516,45 @@ def parse_config(raw_text):
     if not data or "source" not in data or "connection" not in data:
         raise ConfigurationError("Configuration must define 'source' and 'connection'")
 
-    _reject_unknown_keys(
-        "<root>", data,
-        {"source", "connection", "landing", "bronze", "defaults", "tables"},
-    )
-
     source = data["source"]
     connection = data["connection"]
-    _reject_unknown_keys("source", source, {"name", "type"})
-    _reject_unknown_keys("connection", connection, {"secret_id"})
+
+    # One pass over every section, so a config several keys out of date
+    # reports all of them at once rather than one per upload.
+    problems = []
+    _collect_unknown_keys(
+        "<root>", data,
+        {"source", "connection", "landing", "bronze", "defaults", "tables"},
+        problems,
+    )
+    _collect_unknown_keys("source", source, {"name", "type"}, problems)
+    _collect_unknown_keys("connection", connection, {"secret_id"}, problems)
+    _collect_unknown_keys(
+        "landing", data.get("landing") or {},
+        {"location", "checkpoint_table"}, problems,
+    )
+    _collect_unknown_keys(
+        "defaults", data.get("defaults") or {},
+        {"fetch_size", "fail_fast"}, problems,
+    )
+    _collect_unknown_keys(
+        "bronze", data.get("bronze") or {},
+        {"database", "location", "athena_output", "athena_workgroup",
+         "processed_runs_table", "partition_by"},
+        problems,
+    )
+    for table_entry in data.get("tables") or []:
+        label = f"tables[{table_entry.get('name', '?')}]"
+        _collect_unknown_keys(
+            label, table_entry,
+            {"name", "database", "schema", "table", "primary_key", "checkpoint"},
+            problems,
+        )
+        _collect_unknown_keys(
+            f"{label}.checkpoint", table_entry.get("checkpoint") or {},
+            {"type", "column", "lookback_minutes"}, problems,
+        )
+    _raise_if_problems(problems)
 
     tables = [_parse_table(t) for t in data.get("tables", [])]
     if not tables:
@@ -564,8 +589,6 @@ def parse_config(raw_text):
     # of being required Glue job arguments.
     landing_data = data.get("landing") or {}
     defaults_data = data.get("defaults") or {}
-    _reject_unknown_keys("landing", landing_data, {"location", "checkpoint_table"})
-    _reject_unknown_keys("defaults", defaults_data, {"fetch_size", "fail_fast"})
 
     landing_location = _resolve_landing_location(landing_data)
 

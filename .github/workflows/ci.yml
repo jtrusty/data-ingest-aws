@@ -25,7 +25,12 @@ jobs:
       - name: Install (with the Snowflake extra the Glue job actually uses)
         run: pip install -e ".[dev,snowflake]"
 
-      - run: pytest -q
+      - name: Tests, with a coverage floor
+        # A floor rather than a target. It exists to catch a whole module
+        # arriving untested -- which happened: the Bronze job and Athena
+        # client shipped at 23% and 29% while everything around them was
+        # covered, and nothing flagged it.
+        run: pytest -q --cov=data_ingest --cov-report=term-missing --cov-fail-under=90
 
       - name: Build wheel and sdist
         run: |
