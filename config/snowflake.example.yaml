@@ -82,6 +82,28 @@ bronze:
   athena_output: s3://my-data-lake-bucket/athena-results/
   athena_workgroup: primary
 
+  # Iceberg partition spec, applied when a Bronze table is CREATED.
+  # Defaults to month({checkpoint_column}) -- shown here explicitly.
+  #
+  # `{checkpoint_column}` is substituted with each table's own watermark
+  # column, so one entry covers tables that watermark on different names.
+  #
+  # Use a TRANSFORM, not a bare timestamp: month(ts) gives ~12 partitions a
+  # year, while identity partitioning a second-resolution timestamp would
+  # give one per distinct value -- thousands of tiny partitions that cost
+  # more than they save. Available: year, month, day, hour, bucket(N, col),
+  # truncate(N, col).
+  #
+  # Why the watermark and not the ingest date: pruning only happens on
+  # columns a query predicates on, and the merge matches primary_key +
+  # watermark. Ingest date cannot join that clause without breaking dedup, so
+  # its partitions would never be pruned -- strictly worse than none.
+  #
+  # `partition_by: []` disables partitioning. Note this only takes effect at
+  # CREATE TABLE time; changing it later needs an Iceberg partition-spec
+  # change, not a re-run.
+  partition_by: ["month({checkpoint_column})"]
+
   # DynamoDB table recording which landing runs have been merged.
   # Key schema: table_key (HASH), run_id (RANGE).
   #

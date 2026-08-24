@@ -17,3 +17,7 @@ from data_ingest.bronze.job import run_bronze_job
 from data_ingest.bronze.loader import load_bronze, load_table_runs
 
 __all__ = ["run_bronze_job", "load_bronze", "load_table_runs"]
+
+# Nothing here imports pandas/pyarrow, and a test asserts it stays that way:
+# this job is pure orchestration (Athena does the work), so it can run on
+# Glue's smallest Python Shell size rather than paying for 1 DPU.

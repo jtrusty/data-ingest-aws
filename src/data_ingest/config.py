@@ -8,6 +8,7 @@ source-type-agnostic dataclasses. Nothing here knows Snowflake exists;
 data_ingest.sources.registry.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -113,6 +114,15 @@ class DefaultsConfig:
     fail_fast: Optional[bool] = None
 
 
+# Partition Bronze by the month of each table's watermark column, unless the
+# config says otherwise. Chosen as the default because it is the one spec
+# that both applies to every table (they all have a checkpoint column) and
+# actually reduces cost: the merge predicates on the watermark, so Iceberg
+# prunes to the months an incoming run touches instead of scanning all of
+# Bronze. Coarse enough that partition count stays trivial.
+DEFAULT_PARTITION_BY = ("month({checkpoint_column})",)
+
+
 @dataclass(frozen=True)
 class BronzeConfig:
     """
@@ -134,6 +144,41 @@ class BronzeConfig:
     athena_output: str     # s3://... -- where Athena writes query results
     athena_workgroup: str = "primary"
     processed_runs_table: Optional[str] = None  # DynamoDB; None = re-merge every run
+
+    # Iceberg partition spec applied when a Bronze table is CREATED.
+    #
+    # Empty (the default) means unpartitioned, which is correct until query
+    # patterns are known -- but it has a real cost: MERGE INTO must scan the
+    # whole target to evaluate WHEN NOT MATCHED, so merge cost grows with
+    # Bronze rather than with the size of the incoming run.
+    #
+    # `{checkpoint_column}` is substituted with each table's own watermark
+    # column, so one setting works across tables that watermark on different
+    # column names. Partitioning on a time transform of the watermark is the
+    # high-value choice: each run covers a narrow watermark range, so Iceberg
+    # prunes to a few partitions instead of scanning everything.
+    #
+    #     partition_by: ["month({checkpoint_column})"]     # the default
+    #     partition_by: ["day({checkpoint_column})"]       # higher volume
+    #     partition_by: []                                 # explicitly none
+    #
+    # Use a TRANSFORM, not a bare timestamp column. month(ts) yields ~12
+    # partitions a year; identity partitioning on a second-resolution
+    # timestamp would yield one per distinct value -- thousands of tiny
+    # partitions, which costs more than it saves.
+    #
+    # Partitioning on the INGEST date instead would not help: pruning only
+    # happens on columns the query predicates on, and the merge's ON clause
+    # matches primary_key + watermark. Ingest date cannot join that clause --
+    # a row re-landed later must still match its earlier copy or dedup breaks
+    # -- so those partitions would never be pruned, making it strictly worse
+    # than unpartitioned.
+    #
+    # IMPORTANT: applies at CREATE TABLE time only. Setting it after a table
+    # exists changes nothing, because the loader issues CREATE TABLE IF NOT
+    # EXISTS. Iceberg supports partition evolution, but that is a separate
+    # ALTER, not a re-CREATE.
+    partition_by: tuple = DEFAULT_PARTITION_BY
 
     @property
     def location_root(self):
@@ -206,6 +251,41 @@ class IngestionConfig:
         if unknown:
             raise ConfigurationError(f"Unknown tables requested: {', '.join(unknown)}")
         return [self.get_table(name) for name in requested]
+
+
+# Glue passes every job argument as a string, so an operator disabling a
+# flag will type one of these rather than a Python bool. Matching only
+# "false" would silently treat `--fail-fast 0` / `no` / `off` as True --
+# the exact opposite of what was asked for, with no error.
+_FALSE_STRINGS = {"false", "0", "no", "off", "n", "f", ""}
+_TRUE_STRINGS = {"true", "1", "yes", "on", "y", "t"}
+
+
+def _resolve_bool(cli_value, config_value, default, arg_name="flag"):
+    """CLI-arg (a string, since argparse) > config (already a bool/None) > default."""
+    if cli_value is not None:
+        normalized = str(cli_value).strip().lower()
+        if normalized in _FALSE_STRINGS:
+            return False
+        if normalized in _TRUE_STRINGS:
+            return True
+        raise ConfigurationError(
+            f"{arg_name} expects a boolean-ish value "
+            f"(one of {sorted(_TRUE_STRINGS)} / {sorted(_FALSE_STRINGS - {''})}), "
+            f"got {cli_value!r}."
+        )
+    if config_value is not None:
+        return bool(config_value)
+    return default
+
+
+def _resolve(cli_value, config_value, default):
+    """Generic CLI-arg > config > default resolution for the rest."""
+    if cli_value is not None:
+        return cli_value
+    if config_value is not None:
+        return config_value
+    return default
 
 
 def split_s3_uri(uri):
@@ -282,6 +362,30 @@ def _parse_checkpoint(data):
     )
 
 
+# Iceberg partition transforms Athena accepts. An allowlist rather than a
+# passthrough: these land in DDL that has no bind parameters, and a typo
+# should fail at config-parse time with a clear message rather than as an
+# opaque Athena syntax error on the first Bronze run.
+_PARTITION_TRANSFORMS = ("year", "month", "day", "hour", "bucket", "truncate")
+
+_PARTITION_SPEC_PATTERN = re.compile(
+    r"^(?:"
+    r"[A-Za-z_][A-Za-z0-9_]*"                                  # bare column (identity)
+    r"|(?:%s)\(\s*[^()]*\s*\)"                                 # transform(args)
+    r")$" % "|".join(_PARTITION_TRANSFORMS)
+)
+
+
+def _validate_partition_spec(spec):
+    if not _PARTITION_SPEC_PATTERN.match(str(spec).strip()):
+        raise ConfigurationError(
+            f"bronze.partition_by entry {spec!r} is not a bare column name or a "
+            f"supported Iceberg transform "
+            f"({', '.join(t + '(...)' for t in _PARTITION_TRANSFORMS)}). "
+            f"Use e.g. \"month({{checkpoint_column}})\" or \"STORE_ID\"."
+        )
+
+
 def _resolve_landing_location(landing_data):
     """Validate landing.location. Required; run_job names the CLI override."""
     location = landing_data.get("location")
@@ -314,7 +418,21 @@ def _parse_bronze(data):
                 f"bronze.{uri_field} must be an s3:// URI, got {data[uri_field]!r}"
             )
 
+    # Absent -> the default. Explicitly empty (`partition_by: []`) -> no
+    # partitioning. Those must stay distinguishable, so this checks for the
+    # key rather than for a falsy value.
+    if "partition_by" in data:
+        partition_by = data.get("partition_by") or []
+        if isinstance(partition_by, str):
+            partition_by = [partition_by]
+    else:
+        partition_by = list(DEFAULT_PARTITION_BY)
+
+    for spec in partition_by:
+        _validate_partition_spec(spec)
+
     return BronzeConfig(
+        partition_by=tuple(partition_by),
         database=data["database"],
         location=data["location"],
         athena_output=data["athena_output"],

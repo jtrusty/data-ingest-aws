@@ -19,6 +19,9 @@ because Athena DDL has no bind parameters.
 import re
 
 from data_ingest.exceptions import ConfigurationError
+from data_ingest.logging import get_logger
+
+logger = get_logger(__name__)
 
 # run_id is a uuid4 and ingest_date is an ISO date, both produced by this
 # framework. Validated rather than escaped: anything not matching means the
@@ -112,6 +115,34 @@ def merge_sql(bronze_table, landing_table, ingest_date, run_id, primary_key, wat
     )
 
 
+def resolve_partition_spec(partition_by, checkpoint_column):
+    """
+    Substitute {checkpoint_column} per table.
+
+    One config entry -- e.g. "month({checkpoint_column})" -- therefore works
+    across tables that watermark on differently-named columns, without
+    repeating a partition spec per table.
+    """
+    if not partition_by:
+        return []
+
+    if not checkpoint_column:
+        # The default spec references {checkpoint_column}. A table without one
+        # (a future full-load-only source) is landed unpartitioned rather than
+        # failing -- an unpartitioned table is merely slower, while refusing to
+        # create it stops the pipeline over a performance setting.
+        unresolvable = [p for p in partition_by if "{checkpoint_column}" in p]
+        if unresolvable:
+            logger.warning(
+                "Ignoring partition spec %s: this table has no checkpoint column to "
+                "substitute. The Bronze table will be created unpartitioned.",
+                unresolvable,
+            )
+        return [p for p in partition_by if "{checkpoint_column}" not in p]
+
+    return [p.replace("{checkpoint_column}", checkpoint_column) for p in partition_by]
+
+
 def create_bronze_table_sql(bronze_table, columns, location, partitioned_by=None):
     """
     Create the Iceberg target if absent.
@@ -119,17 +150,30 @@ def create_bronze_table_sql(bronze_table, columns, location, partitioned_by=None
     `table_type = 'ICEBERG'` is what makes MERGE INTO available at all --
     Athena supports it only for Iceberg tables, on engine v3.
 
-    Partitioning defaults to none. Iceberg hidden partitioning can be added
-    later without rewriting data, and guessing a partition scheme before
-    query patterns are known usually produces the wrong one.
+    Partitioning is whatever bronze.partition_by resolves to, empty by
+    default. Unpartitioned is a defensible starting point -- guessing a
+    scheme before query patterns are known usually produces the wrong one,
+    and Iceberg can evolve partitioning later without rewriting data -- but
+    it is not free: MERGE INTO must scan the whole target to evaluate WHEN
+    NOT MATCHED, so merge cost grows with Bronze rather than with the run.
+
+    IF NOT EXISTS means this only ever applies to a table that does not yet
+    exist. Changing partition_by afterwards has no effect here; that needs an
+    explicit Iceberg partition-spec change.
     """
     column_ddl = ",\n  ".join(
         f"{quote_identifier(name)} {sql_type}" for name, sql_type in columns
     )
     partition_ddl = ""
     if partitioned_by:
-        spec = ", ".join(f"{quote_identifier(c)}" for c in partitioned_by)
-        partition_ddl = f"PARTITIONED BY ({spec})\n"
+        # Transforms like month(col) must NOT be quoted as identifiers --
+        # quoting would make Athena read the whole expression as a column
+        # name. Bare column names are quoted; transforms pass through, having
+        # been allowlist-validated at config-parse time.
+        rendered = [
+            c if "(" in c else quote_identifier(c) for c in partitioned_by
+        ]
+        partition_ddl = f"PARTITIONED BY ({', '.join(rendered)})\n"
 
     return (
         f"CREATE TABLE IF NOT EXISTS {quote_identifier(bronze_table)} (\n"

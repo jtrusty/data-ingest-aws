@@ -285,3 +285,44 @@ landing:
   location: s3://my-bucket/landing/
 """)
     assert config.landing.prefix == "landing"
+
+
+def test_bronze_partitions_by_watermark_month_by_default():
+    """
+    The default has to both apply to every table and actually reduce cost.
+    Partitioning on the watermark does: the merge predicates on it, so Iceberg
+    prunes to the months a run touches. Ingest date would not -- it cannot
+    appear in the merge's ON clause without breaking dedup, so its partitions
+    would never be pruned.
+    """
+    config = parse_config(VALID_YAML + """
+bronze:
+  database: d
+  location: s3://x/bronze
+  athena_output: s3://x/results/
+""")
+    assert config.bronze.partition_by == ("month({checkpoint_column})",)
+
+
+def test_partitioning_can_be_explicitly_disabled():
+    # Absent means "use the default"; an explicit empty list means "none".
+    # Those must stay distinguishable.
+    config = parse_config(VALID_YAML + """
+bronze:
+  database: d
+  location: s3://x/bronze
+  athena_output: s3://x/results/
+  partition_by: []
+""")
+    assert config.bronze.partition_by == ()
+
+
+def test_partition_spec_is_validated_against_known_transforms():
+    with pytest.raises(ConfigurationError, match="not a bare column name"):
+        parse_config(VALID_YAML + """
+bronze:
+  database: d
+  location: s3://x/bronze
+  athena_output: s3://x/results/
+  partition_by: ["month(x); DROP TABLE y"]
+""")

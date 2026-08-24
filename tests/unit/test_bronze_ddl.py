@@ -136,3 +136,45 @@ def test_identifiers_are_quoted_so_mixed_case_survives():
     )
     assert '"OrderKey"' in sql
     assert '"LastUpdate"' in sql
+
+
+# --------------------------------------------------------------------------
+# Partitioning
+# --------------------------------------------------------------------------
+
+
+def test_partition_spec_substitutes_the_tables_own_checkpoint_column():
+    # One config entry works across tables that watermark on different column
+    # names, without repeating a spec per table.
+    assert ddl.resolve_partition_spec(
+        ("month({checkpoint_column})",), "LAST_UPDATE_DTTM"
+    ) == ["month(LAST_UPDATE_DTTM)"]
+
+
+def test_transform_partitions_are_not_quoted_as_identifiers():
+    """
+    month(col) must reach Athena as an expression. Quoting it would make
+    Athena read the whole string as one column name and fail -- while a bare
+    column still needs quoting to survive mixed case.
+    """
+    sql = ddl.create_bronze_table_sql(
+        "t", [("A", "bigint")], "s3://b/t",
+        ddl.resolve_partition_spec(("month({checkpoint_column})", "STORE_ID"), "UPDATED_AT"),
+    )
+    assert "PARTITIONED BY (month(UPDATED_AT), \"STORE_ID\")" in sql
+
+
+def test_no_partition_spec_creates_an_unpartitioned_table():
+    sql = ddl.create_bronze_table_sql("t", [("A", "bigint")], "s3://b/t", [])
+    assert "PARTITIONED BY" not in sql
+
+
+def test_table_without_a_checkpoint_column_is_created_unpartitioned():
+    # A performance setting must not be able to block table creation.
+    assert ddl.resolve_partition_spec(("month({checkpoint_column})",), None) == []
+
+
+def test_literal_partition_columns_survive_a_missing_checkpoint_column():
+    assert ddl.resolve_partition_spec(
+        ("month({checkpoint_column})", "REGION"), None
+    ) == ["REGION"]

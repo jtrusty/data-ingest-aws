@@ -28,7 +28,7 @@ from typing import Optional
 
 import boto3
 
-from data_ingest.config import load_config
+from data_ingest.config import _resolve, _resolve_bool, load_config
 from data_ingest.exceptions import CheckpointConflictError, ConfigurationError
 from data_ingest.landing import LandingWriter
 from data_ingest.logging import configure_logging, get_logger
@@ -333,41 +333,6 @@ def parse_job_args(argv=None):
     # strict parse_args() would hard-fail on those.
     args, _unknown = parser.parse_known_args(argv)
     return args
-
-
-# Glue passes every job argument as a string, so an operator disabling a
-# flag will type one of these rather than a Python bool. Matching only
-# "false" would silently treat `--fail-fast 0` / `no` / `off` as True --
-# the exact opposite of what was asked for, with no error.
-_FALSE_STRINGS = {"false", "0", "no", "off", "n", "f", ""}
-_TRUE_STRINGS = {"true", "1", "yes", "on", "y", "t"}
-
-
-def _resolve_bool(cli_value, config_value, default, arg_name="flag"):
-    """CLI-arg (a string, since argparse) > config (already a bool/None) > default."""
-    if cli_value is not None:
-        normalized = str(cli_value).strip().lower()
-        if normalized in _FALSE_STRINGS:
-            return False
-        if normalized in _TRUE_STRINGS:
-            return True
-        raise ConfigurationError(
-            f"{arg_name} expects a boolean-ish value "
-            f"(one of {sorted(_TRUE_STRINGS)} / {sorted(_FALSE_STRINGS - {''})}), "
-            f"got {cli_value!r}."
-        )
-    if config_value is not None:
-        return bool(config_value)
-    return default
-
-
-def _resolve(cli_value, config_value, default):
-    """Generic CLI-arg > config > default resolution for the rest."""
-    if cli_value is not None:
-        return cli_value
-    if config_value is not None:
-        return config_value
-    return default
 
 
 def run_job(argv=None, expected_source_type=None):

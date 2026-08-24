@@ -15,10 +15,9 @@ import boto3
 from data_ingest.bronze.athena import AthenaClient
 from data_ingest.bronze.loader import load_bronze
 from data_ingest.bronze.state import NullProcessedRunStore, ProcessedRunStore
-from data_ingest.config import load_config
+from data_ingest.config import _resolve, _resolve_bool, load_config
 from data_ingest.exceptions import ConfigurationError
 from data_ingest.logging import configure_logging, get_logger
-from data_ingest.pipeline import _resolve, _resolve_bool
 
 logger = get_logger(__name__)
 
