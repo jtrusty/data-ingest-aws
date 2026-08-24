@@ -82,8 +82,17 @@ bronze:
   athena_output: s3://my-data-lake-bucket/athena-results/
   athena_workgroup: primary
 
-  # Iceberg partition spec, applied when a Bronze table is CREATED.
-  # Defaults to month({checkpoint_column}) -- shown here explicitly.
+  # OPTIONAL -- override only. Omitting this uses the default:
+  #
+  #     partition_by: ["month({checkpoint_column})"]
+  #
+  # >>> SET THIS BEFORE THE FIRST BRONZE RUN. <<<
+  #
+  # The loader issues CREATE TABLE IF NOT EXISTS, so the partition spec is
+  # applied exactly once, when the Bronze table is first created. Changing
+  # this afterwards does NOTHING: the table already exists, so the setting is
+  # read and then ignored, silently. Repartitioning an existing table means
+  # an explicit Iceberg partition-spec change in Athena, outside this config.
   #
   # `{checkpoint_column}` is substituted with each table's own watermark
   # column, so one entry covers tables that watermark on different names.
@@ -99,10 +108,13 @@ bronze:
   # watermark. Ingest date cannot join that clause without breaking dedup, so
   # its partitions would never be pruned -- strictly worse than none.
   #
-  # `partition_by: []` disables partitioning. Note this only takes effect at
-  # CREATE TABLE time; changing it later needs an Iceberg partition-spec
-  # change, not a re-run.
-  partition_by: ["month({checkpoint_column})"]
+  # `partition_by: []` disables partitioning entirely. That is a real choice,
+  # not a no-op: without it MERGE INTO scans the whole target to evaluate
+  # WHEN NOT MATCHED, so merge cost grows with Bronze rather than with the
+  # incoming run.
+  #
+  # partition_by: ["day({checkpoint_column})"]     # higher-volume tables
+  # partition_by: []                               # no partitioning
 
   # DynamoDB table recording which landing runs have been merged.
   # Key schema: table_key (HASH), run_id (RANGE).

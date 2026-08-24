@@ -221,10 +221,15 @@ Two things that look reasonable and are not:
   distinct value. Specs are validated against the transforms Athena supports
   (`year`, `month`, `day`, `hour`, `bucket`, `truncate`).
 
-**This applies at `CREATE TABLE` time only.** The loader issues `CREATE TABLE
-IF NOT EXISTS`, so changing `partition_by` after a table exists does nothing;
-that needs an Iceberg partition-spec change. Decide before the first Bronze
-run.
+**Set this before the first Bronze run.** The loader issues `CREATE TABLE IF
+NOT EXISTS`, so the partition spec is applied exactly once, when the table is
+first created. Changing it afterwards does nothing — the setting is read and
+then ignored, *silently*, because the table already exists. Repartitioning
+after the fact means an explicit Iceberg partition-spec change in Athena,
+outside this config.
+
+`partition_by` is override-only; omitting it uses the default above. The
+example config leaves it commented out for that reason.
 
 ### Consuming from Redshift
 
