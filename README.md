@@ -331,6 +331,23 @@ These exist because of the specific runtime this deploys to. Read
 `constraints-glue.txt` and the RUNTIME CONTRACT comment in `pyproject.toml`
 before touching any dependency pin.
 
+### IAM the Glue role needs
+
+Beyond S3/DynamoDB/Secrets Manager access, the role must be able to write
+logs, or the job runs blind:
+
+```
+logs:CreateLogGroup
+logs:CreateLogStream
+logs:PutLogEvents      on arn:aws:logs:*:*:log-group:/aws-glue/*
+```
+
+These come with the managed `AWSGlueServiceRole` policy, so this only bites
+on a hand-rolled least-privilege role. The log groups are created lazily on
+first write, so a missing permission shows up as "log group does not exist"
+rather than an access error — indistinguishable at a glance from a job that
+never ran.
+
 ### The Glue job definition
 
 The job's correctness and durability depend on four settings that live in
