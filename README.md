@@ -12,23 +12,28 @@ pipeline.
 ```
 Source (Snowflake, ...)
   |
+  |   Glue Python Shell: jobs/landing_load_snowflake.py   (one per source type)
   v
-Glue Python Shell job (jobs/landing_load_snowflake.py)
+S3 Landing        immutable Parquet, one run_id prefix per run,
+  |               committed by _manifest.json
+  |               checkpoint -> DynamoDB
   |
-  +-- data_ingest wheel (this package)
-  |
-  +-- source/table YAML config
-  |
+  |   Glue Python Shell: jobs/bronze_load.py              (one, for every source)
   v
-S3 Landing (immutable, run_id-partitioned Parquet + _manifest.json)
-  |
+Bronze            Apache Iceberg via Athena MERGE INTO,
+  |               deduplicated on primary_key + watermark
   v
-Bronze Loader (separate project, not part of this repo) -> Iceberg -> Redshift/Athena
+Redshift Spectrum / Athena
 ```
 
-Something else should own infrastructure (S3, Glue job, IAM, DynamoDB, Secrets Manager
-references). This package owns extraction/transaction logic. Neither should
-know about the other's internals.
+Both jobs ship in the same wheel and read the same config file. Landing is
+the normalization boundary: once a run is Parquet plus a valid manifest in
+the standard layout, Bronze does not care which source produced it, so one
+Bronze job serves Snowflake, REST, and CSV sources alike.
+
+Infrastructure (S3, Glue jobs, IAM, DynamoDB, Secrets Manager, the Glue
+catalog database) is owned elsewhere. This package owns extraction and
+transaction logic. Neither should know the other's internals.
 
 ## Package layout
 
@@ -48,6 +53,14 @@ src/data_ingest/
   checkpoints/
     base.py         Checkpoint interface
     watermark.py    single-column watermark checkpoint (+ optional lookback_minutes)
+  bronze/
+    loader.py       orchestration: discover runs -> merge -> record processed
+    discovery.py    committed landing runs (skips anything without a manifest)
+    ddl.py          MERGE / ADD PARTITION / CREATE TABLE generation
+    athena.py       submit a statement, poll to a terminal state, fail loudly
+    state.py        which runs have been merged (a cost optimization, not
+                    correctness -- the merge is idempotent)
+    job.py          Glue entry point
 
 jobs/                      thin Glue entry points, named <layer>_load[_<source>]:
   landing_load_snowflake.py  source -> landing. One per source type, because
@@ -130,10 +143,106 @@ source type, while `database`/`schema`/`table` is a relational concept a
 REST or CSV adapter would have to fabricate. Path depth stays constant at
 `landing/<source>/<table>/…` no matter what the source is.
 
+## Bronze
+
+Optional, and opt-in per source: a config with no `bronze:` section ingests
+to landing and stops there.
+
+Per table, per committed landing run:
+
+```
+ALTER TABLE ... ADD PARTITION   register the run's prefix
+MERGE INTO bronze ...           insert rows not already present
+record run_id processed         DynamoDB
+```
+
+Athena does the compute, so rows never pass through the job process. The
+1 DPU / 16 GB ceiling that forces batching on the ingestion side does not
+apply here at any table size — which is also why the Bronze job can run on
+Glue's **smallest** Python Shell size (0.0625 DPU) rather than 1.
+
+The merge:
+
+```sql
+MERGE INTO "acme_snowflake_order_fact" AS target
+USING (SELECT * FROM "landing_acme_snowflake_order_fact"
+       WHERE ingest_date = '...' AND run_id = '...') AS source
+   ON target."ORDER_KEY" = source."ORDER_KEY"
+  AND target."LAST_UPDATE_DTTM" = source."LAST_UPDATE_DTTM"
+WHEN NOT MATCHED THEN INSERT *
+```
+
+**The dedup keys are already in your config.** `primary_key` and
+`checkpoint.column` exist because ingestion needs them, and they are exactly
+the identity Bronze deduplicates on. Onboarding a table to Bronze requires no
+new per-table configuration.
+
+Three properties follow from `WHEN NOT MATCHED THEN INSERT`:
+
+- **Lookback duplicates collapse.** Re-extracting a trailing window
+  deliberately re-lands rows already in Bronze; they match and are not
+  inserted again.
+- **Re-merging a run is a no-op**, so idempotency is a property of the SQL
+  rather than the bookkeeping. A crash between merging and recording a run is
+  therefore harmless — the same fail-safe shape as a crash between manifest
+  and checkpoint on the ingestion side.
+- **History is retained.** The watermark is part of the match key, so three
+  versions of one primary key at three watermark values stay three rows.
+  There is deliberately no `WHEN MATCHED` clause; collapsing to current state
+  belongs downstream in Redshift.
+
+A landing run without a `_manifest.json` is ignored — a crashed or
+OOM-killed extraction leaves Parquet behind, and the ingestion job
+deliberately does not clean up after itself. A run with an *unreadable*
+manifest raises instead: it claimed to commit, so skipping it would silently
+drop data.
+
+### Partitioning
+
+`bronze.partition_by` defaults to `["month({checkpoint_column})"]`, with
+`{checkpoint_column}` substituted per table so one entry covers tables that
+watermark on different column names.
+
+Unpartitioned Bronze is correct but not free: `MERGE INTO` must scan the
+whole target to evaluate `WHEN NOT MATCHED`, so merge cost grows with Bronze
+rather than with the incoming run. Partitioning on the watermark fixes that,
+because the merge predicates on it and Iceberg can prune to the months a run
+touches.
+
+Two things that look reasonable and are not:
+
+- **Partitioning by ingest date does not help.** Pruning only happens on
+  columns a query predicates on, and ingest date cannot join the merge's `ON`
+  clause without breaking dedup — a row re-landed later must still match its
+  earlier copy. Those partitions would never be pruned, making it strictly
+  worse than none.
+- **Never partition on a bare timestamp.** `month(ts)` yields ~12 partitions
+  a year; identity partitioning a second-resolution column yields one per
+  distinct value. Specs are validated against the transforms Athena supports
+  (`year`, `month`, `day`, `hour`, `bucket`, `truncate`).
+
+**This applies at `CREATE TABLE` time only.** The loader issues `CREATE TABLE
+IF NOT EXISTS`, so changing `partition_by` after a table exists does nothing;
+that needs an Iceberg partition-spec change. Decide before the first Bronze
+run.
+
+### Consuming from Redshift
+
+```sql
+CREATE EXTERNAL SCHEMA bronze
+FROM DATA CATALOG DATABASE 'bronze_acme'
+IAM_ROLE 'arn:aws:iam::<account>:role/<redshift-role>';
+
+SELECT * FROM bronze.acme_snowflake_order_fact;
+```
+
+Redshift reads the Iceberg tables in place through the Glue Data Catalog —
+no copy, no second storage location.
+
 ## Configuring a source
 
-See `config/snowflake.example.yaml` for a fully commented template. The
-shape:
+See `config/snowflake.example.yaml` for the fully commented template — it
+is parsed by the test suite, so it cannot drift from the code. The shape:
 
 ```yaml
 source:
@@ -142,6 +251,20 @@ source:
 
 connection:
   secret_id: acme-snowflake-ro  # Secrets Manager ID, not the credentials
+
+landing:
+  location: s3://my-data-lake-bucket/landing
+  checkpoint_table: my-ingestion-checkpoints
+
+bronze:                          # omit entirely to stop at landing
+  database: bronze_acme
+  location: s3://my-data-lake-bucket/bronze
+  athena_output: s3://my-data-lake-bucket/athena-results/
+  processed_runs_table: bronze-processed-runs
+
+defaults:
+  fetch_size: 10000
+  fail_fast: true
 
 tables:
   - name: order_fct             # identity: landing segment + DynamoDB sort key
@@ -168,6 +291,83 @@ Snowflake credentials (`account`, `username`, `password`, `warehouse`,
 `role`) live in Secrets Manager, referenced by `connection.secret_id`.
 Database/schema/table mappings are configuration, not secrets, and live in
 the YAML.
+
+## AWS resources you must create
+
+None of these are created by the code; it fails loudly if they are missing.
+
+### DynamoDB: extraction checkpoints  (`landing.checkpoint_table`)
+
+```
+partition key   source_key (String)   "acme_snowflake"   (= source.name_source.type)
+sort key        table_name (String)   "order_fact"
+TTL             DISABLED
+PITR            recommended
+```
+
+TTL must stay off. A TTL here silently deletes checkpoints, and every
+affected table then does a full reload — expensive and, on a large table,
+not obviously distinguishable from a first run.
+
+PITR matters more than it looks: this table is the only thing preventing a
+full re-extraction of every table. Lose it and everything reloads.
+
+```bash
+aws dynamodb create-table \
+  --table-name data-platform-checkpoints --region us-east-2 \
+  --billing-mode PAY_PER_REQUEST \
+  --attribute-definitions \
+      AttributeName=source_key,AttributeType=S \
+      AttributeName=table_name,AttributeType=S \
+  --key-schema \
+      AttributeName=source_key,KeyType=HASH \
+      AttributeName=table_name,KeyType=RANGE
+
+aws dynamodb update-continuous-backups \
+  --table-name data-platform-checkpoints --region us-east-2 \
+  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true
+```
+
+### DynamoDB: merged Bronze runs  (`bronze.processed_runs_table`)
+
+Only needed if you use Bronze. Optional even then — without it every
+committed run is re-merged on every pass, which is *correct* (the merge
+deduplicates, so re-merging inserts nothing) but costs more as history
+accumulates.
+
+```
+partition key   table_key (String)   "acme_snowflake:order_fact"
+sort key        run_id    (String)
+```
+
+```bash
+aws dynamodb create-table \
+  --table-name bronze-processed-runs --region us-east-2 \
+  --billing-mode PAY_PER_REQUEST \
+  --attribute-definitions \
+      AttributeName=table_key,AttributeType=S \
+      AttributeName=run_id,AttributeType=S \
+  --key-schema \
+      AttributeName=table_key,KeyType=HASH \
+      AttributeName=run_id,KeyType=RANGE
+```
+
+### Glue Data Catalog database  (`bronze.database`)
+
+```bash
+aws glue create-database --region us-east-2 \
+  --database-input '{"Name":"bronze_acme"}'
+```
+
+### Secrets Manager
+
+One secret per source, holding the connection credentials only — never
+database/schema/table mappings, which are configuration:
+
+```json
+{"account": "...", "username": "...", "password": "...",
+ "warehouse": "...", "role": "..."}
+```
 
 ## Glue job arguments
 
@@ -196,8 +396,8 @@ at startup if neither the CLI arg nor the config YAML provides them.
 mutable `latest` path:
 
 ```
---extra-py-files s3://<artifact-bucket>/python/data_ingest/0.1.0/data_ingest-0.1.0-py3-none-any.whl
---additional-python-modules snowflake-connector-python==3.0.4
+--extra-py-files s3://<artifact-bucket>/python/data_ingest/<version>/data_ingest-<version>-py3-none-any.whl
+--additional-python-modules snowflake-connector-python[pandas]==3.0.4
 ```
 
 ## Local development
@@ -230,7 +430,7 @@ iterating.
 
 ```bash
 mise run build
-# dist/data_ingest-0.1.0-py3-none-any.whl
+# dist/data_ingest-<version>-py3-none-any.whl
 ```
 
 Upload to a **versioned** S3 path (`python/data_ingest/<version>/...`),
@@ -336,10 +536,20 @@ These exist because of the specific runtime this deploys to. Read
 `constraints-glue.txt` and the RUNTIME CONTRACT comment in `pyproject.toml`
 before touching any dependency pin.
 
-### IAM the Glue role needs
+### IAM the Glue roles need
 
-Beyond S3/DynamoDB/Secrets Manager access, the role must be able to write
-logs, or the job runs blind:
+The **landing** role needs Secrets Manager `GetSecretValue`, S3
+`PutObject`/`GetObject`/`ListBucket` on the landing prefix, and DynamoDB
+`GetItem`/`PutItem` on the checkpoint table. Deliberately **not**
+`s3:DeleteObject` — landing is immutable, and lifecycle owns retention.
+
+The **Bronze** role needs S3 read on landing plus read/write on the Bronze
+prefix and the Athena output location, DynamoDB `Query`/`PutItem` on the
+processed-runs table, Athena `StartQueryExecution`/`GetQueryExecution`/
+`StopQueryExecution`, and Glue Data Catalog access for the databases and
+tables it creates and merges into.
+
+Both roles must be able to write logs, or the job runs blind:
 
 ```
 logs:CreateLogGroup
@@ -353,21 +563,41 @@ first write, so a missing permission shows up as "log group does not exist"
 rather than an access error — indistinguishable at a glance from a job that
 never ran.
 
-### The Glue job definition
+### The two Glue job definitions
 
-The job's correctness and durability depend on four settings that live in
-the job definition, not in this repo:
+Both use the same wheel and the same config file; they differ in script,
+sizing, and which extras they need.
+
+**Landing job** — `jobs/landing_load_snowflake.py`, one per source type:
 
 ```
---library-set          analytics    # REQUIRED: supplies pandas/numpy/boto3
+Python version         3.9
+Max capacity           1              # smallest that fits a 10k-row batch
+MaxConcurrentRuns      1              # cheapest defense against a checkpoint race
+--library-set          analytics      # REQUIRED: supplies pandas/numpy/boto3
 --additional-python-modules  snowflake-connector-python[pandas]==3.0.4
 --extra-py-files       s3://<artifact-bucket>/python/data_ingest/<version>/data_ingest-<version>-py3-none-any.whl
-MaxConcurrentRuns      1            # cheapest defense against a checkpoint race
+--config-uri           s3://<bucket>/ingestion-config/<source>_<type>.yaml
 ```
 
 The `[pandas]` extra is **load-bearing**: Glue's analytics library-set does
 not ship pyarrow, and that extra is what supplies it (pinned by the
 connector to `>=10.0.1,<10.1.0`). Dropping `[pandas]` breaks Parquet writing.
+
+**Bronze job** — `jobs/bronze_load.py`, one total, whatever the source:
+
+```
+Python version         3.9
+Max capacity           0.0625         # 16x cheaper; Athena does the work
+--extra-py-files       s3://<artifact-bucket>/python/data_ingest/<version>/data_ingest-<version>-py3-none-any.whl
+--config-uri           s3://<bucket>/ingestion-config/<source>_<type>.yaml
+```
+
+Note what the Bronze job does **not** need: no `--library-set`, no
+`--additional-python-modules`, no Snowflake connector. It imports no pandas
+or pyarrow (asserted in tests), which is what lets it run at the smallest
+capacity. It never opens a source connection — it reads the landing layout
+and drives Athena.
 
 ### Dependency pins
 
@@ -449,49 +679,3 @@ another way.
   `TIMESTAMP_TYPE_MAPPING=TIMESTAMP_NTZ` at connect time, so a change to an
   account or role default can't silently reinterpret a stored watermark.
 
-### DynamoDB state table contract
-
-```
-partition key   source_key (String)   e.g. "acme_snowflake"  (= name_type)
-sort key        table_name (String)   e.g. "order_fct"
-TTL             DISABLED  -- a TTL here silently deletes checkpoints, and
-                             every affected table then does a full reload
-PITR            recommended
-```
-
-Create it with:
-
-```bash
-aws dynamodb create-table \
-  --table-name data-platform-watermarks \
-  --region us-east-2 \
-  --billing-mode PAY_PER_REQUEST \
-  --attribute-definitions \
-      AttributeName=source_key,AttributeType=S \
-      AttributeName=table_name,AttributeType=S \
-  --key-schema \
-      AttributeName=source_key,KeyType=HASH \
-      AttributeName=table_name,KeyType=RANGE
-
-aws dynamodb update-continuous-backups \
-  --table-name data-platform-watermarks --region us-east-2 \
-  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true
-```
-
-The composite key is deliberate: it makes "every checkpoint for this source"
-a single `Query` (`DynamoDBStateStore.list_for_source`), which is what
-staleness monitoring and an on-call "did everything run last night?" check
-need. A single opaque partition key would force a full table `Scan`.
-
-`source_name` and `source_type` are also written as their own attributes.
-They're redundant with `source_key` by construction, but they keep the table
-readable in the console and let a filter target either without
-string-splitting the key.
-
-Note the key is **not** `DATABASE.SCHEMA.TABLE` — see "Identity". A table
-still using the original script's `table_name`-only partition key must be
-recreated; DynamoDB cannot change a key schema in place.
-
-Point-in-time recovery matters more than it looks: this table is the only
-thing preventing a full re-extraction of every table. If it's lost, every
-table sees no prior checkpoint and does a full load on the next run.
