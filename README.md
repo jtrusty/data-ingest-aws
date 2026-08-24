@@ -13,7 +13,7 @@ pipeline.
 Source (Snowflake, ...)
   |
   v
-Glue Python Shell job (jobs/snowflake_ingest.py)
+Glue Python Shell job (jobs/landing_load_snowflake.py)
   |
   +-- data_ingest wheel (this package)
   |
@@ -49,8 +49,13 @@ src/data_ingest/
     base.py         Checkpoint interface
     watermark.py    single-column watermark checkpoint (+ optional lookback_minutes)
 
-jobs/snowflake_ingest.py   thin Glue entry point (imports SnowflakeSource to fail
-                           fast, and asserts the config's source.type)
+jobs/                      thin Glue entry points, named <layer>_load[_<source>]:
+  landing_load_snowflake.py  source -> landing. One per source type, because
+                             each asserts its own source.type and imports its
+                             adapter eagerly to fail fast on a bad runtime.
+  bronze_load.py             landing -> bronze. No source suffix: landing is
+                             the normalization boundary, so one script serves
+                             every source.
 config/snowflake.example.yaml  example config; real ones are gitignored
 constraints-glue.txt       frozen dependency set matching the Glue runtime
 tests/unit/                pytest suite (moto-mocked AWS)

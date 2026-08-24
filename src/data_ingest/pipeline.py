@@ -13,7 +13,7 @@ data_ingest.sources.registry. That split is what lets a new source type
 registry line -- without touching this file or re-implementing the
 failure/retry guarantees.
 
-run_job() is the function the thin Glue script (jobs/snowflake_ingest.py)
+run_job() is the function the thin Glue script (jobs/landing_load_snowflake.py)
 calls; run_table() is the reusable per-table transaction it's built on top
 of, and is also what the test suite exercises directly with a fake Source.
 """
@@ -375,7 +375,7 @@ def run_job(argv=None, expected_source_type=None):
     Thin, source-type-agnostic entry point. Loads config, builds a source
     per configured table type, and runs each requested table through the
     generic pipeline (run_table). This is the function each per-source Glue
-    script (e.g. jobs/snowflake_ingest.py) calls -- the Glue script itself
+    script (e.g. jobs/landing_load_snowflake.py) calls -- the Glue script itself
     stays a couple of lines.
 
     expected_source_type: optional sanity check. A per-source job script

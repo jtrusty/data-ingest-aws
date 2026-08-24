@@ -2,7 +2,7 @@
 """
 Glue Python Shell entry point for Landing -> Iceberg Bronze.
 
-Same shape as jobs/snowflake_ingest.py: all logic lives in the data_ingest
+Same shape as jobs/landing_load_snowflake.py: all logic lives in the data_ingest
 wheel (--extra-py-files), and this script just runs it.
 
 Unlike the ingestion job, this one is source-agnostic -- there is no
