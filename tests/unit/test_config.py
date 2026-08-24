@@ -326,3 +326,68 @@ bronze:
   athena_output: s3://x/results/
   partition_by: ["month(x); DROP TABLE y"]
 """)
+
+
+# --------------------------------------------------------------------------
+# Unknown keys
+#
+# Silently ignoring an unrecognized key is a bad trade for a config that is
+# hand-edited and deployed to S3: a typo, or a key left behind after a
+# rename, reverts that setting to its default. The job then behaves subtly
+# differently, or -- as happened -- fails much later complaining about a
+# DIFFERENT setting being missing, sending you looking in the wrong place.
+# --------------------------------------------------------------------------
+
+
+def test_renamed_landing_keys_name_their_replacement():
+    with pytest.raises(ConfigurationError) as exc_info:
+        parse_config(VALID_YAML + """
+landing:
+  bucket: b
+  prefix: landing
+""")
+    message = str(exc_info.value)
+    assert "landing.bucket" in message
+    assert "landing.location" in message, "must say what to write instead"
+
+
+def test_removed_top_level_state_section_names_its_replacement():
+    with pytest.raises(ConfigurationError, match="landing.checkpoint_table"):
+        parse_config(VALID_YAML + """
+state:
+  table: my-watermarks
+""")
+
+
+@pytest.mark.parametrize(
+    "extra, expected",
+    [
+        ("defaults:\n  fetch_sizee: 10\n", "defaults.fetch_sizee"),
+        ("landing:\n  locaiton: s3://b/p\n", "landing.locaiton"),
+        ("bronze:\n  database: d\n  location: s3://x/b\n"
+         "  athena_output: s3://x/r/\n  partitoin_by: []\n", "bronze.partitoin_by"),
+    ],
+)
+def test_typos_are_rejected_rather_than_ignored(extra, expected):
+    with pytest.raises(ConfigurationError, match=r"not a recognized setting"):
+        parse_config(VALID_YAML + extra)
+
+
+def test_typo_inside_a_table_entry_is_rejected():
+    bad = VALID_YAML.replace("      - RESERVATION_ID", "      - ORDER_ID").replace(
+        "    primary_key:", "    primary_keys:", 1
+    )
+    with pytest.raises(ConfigurationError):
+        parse_config(bad)
+
+
+def test_typo_inside_a_checkpoint_block_is_rejected():
+    bad = VALID_YAML.replace("      column: UPDATED_AT", "      colunm: UPDATED_AT", 1)
+    with pytest.raises(ConfigurationError, match="colunm"):
+        parse_config(bad)
+
+
+def test_the_error_lists_the_keys_that_are_valid():
+    # Naming the alternatives is what turns the error into a fix.
+    with pytest.raises(ConfigurationError, match="fetch_size"):
+        parse_config(VALID_YAML + "defaults:\n  fetch_sizee: 10\n")

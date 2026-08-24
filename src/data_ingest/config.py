@@ -304,6 +304,46 @@ def split_s3_uri(uri):
     return bucket, prefix.strip("/")
 
 
+# Keys that moved. Mapping them to their replacement turns "your setting was
+# silently ignored" into "here is exactly what to write instead", which is the
+# difference between a five-second fix and reading the source.
+_RENAMED_KEYS = {
+    ("landing", "bucket"): "landing.location (a full s3:// URI)",
+    ("landing", "prefix"): "landing.location (a full s3:// URI)",
+    ("<root>", "state"): "landing.checkpoint_table",
+    ("state", "table"): "landing.checkpoint_table",
+}
+
+
+def _reject_unknown_keys(section, data, known):
+    """
+    Fail on any key we do not recognize.
+
+    Silently ignoring unknown keys is a bad trade for a config edited by hand
+    and deployed to S3: a typo, or a key left behind after a rename, reverts
+    that setting to its default and the job either behaves subtly differently
+    or fails much later complaining about something else entirely. Better to
+    refuse at parse time, before anything has been touched.
+    """
+    unknown = sorted(set(data) - set(known))
+    if not unknown:
+        return
+
+    problems = []
+    for key in unknown:
+        replacement = _RENAMED_KEYS.get((section, key))
+        where = key if section == "<root>" else f"{section}.{key}"
+        if replacement:
+            problems.append(f"`{where}` has moved -- use `{replacement}`")
+        else:
+            problems.append(
+                f"`{where}` is not a recognized setting "
+                f"(known: {', '.join(sorted(known))})"
+            )
+
+    raise ConfigurationError("; ".join(problems))
+
+
 def _duplicates(values):
     """Return the sorted set of values appearing more than once."""
     seen = set()
@@ -320,6 +360,10 @@ def _parse_checkpoint(data):
     if "checkpoint" not in data:
         raise ConfigurationError(f"Table '{table_name}' is missing 'checkpoint'")
     checkpoint = data["checkpoint"]
+    _reject_unknown_keys(
+        f"tables[{table_name}].checkpoint", checkpoint,
+        {"type", "column", "lookback_minutes"},
+    )
 
     if "type" not in checkpoint:
         raise ConfigurationError(f"Table '{table_name}' checkpoint is missing 'type'")
@@ -405,6 +449,12 @@ def _parse_bronze(data):
     if not data:
         return None
 
+    _reject_unknown_keys(
+        "bronze", data,
+        {"database", "location", "athena_output", "athena_workgroup",
+         "processed_runs_table", "partition_by"},
+    )
+
     required = ["database", "location", "athena_output"]
     missing = [field_name for field_name in required if not data.get(field_name)]
     if missing:
@@ -442,6 +492,10 @@ def _parse_bronze(data):
 
 
 def _parse_table(data):
+    _reject_unknown_keys(
+        f"tables[{data.get('name', '?')}]", data,
+        {"name", "database", "schema", "table", "primary_key", "checkpoint"},
+    )
     required = ["name", "database", "schema", "table", "primary_key"]
     missing = [field_name for field_name in required if field_name not in data]
     if missing:
@@ -467,8 +521,15 @@ def parse_config(raw_text):
     if not data or "source" not in data or "connection" not in data:
         raise ConfigurationError("Configuration must define 'source' and 'connection'")
 
+    _reject_unknown_keys(
+        "<root>", data,
+        {"source", "connection", "landing", "bronze", "defaults", "tables"},
+    )
+
     source = data["source"]
     connection = data["connection"]
+    _reject_unknown_keys("source", source, {"name", "type"})
+    _reject_unknown_keys("connection", connection, {"secret_id"})
 
     tables = [_parse_table(t) for t in data.get("tables", [])]
     if not tables:
@@ -503,6 +564,8 @@ def parse_config(raw_text):
     # of being required Glue job arguments.
     landing_data = data.get("landing") or {}
     defaults_data = data.get("defaults") or {}
+    _reject_unknown_keys("landing", landing_data, {"location", "checkpoint_table"})
+    _reject_unknown_keys("defaults", defaults_data, {"fetch_size", "fail_fast"})
 
     landing_location = _resolve_landing_location(landing_data)
 
