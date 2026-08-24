@@ -235,3 +235,32 @@ landing:
 state:
   table: old-table
 """)
+
+
+def test_shipped_example_config_parses_and_exercises_every_section():
+    """
+    The example is what people copy, so a mistake in it propagates into every
+    new source. Parsing it here means a typo fails the build instead of
+    silently shipping -- which is exactly the gap that existed while the
+    bronze block was commented out and therefore never validated by anything.
+    """
+    import pathlib
+
+    from data_ingest.config import load_config
+
+    example = pathlib.Path(__file__).parents[2] / "config" / "snowflake.example.yaml"
+    assert example.exists(), f"example config missing at {example}"
+
+    config = load_config(str(example))
+
+    # Both layers present, so the symmetry the file demonstrates is real
+    # rather than aspirational.
+    assert config.landing.bucket and config.landing.checkpoint_table
+    assert config.bronze is not None
+    assert config.bronze.database and config.bronze.processed_runs_table
+
+    assert config.defaults.fetch_size == 10000, (
+        "the example must not advertise a fetch_size that has been observed to OOM"
+    )
+    assert config.source_key == "acme_snowflake"
+    assert [t.name for t in config.tables] == ["fact_order"]
