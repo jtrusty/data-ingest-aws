@@ -467,6 +467,13 @@ automates that.
   - `feat: ...` -> minor (`0.1.1` -> `0.2.0`)
   - `feat!: ...` / `BREAKING CHANGE:` -> major (`0.2.0` -> `1.0.0`)
 
+  **Versioning posture:** 1.0.0 was reached while Bronze was still
+  unexercised against Athena, so treat 1.x as "landing is stable, Bronze may
+  still move" rather than a strict API-stability guarantee. Breaking changes
+  during that period are marked honestly and bump the major -- the changelog
+  staying truthful matters more than the number staying small. Tighten to
+  strict semver once Bronze has run in production.
+
   Release Please also bumps `__version__` in `src/data_ingest/__init__.py`
   (via the `extra-files` entry in `release-please-config.json` and the
   `x-release-please-version` marker), so the version reported at runtime
