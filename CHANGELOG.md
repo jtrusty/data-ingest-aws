@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/jtrusty/data-ingest-aws/compare/v0.1.1...v0.1.2) (2026-08-24)
+
+
+### Bug Fixes
+
+* **logging:** emit under Glue, where the host pre-configures root logging ([a92f163](https://github.com/jtrusty/data-ingest-aws/commit/a92f163c3cdd078b7a787b3cac111456476f1eb7))
+
 ## [0.1.1](https://github.com/jtrusty/data-ingest-aws/compare/v0.1.0...v0.1.1) (2026-08-24)
 
 
