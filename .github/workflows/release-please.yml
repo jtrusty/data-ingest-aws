@@ -1,0 +1,71 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Two release runs racing on the same tag is not something to leave to luck.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          release-type: python
+
+      # Everything below only runs when release-please just merged a
+      # release PR and cut a new tag (e.g. v0.2.1) on this push.
+      - uses: actions/checkout@v4
+        if: ${{ steps.release.outputs.release_created }}
+
+      - uses: actions/setup-python@v5
+        if: ${{ steps.release.outputs.release_created }}
+        with:
+          python-version: "3.9"
+
+      - name: Build wheel
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          pip install build
+          python -m build
+
+      # Test the WHEEL, not an editable source install. This is the artifact
+      # that goes to S3 and into Glue, so an editable install here would
+      # validate something the deployment never runs -- and the release would
+      # publish an unvalidated wheel while reporting that it had been tested.
+      - name: Run tests against the built wheel
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          python -m venv /tmp/release-check
+          /tmp/release-check/bin/pip install "$(ls dist/*.whl)[snowflake]" pytest moto
+          /tmp/release-check/bin/python -c "
+          from data_ingest import run_job, run_table
+          from data_ingest.sources.snowflake import SnowflakeSource
+          print('entry point imports OK')
+          "
+          # --import-mode=importlib with a rootdir switch keeps pytest from
+          # shadowing the installed package with ./src.
+          cd /tmp && /tmp/release-check/bin/python -m pytest \
+            --import-mode=importlib \
+            "$GITHUB_WORKSPACE/tests" -q
+
+      - name: Upload wheel as a release asset
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.release.outputs.tag_name }}" dist/*.whl dist/*.tar.gz
+
+      # S3 publish (Glue's --extra-py-files needs an S3 URI, not a GitHub
+      # release asset) is intentionally not wired up yet. When ready: add
+      # an OIDC-trusted IAM role + artifact bucket and an `aws s3 cp` step
+      # here. See README.md "CI/CD" for the shape that step should take.

@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "data_ingest"
+version = "0.1.0"
+description = "Reusable AWS Glue data ingestion framework (source -> S3 landing)"
+readme = "README.md"
+requires-python = ">=3.9"
+
+# RUNTIME CONTRACT (read before changing any pin):
+#
+# This wheel is deployed to AWS Glue Python Shell 3.9 via --extra-py-files.
+# That path DOES invoke pip and DOES read this metadata -- pip resolves
+# Requires-Dist against what the Glue image already has installed. So a pin
+# that disagrees with the Glue runtime is not inert; it makes pip try to
+# swap a library out from under a running job.
+#
+# Two things constrain us, and these pins are the intersection of both:
+#
+#   1. Glue Python Shell 3.9 (--library-set analytics) preinstalls
+#      boto3 1.21.21, botocore 1.24.21, pandas 1.4.2, numpy 1.22.3 (source:
+#      the "Supported libraries for Python shell jobs" table in the Glue
+#      developer guide -- NOT the 2022 launch blog, whose boto3/botocore
+#      pair is internally inconsistent). Note pandas is 1.4.x and boto3 is
+#      1.21.x -- a `pandas>=1.5` or `boto3>=1.22` floor forces an upgrade.
+#   2. The job installs snowflake-connector-python[pandas]==3.0.4 via
+#      --additional-python-modules. That extra is where pyarrow comes from
+#      (Glue's analytics set does NOT ship pyarrow), and it requires
+#      pandas>=1.0.0,<2.1.0 and pyarrow>=10.0.1,<10.1.0.
+#
+# Ranges below are deliberately wide enough to accept what Glue already has
+# and narrow enough that pip can't pick something the connector rejects.
+dependencies = [
+    "boto3>=1.21",
+    "PyYAML>=5.4",
+    # Matches snowflake-connector-python[pandas]==3.0.4's own range and
+    # accepts Glue's preinstalled 1.4.2 without an upgrade.
+    "pandas>=1.0,<2.1",
+    # pandas 1.x / pyarrow 10.x are built against the numpy 1.x C ABI.
+    "numpy>=1.20,<2.0",
+    # EXACT range mandated by the connector's [pandas] extra. Do not widen:
+    # pyarrow is the numpy-ABI-sensitive dependency, and an unbounded
+    # `>=10.0` lets a resolver pick pyarrow 17 against numpy 1.26 -- a
+    # combination that appears on no Glue image.
+    "pyarrow>=10.0.1,<10.1.0",
+]
+
+[project.optional-dependencies]
+# The Glue job installs this via:
+#   --additional-python-modules snowflake-connector-python[pandas]==3.0.4
+# The [pandas] extra is load-bearing: it is what supplies pyarrow, and it
+# pulls a connector build whose vendored urllib3/pyOpenSSL work under the
+# Glue runtime. See "Known Glue constraints" in README.md before bumping.
+snowflake = [
+    "snowflake-connector-python[pandas]==3.0.4",
+]
+dev = [
+    "pytest>=7.0",
+    "moto>=4.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    # Surfaces a pyarrow/connector version disagreement as a test failure
+    # rather than a warning nobody reads -- that mismatch is precisely the
+    # class of breakage this project pins against.
+    "error:You have an incompatible version of 'pyarrow' installed:UserWarning",
+]

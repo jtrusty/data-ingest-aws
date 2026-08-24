@@ -1,0 +1,87 @@
+# Example ingestion configuration.
+#
+# Copy to a real config named <system>_<type>.yaml (e.g. acme_snowflake.yaml,
+# which .gitignore keeps untracked because it carries account-specific
+# bucket/secret/object names) and upload THAT to S3. The Glue job reads it
+# via --config-uri; it is never bundled into the wheel.
+
+source:
+  # These two fields together are the SOURCE IDENTITY. They are combined as
+  # "<name>_<type>" -- e.g. acme + snowflake -> "acme_snowflake" -- and that
+  # derived value is used in exactly two places, which is what keeps the
+  # data and its checkpoint from ever drifting apart:
+  #
+  #   s3://<bucket>/landing/acme_snowflake/<table>/ingest_date=.../run_id=.../
+  #   DynamoDB partition key  source_key = "acme_snowflake"
+  #
+  # Deriving it (rather than having you write "acme_snowflake" by hand) means
+  # ingesting the same system over a second protocol later is automatically
+  # distinct: an `acme` + `rest` config becomes "acme_rest" and cannot collide,
+  # whether or not anyone remembered to disambiguate it.
+  #
+  # TREAT BOTH AS PERMANENT once a table has run. Changing either changes
+  # the derived identity, so the next run finds no checkpoint, does a FULL
+  # load, and writes to a new landing tree -- stranding the old one. There is
+  # no rename path; it is a re-onboard.
+  #
+  # `name` is the system being extracted from, not the team or the dataset:
+  # prefer the thing a person would name as the upstream ("acme", "workday",
+  # "stripe"). Keep it lowercase with underscores -- it becomes an S3 path
+  # segment.
+  name: acme
+
+  # `type` selects the source adapter (data_ingest.sources.registry) AND is
+  # asserted by the Glue job script via expected_source_type, so a config
+  # pointed at the wrong job fails at startup instead of silently matching
+  # zero tables. Must be a registered type -- currently: snowflake.
+  type: snowflake
+
+connection:
+  # Secrets Manager secret ID, not the credentials themselves. The secret
+  # holds: account, username, password, warehouse, and optionally role.
+  secret_id: my-snowflake-readonly-secret
+
+# Optional deployment-shape settings. Each may also be passed as a Glue job
+# CLI arg (--s3-bucket, --state-table, --s3-prefix, --fetch-size,
+# --fail-fast); a CLI arg wins when present. Setting them here means the
+# job definition only needs --config-uri, and CLI args stay reserved for
+# one-off overrides such as an ad-hoc retry.
+landing:
+  bucket: my-data-lake-bucket
+  prefix: landing
+
+state:
+  table: my-ingestion-watermarks
+
+defaults:
+  fetch_size: 50000
+  fail_fast: true
+
+tables:
+    # `name` is this table's IDENTITY -- the second half of the pair, after
+    # source_key. It selects the table via --tables, names the landing path
+    # segment, and is the DynamoDB sort key. Like source.name/type, treat it
+    # as permanent once the table has run: renaming it starts a new landing
+    # tree and a fresh full load.
+    #
+    # It is deliberately NOT derived from database/schema/table. Those three
+    # say WHERE TO READ FROM and nothing keys off them, so a Snowflake rename
+    # or a schema move is a two-line edit here that orphans nothing. They are
+    # still captured as lineage -- in _manifest.json, and on every landed row
+    # as _source_database / _source_schema / _source_table.
+    #
+    # Give it the logical name you want downstream (Bronze/Iceberg) to use,
+    # not the physical object name.
+  - name: fact_order
+    database: MY_DATABASE
+    schema: MY_SCHEMA
+    table: MY_TABLE_OR_VIEW     # a view is fine; nothing here assumes a table
+    primary_key:
+      - ORDER_KEY               # recorded in the manifest for downstream dedupe
+    checkpoint:
+      type: watermark
+      column: LAST_UPDATE_DTTM
+      # Re-scan this many minutes behind the previous high watermark to catch
+      # late/backdated rows. Produces intentional duplicates in landing that
+      # Bronze must dedupe on primary_key + watermark. 0 disables it.
+      lookback_minutes: 0

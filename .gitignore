@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+# Real configs carry account-specific bucket/secret/object names.
+# The sanitized example is tracked; anything else here is not.
+config/*
+!config/*.example.yaml
+dist/
+build/
+*.egg-info/
+.pytest_cache/

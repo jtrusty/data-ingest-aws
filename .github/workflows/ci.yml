@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# A superseded push shouldn't keep burning a runner.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Match the AWS Glue Python Shell runtime this package deploys to.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install (with the Snowflake extra the Glue job actually uses)
+        run: pip install -e ".[dev,snowflake]"
+
+      - run: pytest -q
+
+      - name: Build wheel and sdist
+        run: |
+          pip install build
+          python -m build
+
+      # The wheel -- not the editable source tree -- is what ships to S3 and
+      # gets loaded by Glue, so validate that artifact specifically.
+      - name: Wheel installs clean and the Glue entry point imports
+        run: |
+          python -m venv /tmp/wheel-check
+          /tmp/wheel-check/bin/pip install "$(ls dist/*.whl)[snowflake]"
+          # Import the job script's dependency chain, not just the package
+          # root: `from data_ingest.sources.snowflake import SnowflakeSource`
+          # is what transitively pulls snowflake.connector, i.e. the import
+          # that actually breaks when packaging is wrong.
+          /tmp/wheel-check/bin/python -c "
+          from data_ingest import run_job, run_table
+          from data_ingest.sources.snowflake import SnowflakeSource
+          print('entry point imports OK')
+          "
+
+      # Explicitly assert a CLEAN EXIT, not just successful imports.
+      # pandas/pyarrow/snowflake-connector all bind numpy's C API, and on
+      # some combinations the interpreter segfaults at shutdown (exit 139)
+      # *after* all work completes. Glue reads a non-zero exit as a FAILED
+      # run and retries it -- duplicating a landing run that succeeded --
+      # so a teardown crash is a real correctness problem, not cosmetic.
+      # `run_job` is asserted separately above; this step is only about the
+      # process exit status.
+      - name: Interpreter exits cleanly against the frozen Glue stack
+        run: |
+          python -m venv /tmp/glue-stack
+          /tmp/glue-stack/bin/pip install -c constraints-glue.txt "$(ls dist/*.whl)[snowflake]"
+          /tmp/glue-stack/bin/pip check
+          for i in 1 2 3; do
+            /tmp/glue-stack/bin/python -c "
+          from data_ingest import run_job, run_table
+          from data_ingest.landing import LandingWriter
+          from data_ingest.sources.snowflake import SnowflakeSource
+          "
+            status=$?
+            if [ $status -ne 0 ]; then
+              echo "::error::Interpreter exited $status against the frozen Glue stack (139 = segfault at shutdown)."
+              exit 1
+            fi
+          done
+          echo "Clean exit on the frozen Glue stack."
+
+      # This project's entire risk profile is "does it coexist with Glue's
+      # preinstalled stack." Assert pip is satisfied and would not need to
+      # swap anything out at job start.
+      - name: Dependency set is internally consistent
+        run: /tmp/wheel-check/bin/pip check
+
+      - name: Glue-runtime compatibility (no upgrades against preinstalled versions)
+        run: |
+          python -m venv /tmp/glue-sim
+          # Versions preinstalled by Glue Python Shell 3.9 (--library-set analytics).
+          /tmp/glue-sim/bin/pip install "boto3==1.21.21" "botocore==1.24.21" "pandas==1.4.2" "numpy==1.22.3"
+          # Installing our wheel on top must NOT try to replace them.
+          /tmp/glue-sim/bin/pip install --dry-run --report /tmp/report.json "$(ls dist/*.whl)"
+          python - <<'EOF'
+          import json, sys
+
+          # What Glue already has; the wheel must accept these as-is.
+          PREINSTALLED = {"boto3": "1.21.21", "botocore": "1.24.21", "pandas": "1.4.2", "numpy": "1.22.3"}
+
+          report = json.load(open("/tmp/report.json"))
+          conflicts = []
+          for item in report.get("install", []):
+              meta = item["metadata"]
+              name, version = meta["name"].lower(), meta["version"]
+              if name in PREINSTALLED and version != PREINSTALLED[name]:
+                  conflicts.append(f"{name}: Glue has {PREINSTALLED[name]}, wheel wants {version}")
+
+          if conflicts:
+              print("::error::Wheel would replace Glue-preinstalled package(s):")
+              for c in conflicts:
+                  print(f"  - {c}")
+              print("See the RUNTIME CONTRACT comment in pyproject.toml.")
+              sys.exit(1)
+          print("No Glue-preinstalled package would be replaced.")
+          EOF

@@ -1,0 +1,51 @@
+# Frozen dependency set matching the AWS Glue Python Shell 3.9 runtime.
+#
+# WHY THIS FILE EXISTS
+#
+# pyproject.toml expresses *ranges*, which is right for a library but leaves
+# a resolver free to pick a combination that never appears on a Glue image.
+# Two failure modes this prevents, both verified on CPython 3.9:
+#
+#   1. Mismatched numpy/pandas build pairs segfault the interpreter at
+#      shutdown -- e.g. numpy 1.23.5 with pandas 1.4.2 exits 139 *after* all
+#      work completes. Glue reads the non-zero exit as a FAILED run and
+#      retries, duplicating a landing run that actually succeeded. pandas
+#      binary wheels must run against the numpy they were built against.
+#   2. `--additional-python-modules snowflake-connector-python[pandas]==3.0.4`
+#      resolves its own transitive tree (urllib3, pyOpenSSL, cryptography,
+#      requests) fresh at job runtime, at whatever versions PyPI serves that
+#      day. That is exactly where the urllib3/OpenSSL breakage this project
+#      pins against lives, and it makes the same job definition able to work
+#      on Monday and fail on Thursday with no code change.
+#
+# The versions below are what Glue Python Shell 3.9 (--library-set analytics)
+# actually preinstalls, plus pyarrow from the connector's [pandas] extra.
+# This exact combination is verified to import cleanly.
+#
+# HOW TO USE
+#
+#   pip install -c constraints-glue.txt -e ".[dev,snowflake]"
+#
+# CI installs against this file so the tested combination is the shipped one.
+#
+# WHEN GLUE CHANGES
+#
+# If Glue ships a newer Python Shell runtime, re-derive this file from that
+# image's actual preinstalled versions -- do not hand-bump individual lines.
+# See "Known Glue constraints" in README.md.
+
+# --- Preinstalled by Glue Python Shell 3.9 (--library-set analytics) ---
+# Source of truth is the "Supported libraries for Python shell jobs" table in
+# the AWS Glue developer guide, NOT the 2022 launch announcement -- the blog
+# post lists a boto3/botocore pair (1.22.5 / 1.23.5) that is internally
+# inconsistent and cannot resolve.
+boto3==1.21.21
+botocore==1.24.21
+numpy==1.22.3
+pandas==1.4.2
+
+# --- Supplied by snowflake-connector-python[pandas]==3.0.4 ---
+# Glue's analytics library-set does NOT ship pyarrow; the [pandas] extra is
+# what provides it. The connector requires >=10.0.1,<10.1.0.
+pyarrow==10.0.1
+snowflake-connector-python==3.0.4

@@ -1,0 +1,18 @@
+[tools]
+# Match the AWS Glue Python Shell runtime this package actually deploys to.
+python = "3.9"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.install]
+description = "Install package + dev/test dependencies into the mise-managed venv"
+run = "python -m ensurepip --upgrade && python -m pip install -e '.[dev,snowflake]'"
+
+[tasks.test]
+description = "Run unit tests"
+run = "python -m pytest -q"
+
+[tasks.build]
+description = "Build the wheel"
+run = "python -m pip install build && python -m build"
