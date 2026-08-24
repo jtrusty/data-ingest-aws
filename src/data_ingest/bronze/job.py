@@ -72,7 +72,7 @@ def run_bronze_job(argv=None):
     missing = [
         name
         for name, value in [
-            ("--s3-bucket / landing.bucket", s3_bucket),
+            ("--s3-bucket / landing.location", s3_bucket),
             ("--bronze-database / bronze.database", database),
             ("--athena-output / bronze.athena_output", athena_output),
         ]

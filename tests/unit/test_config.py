@@ -264,3 +264,69 @@ def test_shipped_example_config_parses_and_exercises_every_section():
     )
     assert config.source_key == "acme_snowflake"
     assert [t.name for t in config.tables] == ["fact_order"]
+
+
+def test_landing_location_is_split_into_bucket_and_prefix():
+    config = parse_config(VALID_YAML + """
+landing:
+  location: s3://my-bucket/some/nested/landing
+""")
+    assert config.landing.bucket == "my-bucket"
+    assert config.landing.prefix == "some/nested/landing"
+
+
+def test_landing_and_bronze_can_live_in_different_buckets():
+    """
+    The reason each layer carries its own location rather than sharing a
+    top-level bucket: landing gets an S3 Lifecycle policy and bronze must
+    never get one, because expiring files under Iceberg metadata corrupts
+    the table. Separate buckets must stay expressible.
+    """
+    config = parse_config(VALID_YAML + """
+landing:
+  location: s3://raw-zone/landing
+
+bronze:
+  database: d
+  location: s3://curated-zone/bronze
+  athena_output: s3://scratch/results/
+""")
+    assert config.landing.bucket == "raw-zone"
+    assert config.bronze.location_root == "s3://curated-zone/bronze"
+
+
+def test_deprecated_bucket_prefix_still_works():
+    config = parse_config(VALID_YAML + """
+landing:
+  bucket: legacy-bucket
+  prefix: landing
+""")
+    assert config.landing.bucket == "legacy-bucket"
+    assert config.landing.prefix == "landing"
+
+
+def test_setting_both_location_and_bucket_is_rejected():
+    with pytest.raises(ConfigurationError, match="Keep only `location`"):
+        parse_config(VALID_YAML + """
+landing:
+  location: s3://a/landing
+  bucket: b
+""")
+
+
+def test_landing_location_must_be_an_s3_uri():
+    with pytest.raises(ConfigurationError, match="must be an s3:// URI"):
+        parse_config(VALID_YAML + """
+landing:
+  location: /local/path
+""")
+
+
+def test_trailing_slashes_do_not_produce_double_slashes():
+    # "s3://b/landing/" + "/" + "source" would yield "landing//source",
+    # which S3 treats as a real empty path segment.
+    config = parse_config(VALID_YAML + """
+landing:
+  location: s3://my-bucket/landing/
+""")
+    assert config.landing.prefix == "landing"

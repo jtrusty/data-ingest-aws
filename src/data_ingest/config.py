@@ -84,9 +84,24 @@ class LandingConfig:
     data_ingest.checkpoints.
     """
 
-    bucket: Optional[str] = None
-    prefix: str = "landing"
+    # A single s3:// URI rather than separate bucket/prefix fields, matching
+    # bronze.location. Beyond being one field instead of two that can be
+    # half-set, it keeps each layer's location independent -- which matters,
+    # because landing and bronze must NOT share a lifecycle policy. Landing
+    # ages into Glacier and expires; Iceberg metadata references physical
+    # objects, so expiring files under bronze corrupts the table. A shared
+    # top-level bucket would structurally encourage one rule spanning both.
+    location: Optional[str] = None
     checkpoint_table: Optional[str] = None
+
+    @property
+    def bucket(self):
+        """Derived from location; boto3 needs bucket and key separately."""
+        return split_s3_uri(self.location)[0] if self.location else None
+
+    @property
+    def prefix(self):
+        return split_s3_uri(self.location)[1] if self.location else "landing"
 
 
 @dataclass(frozen=True)
@@ -196,6 +211,22 @@ class IngestionConfig:
         return [self.get_table(name) for name in requested]
 
 
+def split_s3_uri(uri):
+    """
+    "s3://bucket/some/prefix" -> ("bucket", "some/prefix").
+
+    Trailing slashes are stripped so callers can join with "/" without
+    producing a double slash, which S3 treats as a real (empty) path segment.
+    """
+    if not str(uri).startswith("s3://"):
+        raise ConfigurationError(f"Expected an s3:// URI, got {uri!r}")
+    without_scheme = str(uri)[len("s3://"):]
+    bucket, _, prefix = without_scheme.partition("/")
+    if not bucket:
+        raise ConfigurationError(f"S3 URI has no bucket: {uri!r}")
+    return bucket, prefix.strip("/")
+
+
 def _duplicates(values):
     """Return the sorted set of values appearing more than once."""
     seen = set()
@@ -252,6 +283,46 @@ def _parse_checkpoint(data):
         column=column,
         lookback_minutes=lookback_minutes,
     )
+
+
+def _resolve_landing_location(landing_data):
+    """
+    Accept `location` (preferred) or the older `bucket` + `prefix` pair.
+
+    The split form predates bronze and its single `location`; keeping it
+    working means a deployed config does not break, but only one spelling may
+    be present -- two ways to say the same thing is how a config drifts out
+    of sync with itself.
+    """
+    location = landing_data.get("location")
+    bucket = landing_data.get("bucket")
+    prefix = landing_data.get("prefix")
+
+    if location and (bucket or prefix):
+        raise ConfigurationError(
+            "landing sets BOTH `location` and the deprecated `bucket`/`prefix`. "
+            "Keep only `location` (e.g. s3://my-bucket/landing)."
+        )
+
+    if location:
+        if not str(location).startswith("s3://"):
+            raise ConfigurationError(
+                f"landing.location must be an s3:// URI, got {location!r}"
+            )
+        return location
+
+    if bucket:
+        logger.warning(
+            "Config uses the deprecated `landing.bucket`/`landing.prefix`; replace "
+            "them with a single `landing.location: s3://%s/%s` to match "
+            "bronze.location.",
+            bucket, (prefix or "landing").strip("/"),
+        )
+        return f"s3://{bucket}/{(prefix or 'landing').strip('/')}"
+
+    # Neither present: run_job reports this as a missing required setting,
+    # with the CLI override named alongside it.
+    return None
 
 
 def _parse_bronze(data):
@@ -348,6 +419,7 @@ def parse_config(raw_text):
     # each pipeline layer owned its own state. Still accepted so a deployed
     # config keeps working, but warned about: two spellings for one setting
     # is exactly how a config drifts out of sync with its documentation.
+    landing_location = _resolve_landing_location(landing_data)
     checkpoint_table = landing_data.get("checkpoint_table")
     legacy_state = (data.get("state") or {}).get("table")
     if legacy_state and not checkpoint_table:
@@ -370,8 +442,7 @@ def parse_config(raw_text):
         connection=ConnectionConfig(secret_id=connection["secret_id"]),
         tables=tables,
         landing=LandingConfig(
-            bucket=landing_data.get("bucket"),
-            prefix=landing_data.get("prefix") or "landing",
+            location=landing_location,
             checkpoint_table=checkpoint_table,
         ),
         defaults=DefaultsConfig(

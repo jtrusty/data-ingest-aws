@@ -412,7 +412,7 @@ def run_job(argv=None, expected_source_type=None):
 
     missing = [
         name
-        for name, value in [("--s3-bucket / landing.bucket", s3_bucket), ("--state-table / landing.checkpoint_table", state_table)]
+        for name, value in [("--s3-bucket / landing.location", s3_bucket), ("--state-table / landing.checkpoint_table", state_table)]
         if value is None
     ]
     if missing:

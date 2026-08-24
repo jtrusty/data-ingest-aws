@@ -176,8 +176,8 @@ not as required boilerplate on every job definition.
 ```
 --config-uri     s3://<bucket>/ingestion-config/acme_snowflake.yaml (required)
 --state-table    data-platform-checkpoints                       (optional -- falls back to config YAML's landing.checkpoint_table)
---s3-bucket      <data-bucket>                                   (optional -- falls back to config YAML's landing.bucket)
---s3-prefix      landing                                         (optional -- falls back to config YAML's landing.prefix, default "landing")
+--s3-bucket      <data-bucket>                                   (optional -- falls back to the bucket in config YAML's landing.location)
+--s3-prefix      landing                                         (optional -- falls back to the prefix in config YAML's landing.location)
 --tables         all | orders | orders,customers        (default "all")
 --fetch-size     10000                                           (optional -- falls back to config YAML's defaults.fetch_size, default 10000)
 --fail-fast      true | false                                    (optional -- falls back to config YAML's defaults.fail_fast, default true)

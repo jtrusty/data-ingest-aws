@@ -56,8 +56,12 @@ connection:
 # ---------------------------------------------------------------------------
 
 landing:
-  bucket: my-data-lake-bucket
-  prefix: landing
+  # One s3:// URI, matching bronze.location. Deliberately NOT a shared
+  # top-level bucket with per-layer prefixes: landing and bronze must not
+  # share a lifecycle policy. Landing ages into Glacier and expires, while
+  # Iceberg metadata under bronze references physical objects -- expiring
+  # those corrupts the table. Separate locations keep separate buckets easy.
+  location: s3://my-data-lake-bucket/landing
 
   # DynamoDB table holding extraction checkpoints -- how far into the source
   # each table has been read. Named checkpoint_table rather than
