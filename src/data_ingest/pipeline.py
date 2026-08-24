@@ -37,7 +37,17 @@ from data_ingest.state import DynamoDBStateStore, StateKey
 
 logger = get_logger(__name__)
 
-DEFAULT_FETCH_SIZE = 50_000
+# Rows pulled per source batch when neither the CLI arg nor the config YAML
+# specifies one. This module is the authority -- run_job() resolves
+# CLI > config > this value and hands the result to the adapter, so an
+# adapter's own default only applies when it is constructed directly.
+#
+# 10k, not a larger round number, for an empirical reason: a 1.3M-row full
+# load was SIGKILLed (exit 137, OOM) at 50k on a Glue Python Shell job and
+# completed at 10k. Python Shell is capped at 1 DPU / 16 GB with no way to
+# scale up, so batch size is the main lever. Raise it only with a real run
+# behind it.
+DEFAULT_FETCH_SIZE = 10_000
 
 
 @dataclass

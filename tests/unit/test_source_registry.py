@@ -60,3 +60,29 @@ def test_adapter_module_missing_build_source_raises_configuration_error():
 
     with pytest.raises(ConfigurationError, match="must define a build_source"):
         registry.build_source("broken", credentials={}, table_config=None, fetch_size=10)
+
+
+def test_fetch_size_defaults_do_not_drift():
+    """
+    pipeline.DEFAULT_FETCH_SIZE is the authority (run_job resolves
+    CLI > config > it), while the adapter's own default applies when it is
+    constructed directly. They are separate constants in separate modules,
+    so nothing but a test stops them drifting apart -- and a mismatch would
+    mean the memory ceiling proven in one path silently differs in the other.
+    """
+    from data_ingest import pipeline
+    from data_ingest.sources import snowflake
+
+    assert pipeline.DEFAULT_FETCH_SIZE == snowflake.DEFAULT_FETCH_SIZE
+
+
+def test_prefetch_threads_are_capped_below_the_library_default():
+    """
+    The connector buffers result chunks ahead of the cursor; its default (4)
+    assumes a machine with headroom. Glue Python Shell is 1 DPU / 16 GB and
+    cannot be scaled, so we cap it. Guards against someone raising it back
+    without knowing why it was lowered.
+    """
+    from data_ingest.sources import snowflake
+
+    assert 1 <= snowflake.DEFAULT_PREFETCH_THREADS <= 2

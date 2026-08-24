@@ -179,7 +179,7 @@ not as required boilerplate on every job definition.
 --s3-bucket      <data-bucket>                                   (optional -- falls back to config YAML's landing.bucket)
 --s3-prefix      landing                                         (optional -- falls back to config YAML's landing.prefix, default "landing")
 --tables         all | orders | orders,customers        (default "all")
---fetch-size     50000                                           (optional -- falls back to config YAML's defaults.fetch_size, default 50000)
+--fetch-size     10000                                           (optional -- falls back to config YAML's defaults.fetch_size, default 10000)
 --fail-fast      true | false                                    (optional -- falls back to config YAML's defaults.fail_fast, default true)
 ```
 
@@ -375,6 +375,46 @@ connector to `>=10.0.1,<10.1.0`). Dropping `[pandas]` breaks Parquet writing.
   retries, duplicating a landing run that actually succeeded. This is why
   `constraints-glue.txt` pins them together rather than as independent
   ranges.
+
+### Memory: the initial full load is the hard case
+
+Glue Python Shell is capped at **1 DPU / 16 GB and cannot be scaled up**
+(`max_capacity` accepts only `0.0625` or `1`), so memory is a fixed ceiling
+rather than something to provision around. The first full load of a table is
+where that bites — every later run is an increment.
+
+Measured: a 1.3M-row full load of a wide fact table was SIGKILLed
+(**exit 137**, the container OOM) at `fetch_size: 50000`, and completed at
+`10000`. Two things consume the budget:
+
+- **Batch size.** Rows arrive from the DB-API as tuples of Python objects, so
+  every column lands as pandas `object` dtype — individually boxed values
+  rather than packed arrays. That is far heavier per row than a typed frame,
+  and wide tables or `VARIANT`/large `VARCHAR` columns push it up further.
+- **Connector read-ahead.** `fetchmany()` bounds how many rows *we* hold, not
+  how much the connector buffers behind it: it downloads result chunks in
+  background threads and queues them ahead of the cursor. The library default
+  of 4 assumes headroom we don't have, so the adapter pins
+  `client_prefetch_threads` to 2.
+
+If a run dies with exit 137, lower `defaults.fetch_size` in the config YAML
+and re-upload — no rebuild or redeploy, since the job reads it from S3 at
+runtime. Failed runs cost nothing in correctness: no manifest was written, so
+the checkpoint never advanced and the retry starts clean. The orphaned
+Parquet under that `run_id` is inert and ages out via lifecycle.
+
+Still open: bounded/chunked initial load, so a large first load is resumable
+in windows rather than all-or-nothing. Until then, a table big enough to
+exhaust 16 GB even at a small `fetch_size` needs its first load seeded
+another way.
+
+### Exit codes worth recognizing
+
+| Code | Meaning |
+|---|---|
+| `2` | argparse rejected the job arguments — usually a missing `--config-uri`. The explanation goes to stderr, which lands in `/aws-glue/python-jobs/error`, a *different* log group from the output one. |
+| `137` | SIGKILL, i.e. the container ran out of memory. See above. |
+| `1` | A table failed; the checkpoint did not advance. See "Failure/retry behavior". |
 
 ### Extraction behavior
 

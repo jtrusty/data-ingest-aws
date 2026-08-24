@@ -20,7 +20,24 @@ from data_ingest.sources.base import Source
 
 logger = get_logger(__name__)
 
-DEFAULT_FETCH_SIZE = 50_000
+# Rows pulled per fetchmany() call.
+#
+# 10k rather than a larger round number for an empirical reason: a 1.3M-row
+# full load of a wide fact table was SIGKILLed (exit 137, OOM) at 50k on a
+# Glue Python Shell job, and completed at 10k. Python Shell is capped at
+# 1 DPU / 16 GB and cannot be scaled up, so the batch size is the main lever.
+#
+# Rows arrive from the DB-API as tuples of Python objects, so every column
+# lands as pandas `object` dtype -- individually boxed values, not packed
+# arrays -- which is far heavier per row than a typed frame. Wide tables and
+# VARIANT/large VARCHAR columns push it up further. Raise this only with a
+# real run behind it.
+DEFAULT_FETCH_SIZE = 10_000
+
+# Result chunks the connector downloads ahead of the cursor. The library
+# default is 4; 2 trades a little throughput for materially less peak memory
+# on a container that cannot be given more. See the connect() call below.
+DEFAULT_PREFETCH_THREADS = 2
 
 # Snowflake numeric type codes (cursor.description[i].type_code), from
 # snowflake.connector.constants.FIELD_ID_TO_NAME.
@@ -152,6 +169,7 @@ class SnowflakeSource(Source):
         watermark_column,
         lookback_minutes=0,
         fetch_size=DEFAULT_FETCH_SIZE,
+        prefetch_threads=DEFAULT_PREFETCH_THREADS,
     ):
         self.database = database
         self.schema = schema
@@ -159,6 +177,7 @@ class SnowflakeSource(Source):
         self.watermark_column = watermark_column
         self.lookback_minutes = lookback_minutes
         self.fetch_size = fetch_size
+        self.prefetch_threads = prefetch_threads
 
         self._codec = None  # resolved lazily on first watermark read
 
@@ -168,6 +187,19 @@ class SnowflakeSource(Source):
                 "user": credentials["username"],
                 "password": credentials["password"],
                 "warehouse": credentials["warehouse"],
+                # Cap how far ahead the connector downloads result chunks.
+                #
+                # fetchmany() bounds how many rows WE hold, but not how much
+                # the connector buffers behind it: it downloads result chunks
+                # in background threads and queues them ahead of the cursor.
+                # The library default (4) is tuned for machines with room to
+                # spare; a Glue Python Shell job is capped at 1 DPU / 16 GB
+                # with no way to scale up, so that read-ahead competes with
+                # the batch being converted to Parquet and can OOM the
+                # container (SIGKILL, exit 137) on a large full load.
+                #
+                # Lower means less memory and slightly less throughput.
+                "client_prefetch_threads": self.prefetch_threads,
                 # Pin the session's temporal semantics rather than inheriting
                 # whatever the account/user default happens to be. Without
                 # this, the same stored watermark string can mean a different
