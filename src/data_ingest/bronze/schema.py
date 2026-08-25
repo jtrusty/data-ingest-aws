@@ -92,10 +92,11 @@ def add_columns_sql(table, columns):
     Additive only. Athena has no combined add-and-retype statement, which
     suits us -- a retype should not be reachable by accident.
     """
-    from data_ingest.bronze.ddl import quote_ddl_identifier
+    from data_ingest.bronze.ddl import normalize_column, quote_ddl_identifier
 
     rendered = ", ".join(
-        f"{quote_ddl_identifier(name)} {sql_type}" for name, sql_type in columns
+        f"{quote_ddl_identifier(normalize_column(name))} {sql_type}"
+        for name, sql_type in columns
     )
     return f"ALTER TABLE {quote_ddl_identifier(table)} ADD COLUMNS ({rendered})"
 

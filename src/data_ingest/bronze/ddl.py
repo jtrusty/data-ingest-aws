@@ -42,6 +42,28 @@ def quote_identifier(value):
     return '"' + str(value).replace('"', '""') + '"'
 
 
+def normalize_column(name):
+    """
+    Lowercase a column name for generated SQL.
+
+    Athena and the Glue catalog store column names lowercased, and Iceberg
+    then matches them case-sensitively against whatever a statement says. A
+    declaration of `LAST_UPDATE_DTTM` paired with PARTITIONED BY
+    (month(LAST_UPDATE_DTTM)) therefore fails with
+
+        Cannot find source column: last_update_dttm
+
+    because one side was normalized and the other was not. Snowflake returns
+    identifiers uppercase, so this is every column in every table -- the fix
+    is to lowercase consistently on our side rather than fight what Athena
+    stores.
+
+    Only generated SQL is affected. The manifest keeps the source's own
+    casing, since it records what was actually written to Parquet.
+    """
+    return str(name).lower()
+
+
 def quote_ddl_identifier(value):
     """
     Quote an identifier for Athena's Hive DDL parser (CREATE / ALTER TABLE).
@@ -123,8 +145,12 @@ def merge_sql(bronze_table, landing_table, ingest_date, run_id, primary_key, wat
         )
 
     match_columns = list(primary_key) + [watermark_column]
+    # Lowercased for the same reason as the DDL: the columns exist in the
+    # catalog lowercased, and Iceberg matches case-sensitively.
     on_clause = "\n   AND ".join(
-        f"target.{quote_identifier(c)} = source.{quote_identifier(c)}" for c in match_columns
+        f"target.{quote_identifier(normalize_column(c))} = "
+        f"source.{quote_identifier(normalize_column(c))}"
+        for c in match_columns
     )
 
     return (
@@ -185,7 +211,8 @@ def create_bronze_table_sql(bronze_table, columns, location, partitioned_by=None
     explicit Iceberg partition-spec change.
     """
     column_ddl = ",\n  ".join(
-        f"{quote_ddl_identifier(name)} {sql_type}" for name, sql_type in columns
+        f"{quote_ddl_identifier(normalize_column(name))} {sql_type}"
+        for name, sql_type in columns
     )
     partition_ddl = ""
     if partitioned_by:
@@ -193,8 +220,13 @@ def create_bronze_table_sql(bronze_table, columns, location, partitioned_by=None
         # quoting would make Athena read the whole expression as a column
         # name. Bare column names are quoted; transforms pass through, having
         # been allowlist-validated at config-parse time.
+        # A transform such as month(col) must reference the column exactly as
+        # declared above, i.e. lowercased. Bare columns are quoted; transforms
+        # are lowercased wholesale, which is safe because the allowlist at
+        # config-parse time restricts them to transform(column) forms.
         rendered = [
-            c if "(" in c else quote_ddl_identifier(c) for c in partitioned_by
+            normalize_column(c) if "(" in c else quote_ddl_identifier(normalize_column(c))
+            for c in partitioned_by
         ]
         partition_ddl = f"PARTITIONED BY ({', '.join(rendered)})\n"
 
@@ -222,7 +254,8 @@ def create_landing_table_sql(landing_table, columns, location):
     managed table.
     """
     column_ddl = ",\n  ".join(
-        f"{quote_ddl_identifier(name)} {sql_type}" for name, sql_type in columns
+        f"{quote_ddl_identifier(normalize_column(name))} {sql_type}"
+        for name, sql_type in columns
     )
     return (
         f"CREATE EXTERNAL TABLE IF NOT EXISTS {quote_ddl_identifier(landing_table)} (\n"

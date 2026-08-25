@@ -20,8 +20,8 @@ def test_merge_deduplicates_on_primary_key_plus_watermark():
         watermark_column="LAST_UPDATE_DTTM",
     )
 
-    assert 'target."ORDER_KEY" = source."ORDER_KEY"' in sql
-    assert 'target."LAST_UPDATE_DTTM" = source."LAST_UPDATE_DTTM"' in sql
+    assert 'target."order_key" = source."order_key"' in sql
+    assert 'target."last_update_dttm" = source."last_update_dttm"' in sql
     assert "WHEN NOT MATCHED THEN INSERT" in sql
     # No update/delete clause: Bronze retains history rather than mutating it.
     assert "WHEN MATCHED" not in sql
@@ -35,7 +35,7 @@ def test_merge_supports_composite_primary_keys():
         watermark_column="UPDATED_AT",
     )
     for column in ("ORDER_KEY", "LINE_NO", "UPDATED_AT"):
-        assert f'target."{column}" = source."{column}"' in sql
+        assert f'target."{column.lower()}" = source."{column.lower()}"' in sql
 
 
 def test_merge_scopes_the_source_to_exactly_one_run():
@@ -113,7 +113,7 @@ def test_bronze_table_is_created_as_iceberg():
     )
     assert "'table_type' = 'ICEBERG'" in sql
     assert "CREATE TABLE IF NOT EXISTS" in sql
-    assert "`ORDER_KEY` bigint" in sql
+    assert "`order_key` bigint" in sql
 
 
 def test_landing_external_table_is_partitioned_to_match_the_physical_layout():
@@ -128,14 +128,14 @@ def test_landing_external_table_is_partitioned_to_match_the_physical_layout():
     assert "ICEBERG" not in sql
 
 
-def test_identifiers_are_quoted_so_mixed_case_survives():
+def test_identifiers_are_quoted_and_normalized():
     sql = ddl.merge_sql(
         bronze_table="t", landing_table="l",
         ingest_date="2026-08-24", run_id="r",
         primary_key=["OrderKey"], watermark_column="LastUpdate",
     )
-    assert '"OrderKey"' in sql
-    assert '"LastUpdate"' in sql
+    assert '"orderkey"' in sql
+    assert '"lastupdate"' in sql
 
 
 # --------------------------------------------------------------------------
@@ -161,7 +161,7 @@ def test_transform_partitions_are_not_quoted_as_identifiers():
         "t", [("A", "bigint")], "s3://b/t",
         ddl.resolve_partition_spec(("month({checkpoint_column})", "STORE_ID"), "UPDATED_AT"),
     )
-    assert "PARTITIONED BY (month(UPDATED_AT), `STORE_ID`)" in sql
+    assert "PARTITIONED BY (month(updated_at), `store_id`)" in sql
 
 
 def test_no_partition_spec_creates_an_unpartitioned_table():
@@ -222,3 +222,41 @@ def test_iceberg_table_omits_the_external_keyword():
     sql = ddl.create_bronze_table_sql("t", [("A", "bigint")], "s3://b/t")
     assert sql.startswith("CREATE TABLE IF NOT EXISTS")
     assert "EXTERNAL" not in sql
+
+
+def test_partition_transform_matches_the_declared_column_case():
+    """
+    Regression for:
+
+        Failed to create bronze table ... Cannot find source column:
+        last_update_dttm
+
+    Athena stores column names lowercased and Iceberg then matches them
+    case-sensitively, so declaring `LAST_UPDATE_DTTM` while partitioning by
+    month(LAST_UPDATE_DTTM) leaves the two sides disagreeing. Snowflake
+    returns every identifier uppercase, so this affected every table.
+    """
+    sql = ddl.create_bronze_table_sql(
+        "t",
+        [("ORDER_KEY", "bigint"), ("LAST_UPDATE_DTTM", "timestamp")],
+        "s3://b/t",
+        ddl.resolve_partition_spec(("month({checkpoint_column})",), "LAST_UPDATE_DTTM"),
+    )
+    assert "`last_update_dttm` timestamp" in sql
+    assert "PARTITIONED BY (month(last_update_dttm))" in sql
+    assert "LAST_UPDATE_DTTM" not in sql, "no uppercase may survive into the DDL"
+
+
+def test_merge_references_match_the_declared_column_case():
+    # The merge must reference the same lowercased names the DDL declared,
+    # or Iceberg cannot resolve the ON clause.
+    sql = ddl.merge_sql("t", "l", "2026-08-25", "abc", ["ORDER_KEY"], "LAST_UPDATE_DTTM")
+    assert "ORDER_KEY" not in sql
+    assert 'target."order_key"' in sql
+
+
+def test_landing_table_columns_are_normalized_too():
+    # Both tables must agree, since MERGE ... INSERT * maps between them.
+    sql = ddl.create_landing_table_sql("l", [("ORDER_KEY", "bigint")], "s3://b/l")
+    assert "`order_key` bigint" in sql
+    assert "ORDER_KEY" not in sql

@@ -371,7 +371,7 @@ def test_a_column_added_in_the_source_reaches_bronze(env):
 
     alters = [s for s in athena.statements if s.startswith("ALTER TABLE") and "ADD COLUMNS" in s]
     assert len(alters) == 2, "both the landing external table AND bronze must gain it"
-    assert all("`PROMO_CODE` string" in a for a in alters)
+    assert all("`promo_code` string" in a for a in alters)
 
     # And the tables are NOT recreated -- they already exist.
     assert not any(s.startswith("CREATE") for s in athena.statements)
