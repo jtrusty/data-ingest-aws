@@ -203,6 +203,43 @@ class LandingRun:
             ]
         return converted if converted is not None else dataframe
 
+    def _cast_to_schema(self, dataframe, original_error):
+        """
+        Second attempt at conforming a batch: infer, then cast.
+
+        `from_pandas(schema=...)` converts and validates in one step and is
+        strict about how the pandas dtype maps onto the target -- a decimal
+        column whose values need more precision than the first batch showed,
+        an int32 against an int64 field, a timestamp at the wrong unit. Arrow
+        casts all of those happily once the data is already in Arrow.
+
+        Returns the cast table, or None if the batch genuinely cannot be
+        represented in the pinned schema and drift is the honest answer.
+
+        safe=True on purpose. An unsafe cast would silently truncate a value
+        too wide for its column, which is worse than drift: drift is visible
+        in the manifest and blocked at Bronze, whereas a truncated number
+        looks like data.
+        """
+        try:
+            inferred = pa.Table.from_pandas(dataframe, preserve_index=False)
+            # Column-order and presence must match; a batch missing a column
+            # entirely is a different problem that casting cannot fix.
+            if inferred.schema.names != self.schema.names:
+                return None
+            cast = inferred.cast(self.schema)
+        except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError):
+            return None
+
+        logger.info(
+            "Batch %d of run %s did not convert directly to the run's pinned schema "
+            "(%s) but cast to it cleanly. Landing it conformed; no drift.",
+            self.file_count,
+            self.run_id,
+            original_error,
+        )
+        return cast
+
     def _to_arrow(self, dataframe, declared_schema=None):
         """
         Convert a batch to an Arrow table, holding the schema stable across
@@ -232,6 +269,9 @@ class LandingRun:
             conformed = self._coerce_to_declared(dataframe, self.schema)
             return pa.Table.from_pandas(conformed, schema=self.schema, preserve_index=False)
         except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as exc:
+            cast = self._cast_to_schema(dataframe, exc)
+            if cast is not None:
+                return cast
             # A later batch genuinely doesn't fit the pinned schema (a column
             # the source widened mid-extraction, a mixed-type object column).
             # Hard-failing here would be a poison pill: the run dies at batch

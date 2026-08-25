@@ -4,6 +4,7 @@ import json
 import boto3
 import pandas as pd
 import pyarrow.parquet as pq
+import pyarrow as pa
 import pytest
 from moto import mock_aws
 
@@ -328,3 +329,47 @@ def test_a_drifted_run_reports_no_schema(s3_client):
     )
     assert manifest.schema is None, "a drifted run must not claim a single schema"
     assert manifest.schema_drift is True, "but must still say why"
+
+
+def test_a_batch_that_will_not_convert_directly_is_cast_rather_than_drifted(s3_client):
+    """
+    from_pandas(schema=...) converts and validates in one step and is strict
+    about the pandas dtype -> Arrow mapping. Arrow's own cast is not. Falling
+    straight to drift skipped a conversion that works, splitting a run across
+    incompatible files for a difference Arrow can resolve losslessly.
+
+    The concrete case: a column all-NULL in batch 0 pins as `string` (see
+    _promote_null_fields), then batch 1 arrives holding integers.
+    """
+    writer = LandingWriter(s3_client, BUCKET, "landing")
+    run = writer.start("acme", "orders", "r-cast", "ACME", "PUBLIC", "ORDERS",
+                       ingest_date="2026-08-25")
+
+    run.write_batch(pd.DataFrame({"CODE": [None, None]}))
+    assert run.schema.field("CODE").type == pa.string()
+
+    run.write_batch(pd.DataFrame({"CODE": [1, 2]}))
+
+    assert run.schema_drift is False, "a castable batch is not drift"
+    assert run.file_count == 2
+
+    landed = _read_parquet_from_s3(s3_client, f"{run.prefix}/part-00001.parquet")
+    assert landed["CODE"].tolist() == ["1", "2"], "cast to the pinned string type"
+
+
+def test_a_cast_that_would_lose_data_drifts_instead(s3_client):
+    """
+    The cast is safe=True on purpose. An unsafe cast would silently truncate
+    a value too wide for its column -- worse than drift, because drift is
+    visible in the manifest and refused at Bronze, while a truncated number
+    just looks like data.
+    """
+    writer = LandingWriter(s3_client, BUCKET, "landing")
+    run = writer.start("acme", "orders", "r-lossy", "ACME", "PUBLIC", "ORDERS",
+                       ingest_date="2026-08-25")
+
+    declared = pa.schema([pa.field("SMALL", pa.int8())])
+    run.write_batch(pd.DataFrame({"SMALL": [1]}), declared_schema=declared)
+    run.write_batch(pd.DataFrame({"SMALL": [99999]}), declared_schema=declared)
+
+    assert run.schema_drift is True, "a value that does not fit must not be truncated"
