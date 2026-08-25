@@ -33,8 +33,31 @@ _S3_LOCATION_PATTERN = re.compile(r"^s3://[A-Za-z0-9._\-/=]+$")
 
 
 def quote_identifier(value):
-    """Double-quote an identifier for Athena/Trino, escaping embedded quotes."""
+    """
+    Quote an identifier for Athena's Trino engine (DML: SELECT, MERGE INTO).
+
+    Double quotes are ANSI/Trino. Do NOT use these in DDL -- see
+    quote_ddl_identifier.
+    """
     return '"' + str(value).replace('"', '""') + '"'
+
+
+def quote_ddl_identifier(value):
+    """
+    Quote an identifier for Athena's Hive DDL parser (CREATE / ALTER TABLE).
+
+    Backticks, not double quotes, and the distinction is not cosmetic: Athena
+    parses DDL with a Hive grammar and DML with Trino's. A double-quoted
+    identifier in a DDL statement makes Athena route the whole statement to
+    the Trino parser, which has no EXTERNAL keyword -- so
+
+        CREATE EXTERNAL TABLE "landing_x" (...)
+
+    fails with `mismatched input 'EXTERNAL'` pointing at column 8, before any
+    identifier appears. The error blames the keyword; the cause is the quotes
+    further along.
+    """
+    return "`" + str(value).replace("`", "``") + "`"
 
 
 def _validate_partition_values(ingest_date, run_id, location=None):
@@ -60,7 +83,7 @@ def add_partition_sql(landing_table, ingest_date, run_id, location):
     """
     _validate_partition_values(ingest_date, run_id, location)
     return (
-        f"ALTER TABLE {quote_identifier(landing_table)} ADD IF NOT EXISTS\n"
+        f"ALTER TABLE {quote_ddl_identifier(landing_table)} ADD IF NOT EXISTS\n"
         f"  PARTITION (ingest_date='{ingest_date}', run_id='{run_id}')\n"
         f"  LOCATION '{location}'"
     )
@@ -162,7 +185,7 @@ def create_bronze_table_sql(bronze_table, columns, location, partitioned_by=None
     explicit Iceberg partition-spec change.
     """
     column_ddl = ",\n  ".join(
-        f"{quote_identifier(name)} {sql_type}" for name, sql_type in columns
+        f"{quote_ddl_identifier(name)} {sql_type}" for name, sql_type in columns
     )
     partition_ddl = ""
     if partitioned_by:
@@ -171,12 +194,12 @@ def create_bronze_table_sql(bronze_table, columns, location, partitioned_by=None
         # name. Bare column names are quoted; transforms pass through, having
         # been allowlist-validated at config-parse time.
         rendered = [
-            c if "(" in c else quote_identifier(c) for c in partitioned_by
+            c if "(" in c else quote_ddl_identifier(c) for c in partitioned_by
         ]
         partition_ddl = f"PARTITIONED BY ({', '.join(rendered)})\n"
 
     return (
-        f"CREATE TABLE IF NOT EXISTS {quote_identifier(bronze_table)} (\n"
+        f"CREATE TABLE IF NOT EXISTS {quote_ddl_identifier(bronze_table)} (\n"
         f"  {column_ddl}\n"
         f")\n"
         f"{partition_ddl}"
@@ -199,10 +222,10 @@ def create_landing_table_sql(landing_table, columns, location):
     managed table.
     """
     column_ddl = ",\n  ".join(
-        f"{quote_identifier(name)} {sql_type}" for name, sql_type in columns
+        f"{quote_ddl_identifier(name)} {sql_type}" for name, sql_type in columns
     )
     return (
-        f"CREATE EXTERNAL TABLE IF NOT EXISTS {quote_identifier(landing_table)} (\n"
+        f"CREATE EXTERNAL TABLE IF NOT EXISTS {quote_ddl_identifier(landing_table)} (\n"
         f"  {column_ddl}\n"
         f")\n"
         f"PARTITIONED BY (ingest_date string, run_id string)\n"

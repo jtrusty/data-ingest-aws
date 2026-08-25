@@ -127,7 +127,7 @@ def test_a_new_column_is_added_to_the_table():
 
     assert existed is True
     assert len(athena.statements) == 1
-    assert athena.statements[0] == 'ALTER TABLE "t" ADD COLUMNS ("NEW_COL" string)'
+    assert athena.statements[0] == "ALTER TABLE `t` ADD COLUMNS (`NEW_COL` string)"
 
 
 def test_several_new_columns_are_added_in_one_statement():
@@ -140,7 +140,7 @@ def test_several_new_columns_are_added_in_one_statement():
         label="bronze table",
     )
 
-    assert athena.statements == ['ALTER TABLE "t" ADD COLUMNS ("A" string, "B" double)']
+    assert athena.statements == ["ALTER TABLE `t` ADD COLUMNS (`A` string, `B` double)"]
 
 
 def test_an_unchanged_schema_issues_no_statements():
@@ -196,6 +196,9 @@ def test_a_type_change_is_reported_even_alongside_valid_additions():
     assert athena.statements == []
 
 
-def test_add_columns_sql_quotes_identifiers():
+def test_add_columns_sql_uses_hive_backtick_quoting():
+    # ALTER TABLE is DDL, so it must use Athena's Hive grammar. Double quotes
+    # would route the statement to the Trino parser -- see test_ddl_and_dml_
+    # use_different_quoting in test_bronze_ddl.py.
     sql = add_columns_sql("my_table", [("MixedCase", "string")])
-    assert sql == 'ALTER TABLE "my_table" ADD COLUMNS ("MixedCase" string)'
+    assert sql == "ALTER TABLE `my_table` ADD COLUMNS (`MixedCase` string)"

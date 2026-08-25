@@ -113,7 +113,7 @@ def test_bronze_table_is_created_as_iceberg():
     )
     assert "'table_type' = 'ICEBERG'" in sql
     assert "CREATE TABLE IF NOT EXISTS" in sql
-    assert '"ORDER_KEY" bigint' in sql
+    assert "`ORDER_KEY` bigint" in sql
 
 
 def test_landing_external_table_is_partitioned_to_match_the_physical_layout():
@@ -161,7 +161,7 @@ def test_transform_partitions_are_not_quoted_as_identifiers():
         "t", [("A", "bigint")], "s3://b/t",
         ddl.resolve_partition_spec(("month({checkpoint_column})", "STORE_ID"), "UPDATED_AT"),
     )
-    assert "PARTITIONED BY (month(UPDATED_AT), \"STORE_ID\")" in sql
+    assert "PARTITIONED BY (month(UPDATED_AT), `STORE_ID`)" in sql
 
 
 def test_no_partition_spec_creates_an_unpartitioned_table():
@@ -178,3 +178,47 @@ def test_literal_partition_columns_survive_a_missing_checkpoint_column():
     assert ddl.resolve_partition_spec(
         ("month({checkpoint_column})", "REGION"), None
     ) == ["REGION"]
+
+
+def test_ddl_and_dml_use_different_quoting():
+    """
+    Athena parses DDL with a Hive grammar and DML with Trino's, and they
+    disagree about identifier quoting. A double-quoted identifier inside a
+    DDL statement routes the whole statement to the Trino parser, which has
+    no EXTERNAL keyword -- producing
+
+        line 1:8: mismatched input 'EXTERNAL'
+
+    which blames the keyword while the actual cause is the quotes further
+    along. That cost a real debugging cycle, so it is pinned here.
+    """
+    cols = [("ORDER_KEY", "bigint")]
+
+    ddl_statements = [
+        ddl.create_landing_table_sql("t", cols, "s3://b/t"),
+        ddl.create_bronze_table_sql("t", cols, "s3://b/t"),
+        ddl.add_partition_sql("t", "2026-08-25", "abc", "s3://b/p/"),
+    ]
+    for sql in ddl_statements:
+        assert '"' not in sql.split("LOCATION")[0], (
+            f"DDL must use backticks, not double quotes:\n{sql}"
+        )
+        assert "`" in sql
+
+    # MERGE INTO is genuinely Trino DML, where double quotes are correct.
+    merge = ddl.merge_sql("t", "l", "2026-08-25", "abc", ["ID"], "UPDATED_AT")
+    assert '"' in merge
+    assert "`" not in merge
+
+
+def test_external_keyword_is_present_for_the_landing_table():
+    # Required for non-Iceberg tables; Athena errors without it.
+    sql = ddl.create_landing_table_sql("t", [("A", "bigint")], "s3://b/t")
+    assert sql.startswith("CREATE EXTERNAL TABLE IF NOT EXISTS")
+
+
+def test_iceberg_table_omits_the_external_keyword():
+    # The inverse: EXTERNAL is NOT supported for Iceberg tables.
+    sql = ddl.create_bronze_table_sql("t", [("A", "bigint")], "s3://b/t")
+    assert sql.startswith("CREATE TABLE IF NOT EXISTS")
+    assert "EXTERNAL" not in sql

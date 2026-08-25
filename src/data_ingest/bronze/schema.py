@@ -92,12 +92,12 @@ def add_columns_sql(table, columns):
     Additive only. Athena has no combined add-and-retype statement, which
     suits us -- a retype should not be reachable by accident.
     """
-    from data_ingest.bronze.ddl import quote_identifier
+    from data_ingest.bronze.ddl import quote_ddl_identifier
 
     rendered = ", ".join(
-        f"{quote_identifier(name)} {sql_type}" for name, sql_type in columns
+        f"{quote_ddl_identifier(name)} {sql_type}" for name, sql_type in columns
     )
-    return f"ALTER TABLE {quote_identifier(table)} ADD COLUMNS ({rendered})"
+    return f"ALTER TABLE {quote_ddl_identifier(table)} ADD COLUMNS ({rendered})"
 
 
 def evolve_table(athena, glue_client, database, table, desired_columns, label):
