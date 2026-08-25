@@ -79,9 +79,9 @@ def test_stale_version_commit_is_rejected_and_leaves_winner_intact(state_table):
     """
     The `version = :expected` guard on an EXISTING record.
 
-    Previously untested: every concurrency test passed expected_version=None,
-    so only the attribute_not_exists branch ever ran. The entire
-    ConditionExpression could be deleted and the suite stayed green.
+    Worth its own test because a case that passes expected_version=None
+    exercises only the attribute_not_exists branch, leaving this half of the
+    ConditionExpression deletable without anything failing.
 
     Scenario: runs A and B both read version=1. A commits (-> 2). B then
     commits with its now-stale expected_version=1 and must be rejected

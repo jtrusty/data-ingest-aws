@@ -1,9 +1,9 @@
 """
-Bronze Glue entry point.
+Bronze Glue entry point -- the code Glue actually invokes.
 
-The ingestion side has test_run_job.py covering argument resolution and the
-missing-setting checks; Bronze had no equivalent, so its entry point sat at
-23% coverage while being the thing Glue actually invokes.
+Covers for Bronze what test_run_job.py covers for ingestion: argument
+resolution, CLI-over-config precedence, the missing-setting checks, which
+processed-run store gets selected, and the exit code on failure.
 """
 
 from contextlib import contextmanager

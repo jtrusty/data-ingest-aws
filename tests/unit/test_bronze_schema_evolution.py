@@ -1,7 +1,7 @@
 """
 Schema evolution between landing and Bronze.
 
-The bug this prevents is silent. CREATE TABLE IF NOT EXISTS is a no-op once
+The failure this prevents is silent. CREATE TABLE IF NOT EXISTS is a no-op once
 a table exists, so a column added in Snowflake lands in Parquet and is then
 invisible to Athena forever -- data present in S3, absent from Bronze, no
 error anywhere.

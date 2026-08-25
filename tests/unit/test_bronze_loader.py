@@ -432,12 +432,6 @@ def test_a_source_type_change_stops_the_load(env):
 
 def test_a_drifted_run_is_refused_before_any_athena_work(env):
     """
-    Regression for a production failure:
-
-        HIVE_BAD_DATA: Malformed Parquet file. Field vender_id's type INT64
-        in parquet file is incompatible with type decimal(38,0) defined in
-        table schema.
-
     A run whose files disagree with each other cannot be described by one
     table schema. Athena accepts the CREATE and then fails at READ time,
     blaming the file -- far from the extraction that produced it. Refusing up

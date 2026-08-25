@@ -155,9 +155,10 @@ bronze:
 
 # Execution policy, as opposed to the resources above.
 defaults:
-  # Rows per source batch. 10k, not a larger round number: a 1.3M-row full
-  # load of a wide fact table was OOM-killed (exit 137) at 50k on a Glue
-  # Python Shell job and completed at 10k. Python Shell is capped at
+  # Rows per source batch. 10k, not a larger round number, and the ceiling
+  # is memory rather than throughput: a wide fact table at 50k rows per batch
+  # exhausts the container and the job is SIGKILLed (exit 137), while 10k
+  # carries a 1.3M-row full load. Python Shell is capped at
   # 1 DPU / 16 GB and cannot be scaled up, so this is the main lever.
   # Raise it only with a real run behind it.
   fetch_size: 10000

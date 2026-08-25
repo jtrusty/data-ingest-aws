@@ -1,16 +1,16 @@
 """
 Reusable ingestion framework: source -> immutable S3 landing -> Iceberg Bronze.
 
-Nothing heavy is imported at package import time. `from data_ingest import
-run_job` used to pull pipeline -> landing -> pandas + pyarrow, which meant
-the Bronze job dragged the whole data stack into memory despite never
-touching a DataFrame -- Athena does all of its work. That cost it the ability
-to run on Glue's smallest Python Shell size (0.0625 DPU, ~1 GB), a 16x price
-difference for a job that is pure orchestration.
+Nothing heavy is imported at package import time. A direct
+`from data_ingest import run_job` would pull pipeline -> landing -> pandas +
+pyarrow, dragging the whole data stack into the Bronze job's memory even
+though it never touches a DataFrame -- Athena does all of its work. That
+would cost Bronze the smallest Python Shell size (0.0625 DPU, ~1 GB), a 16x
+price difference for a job that is pure orchestration.
 
-The module-level __getattr__ below (PEP 562) keeps `from data_ingest import
-run_job` working exactly as before, while deferring the import until the name
-is actually used. Import a name, pay for that name.
+The module-level __getattr__ below (PEP 562) keeps the import spelling
+unchanged while deferring the work until the name is actually used. Import a
+name, pay for that name.
 """
 
 # x-release-please-version

@@ -225,18 +225,16 @@ def test_declared_schema_covers_the_lineage_columns(s3_client):
 
 def test_scale_zero_number_columns_conform_to_the_declared_decimal(s3_client):
     """
-    Regression for a second drift warning, on ORDER_ID:
+    Snowflake's default NUMBER(38,0) declares as decimal128(38,0), but the
+    connector returns Python ints for scale-0 columns, so pandas types the
+    batch int64 -- and pyarrow cannot cast int64 to decimal128:
 
         Got bytestring of length 8 (expected 16)
         Conversion failed for column ORDER_ID with type int64
 
-    Snowflake's default NUMBER(38,0) declares as decimal128(38,0), but the
-    connector returns Python ints for scale-0 columns, so pandas types the
-    batch int64 -- and pyarrow cannot cast int64 to decimal128. Every ID
-    column therefore failed to conform and fell back to per-batch inference.
-
-    The declared type stays authoritative (it preserves precision beyond
-    int64); the data is adapted to it.
+    Without coercion every ID column fails to conform and falls back to
+    per-batch inference. The declared type stays authoritative because it
+    preserves precision beyond int64; the data is adapted to it.
     """
     import pyarrow as pa
 

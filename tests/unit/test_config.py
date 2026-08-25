@@ -407,7 +407,7 @@ def test_the_error_lists_the_keys_that_are_valid():
 # some different key.
 # --------------------------------------------------------------------------
 
-CONFIG_AS_DEPLOYED_BEFORE_THE_LAYER_REFACTOR = """
+CONFIG_WITH_STALE_TOP_LEVEL_KEYS = """
 source:
   name: acme
   type: snowflake
@@ -438,13 +438,13 @@ tables:
 """
 
 
-def test_a_previously_valid_config_fails_with_actionable_guidance():
+def test_a_stale_flat_config_fails_with_actionable_guidance():
     with pytest.raises(ConfigurationError) as exc_info:
-        parse_config(CONFIG_AS_DEPLOYED_BEFORE_THE_LAYER_REFACTOR)
+        parse_config(CONFIG_WITH_STALE_TOP_LEVEL_KEYS)
 
     message = str(exc_info.value)
-    # Names the stale key AND its replacement -- not just "something is
-    # missing", which is what sent someone looking in the wrong place.
+    # Names the stale key AND its replacement, so the message points at the
+    # edit to make rather than only saying that something is missing.
     assert "landing.bucket" in message
     assert "landing.location" in message
 
@@ -456,7 +456,7 @@ def test_the_failure_happens_at_parse_time():
     or resource problem rather than a typo.
     """
     with pytest.raises(ConfigurationError):
-        parse_config(CONFIG_AS_DEPLOYED_BEFORE_THE_LAYER_REFACTOR)
+        parse_config(CONFIG_WITH_STALE_TOP_LEVEL_KEYS)
 
 
 def test_every_problem_is_reported_at_once():
@@ -467,7 +467,7 @@ def test_every_problem_is_reported_at_once():
     at once is the normal case after a rename, not an edge case.
     """
     with pytest.raises(ConfigurationError) as exc_info:
-        parse_config(CONFIG_AS_DEPLOYED_BEFORE_THE_LAYER_REFACTOR.replace(
+        parse_config(CONFIG_WITH_STALE_TOP_LEVEL_KEYS.replace(
             "  fetch_size: 50000", "  fetch_sizee: 50000"
         ))
 

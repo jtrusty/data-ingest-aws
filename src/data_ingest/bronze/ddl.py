@@ -54,9 +54,9 @@ def normalize_column(name):
         Cannot find source column: last_update_dttm
 
     because one side was normalized and the other was not. Snowflake returns
-    identifiers uppercase, so this is every column in every table -- the fix
-    is to lowercase consistently on our side rather than fight what Athena
-    stores.
+    identifiers uppercase, so this is every column in every table. Generated
+    SQL therefore lowercases every identifier rather than fighting what
+    Athena stores.
 
     Only generated SQL is affected. The manifest keeps the source's own
     casing, since it records what was actually written to Parquet.

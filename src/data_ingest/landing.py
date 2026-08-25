@@ -166,8 +166,7 @@ class LandingRun:
         while the connector hands back Python ints and pandas types the
         column int64. pyarrow cannot cast int64 to decimal128, so every batch
         fails to conform and the writer falls back to per-batch inference --
-        which is exactly the schema drift the declared schema was added to
-        prevent.
+        exactly the schema drift a declared schema exists to prevent.
 
         Adapting the data rather than loosening the declaration keeps the
         source's precision, which matters for IDs wider than int64.

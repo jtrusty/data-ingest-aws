@@ -35,18 +35,15 @@ def reset_logging_state():
 
 def test_emits_when_the_host_already_configured_root_logging():
     """
-    THE regression test for a silent production failure.
+    The case that decides whether the job can be diagnosed at all.
 
     AWS Glue configures root logging before the job script runs and leaves
-    the root level above INFO. The previous implementation only called
-    basicConfig() `if not logging.getLogger().handlers`, so under Glue it
-    configured nothing, root filtered every INFO record, and the framework
-    produced no logs at all -- the first real failure had to be diagnosed
-    blind.
+    the root level above INFO. A configure_logging() that calls basicConfig()
+    only `if not logging.getLogger().handlers` therefore does nothing under
+    Glue: root filters every INFO record and the framework emits no logs.
 
-    Nothing caught it because a test process has no pre-existing root
-    handlers, so the guard never triggered. This test recreates Glue's
-    condition explicitly.
+    A test process has no pre-existing root handlers, so no ordinary test
+    reaches that state. This one recreates Glue's condition explicitly.
     """
     root = logging.getLogger()
     root.handlers = [logging.NullHandler()]
@@ -80,7 +77,7 @@ def test_emits_when_no_logging_is_configured_at_all():
 
 
 def test_does_not_modify_the_root_logger():
-    """A library configuring the host's root logger is the bug this avoids."""
+    """A library must not reconfigure its host's root logger."""
     root = logging.getLogger()
     sentinel = logging.NullHandler()
     root.handlers = [sentinel]

@@ -626,10 +626,10 @@ def parse_config(raw_text):
             f"landing path, and forms its DynamoDB source_key -- so it must be unique."
         )
 
-    # Two entries reading the same source object is no longer a correctness
-    # problem (they'd have distinct names, so distinct checkpoints and
-    # distinct landing paths), but it does mean extracting the same data
-    # twice and paying for it twice -- almost always a copy/paste mistake.
+    # Two entries reading the same source object is not a correctness problem
+    # -- distinct names mean distinct checkpoints and distinct landing paths
+    # -- but it does mean extracting the same data twice and paying for it
+    # twice, which is almost always a copy/paste mistake.
     duplicate_objects = _duplicates(t.source_object for t in tables)
     if duplicate_objects:
         raise ConfigurationError(

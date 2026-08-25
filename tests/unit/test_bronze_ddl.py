@@ -233,15 +233,15 @@ def test_iceberg_table_omits_the_external_keyword():
 
 def test_partition_transform_matches_the_declared_column_case():
     """
-    Regression for:
+    Athena stores column names lowercased and Iceberg then matches them
+    case-sensitively, so declaring `LAST_UPDATE_DTTM` while partitioning by
+    month(LAST_UPDATE_DTTM) leaves the two sides disagreeing:
 
         Failed to create bronze table ... Cannot find source column:
         last_update_dttm
 
-    Athena stores column names lowercased and Iceberg then matches them
-    case-sensitively, so declaring `LAST_UPDATE_DTTM` while partitioning by
-    month(LAST_UPDATE_DTTM) leaves the two sides disagreeing. Snowflake
-    returns every identifier uppercase, so this affected every table.
+    Snowflake returns every identifier uppercase, so this reaches every
+    column of every table.
     """
     sql = ddl.create_bronze_table_sql(
         "t",
@@ -272,12 +272,10 @@ def test_landing_table_columns_are_normalized_too():
 
 def test_merge_uses_an_explicit_column_list_not_insert_star():
     """
-    Regression for:
+    `INSERT *` is Spark/Databricks syntax. Trino -- and therefore Athena --
+    requires INSERT (cols) VALUES (...), and rejects the shorthand with
 
         line 8:30: mismatched input '*'. Expecting: '(', 'VALUES'
-
-    `INSERT *` is Spark/Databricks syntax. Trino -- and therefore Athena --
-    requires INSERT (cols) VALUES (...).
     """
     sql = ddl.merge_sql(
         "t", "l", "2026-08-25", "abc", ["ID"], "UPDATED_AT",

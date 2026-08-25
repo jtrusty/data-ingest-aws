@@ -57,6 +57,8 @@ src/data_ingest/
     loader.py       orchestration: discover runs -> merge -> record processed
     discovery.py    committed landing runs (skips anything without a manifest)
     ddl.py          MERGE / ADD PARTITION / CREATE TABLE generation
+    schema.py       catalog-vs-run schema diff, additive evolution, and the
+                    checks that refuse an unmergeable state
     athena.py       submit a statement, poll to a terminal state, fail loudly
     state.py        which runs have been merged (a cost optimization, not
                     correctness -- the merge is idempotent)
@@ -165,17 +167,27 @@ The merge:
 
 ```sql
 MERGE INTO "acme_snowflake_order_fact" AS target
-USING (SELECT * FROM "landing_acme_snowflake_order_fact"
-       WHERE ingest_date = '...' AND run_id = '...') AS source
-   ON target."ORDER_KEY" = source."ORDER_KEY"
-  AND target."LAST_UPDATE_DTTM" = source."LAST_UPDATE_DTTM"
-WHEN NOT MATCHED THEN INSERT *
+USING (
+  SELECT * FROM "landing_acme_snowflake_order_fact"
+  WHERE ingest_date = '2026-08-25' AND run_id = '3f2a9c1e'
+) AS source
+   ON target."order_key" = source."order_key"
+   AND target."last_update_dttm" = source."last_update_dttm"
+WHEN NOT MATCHED THEN INSERT ("order_key", "amount", "last_update_dttm")
+  VALUES (source."order_key", source."amount", source."last_update_dttm")
 ```
 
 **The dedup keys are already in your config.** `primary_key` and
 `checkpoint.column` exist because ingestion needs them, and they are exactly
 the identity Bronze deduplicates on. Onboarding a table to Bronze requires no
 new per-table configuration.
+
+Two details of that statement are not stylistic. Identifiers are lowercased
+because Athena stores them that way and Iceberg then matches
+case-sensitively; and the `INSERT` column list is explicit because `INSERT *`
+is Spark syntax that Trino rejects. The `INSERT` targets are unprefixed while
+the `VALUES` expressions are `source.`-prefixed — the two lists look
+symmetric but are not.
 
 Three properties follow from `WHEN NOT MATCHED THEN INSERT`:
 
@@ -259,7 +271,35 @@ the columns a table declares, so without evolution a column added upstream
 lands in Parquet and is then invisible — data in S3, absent from Bronze, no
 error anywhere.
 
+The comparison uses the **union** of every pending run's manifest schema,
+not one run's. Runs merged in a single pass legitimately disagree — a newer
+one has a column the source just gained, an older one predates it — and
+defining the tables from any single run breaks the rest: too narrow, and the
+merge's `SELECT *` cannot resolve `source.<col>` for a run that has it. A run
+lacking a column simply omits it from its `INSERT` list, and Iceberg writes
+NULL, which is the honest value.
+
+A rename therefore yields **both** columns, each NULL outside its own era.
+
 The Bronze role needs `glue:GetTable` for this.
+
+### What Bronze refuses
+
+Each of these stops the load with a message naming the cause and the fix,
+rather than letting Athena fail later with an error that points at the symptom.
+
+| Condition | Why it cannot proceed |
+|---|---|
+| Landing run marked `schema_drift` | Its Parquet files disagree with each other, so no single table schema describes them. Athena would accept the `CREATE` and fail at read time with `HIVE_BAD_DATA`, blaming the file rather than the extraction. |
+| Runs disagreeing on a column's **type** | One table cannot describe both, and picking one silently loses precision on the other. |
+| A run missing its own primary key or watermark | The `ON` clause would parse — the landing table declares the union — but compare against NULL, which never matches. Every row would be re-inserted on every pass. |
+| Iceberg metadata file missing | A catalog entry whose S3 metadata was deleted looks healthy to `GetTable`, so `CREATE TABLE IF NOT EXISTS` is skipped and the merge fails with `ICEBERG_MISSING_METADATA`. |
+| `table_prefix` changed after tables exist | See above — it would create a second set of tables and strand the first. |
+
+None of these self-heal. Dropping a catalog entry or deleting a prefix can
+destroy hours of landed data, so the job prints the `aws glue delete-table`
+command and stops. That is also why neither Glue role holds
+`glue:DeleteTable` or `s3:DeleteObject`.
 
 ### Table naming  (`bronze.table_prefix`)
 
@@ -330,6 +370,8 @@ is parsed by the test suite, so it cannot drift from the code. The shape:
 source:
   name: acme         # -> source_key "acme_snowflake"
   type: snowflake
+  database: ACME_ANALYTICS   # optional defaults for every table below
+  schema: REPORTING
 
 connection:
   secret_id: acme-snowflake-ro  # Secrets Manager ID, not the credentials
@@ -343,6 +385,8 @@ bronze:                          # omit entirely to stop at landing
   location: s3://my-data-lake-bucket/bronze
   athena_output: s3://my-data-lake-bucket/athena-results/
   processed_runs_table: bronze-processed-runs
+  # table_prefix: none                          # identity -- see Table naming
+  # partition_by: ["month({checkpoint_column})"]  # the default; CREATE-time only
 
 defaults:
   fetch_size: 10000
@@ -350,9 +394,8 @@ defaults:
 
 tables:
   - name: order_fct             # identity: landing segment + DynamoDB sort key
-    database: ACME_ANALYTICS
-    schema: REPORTING             # lineage only -- safe to change
-    table: ORDER_FACT_V          # lineage only -- safe to change
+    table: ORDER_FACT_V         # lineage only -- safe to change
+    # database / schema inherited from source: above; override per table
     primary_key: [ORDER_KEY]
     checkpoint:
       type: watermark

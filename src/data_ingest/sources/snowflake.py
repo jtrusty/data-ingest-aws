@@ -23,10 +23,11 @@ logger = get_logger(__name__)
 
 # Rows pulled per fetchmany() call.
 #
-# 10k rather than a larger round number for an empirical reason: a 1.3M-row
-# full load of a wide fact table was SIGKILLed (exit 137, OOM) at 50k on a
-# Glue Python Shell job, and completed at 10k. Python Shell is capped at
-# 1 DPU / 16 GB and cannot be scaled up, so the batch size is the main lever.
+# 10k, not a larger round number, and the ceiling is memory rather than
+# throughput. Python Shell is capped at 1 DPU / 16 GB with no way to scale up,
+# so batch size is the main lever: a wide fact table at 50k rows per batch
+# exhausts the container and the job is SIGKILLed (exit 137), while 10k carries
+# a 1.3M-row full load with headroom. Raise it only with a real run behind it.
 #
 # Rows arrive from the DB-API as tuples of Python objects, so every column
 # lands as pandas `object` dtype -- individually boxed values, not packed
