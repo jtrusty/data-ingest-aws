@@ -87,13 +87,21 @@ def write_config(tmp_path, text):
     return str(path)
 
 
-def test_missing_bronze_section_is_reported_clearly(tmp_path):
-    # Bronze is opt-in, so a config without the section is a normal state --
-    # but pointing the Bronze job at one is a mistake worth naming.
+def test_missing_bronze_section_warns_and_skips(package_logs, tmp_path):
+    """
+    Bronze is opt-in per source, so a landing-only config is a valid state.
+    A shared Bronze job pointed at several sources should skip the ones that
+    have not opted in rather than failing the run -- but loudly, because the
+    other reading is that someone expected this job to do something.
+    """
     config = write_config(tmp_path, BASE_CONFIG)
     with aws_env():
-        with pytest.raises(ConfigurationError, match="No bronze configuration"):
-            run_bronze_job(argv=["--config-uri", config])
+        result = run_bronze_job(argv=["--config-uri", config])
+
+    assert result == [], "nothing merged"
+    assert any("SKIPPING BRONZE" in r.getMessage() for r in package_logs), (
+        "a silent skip would look identical to a successful load"
+    )
 
 
 def test_settings_resolve_from_the_config(tmp_path):

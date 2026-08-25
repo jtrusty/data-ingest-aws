@@ -122,6 +122,21 @@ class LandingRun:
         dataframe["_source_table"] = self.source_table
         return dataframe
 
+    def _align_declared_schema(self, declared_schema, dataframe):
+        """
+        Extend a source-declared schema with the lineage columns.
+
+        The source describes its own columns only; _add_lineage_columns has
+        already appended _ingest_*/_source_* by the time this runs, and a
+        schema missing them would reject every batch.
+        """
+        fields = list(declared_schema)
+        declared_names = {f.name for f in fields}
+        for name in dataframe.columns:
+            if name not in declared_names:
+                fields.append(pa.field(name, pa.string()))
+        return pa.schema(fields)
+
     @staticmethod
     def _promote_null_fields(schema):
         """
@@ -139,7 +154,7 @@ class LandingRun:
         ]
         return pa.schema(fields)
 
-    def _to_arrow(self, dataframe):
+    def _to_arrow(self, dataframe, declared_schema=None):
         """
         Convert a batch to an Arrow table, holding the schema stable across
         the whole run.
@@ -152,8 +167,17 @@ class LandingRun:
         never be rewritten to fix it.
         """
         if self.schema is None:
-            inferred = pa.Table.from_pandas(dataframe, preserve_index=False).schema
-            self.schema = self._promote_null_fields(inferred)
+            if declared_schema is not None:
+                # Source metadata beats inference. The source knows a column
+                # is NUMBER(38,3); the first batch only shows the values that
+                # happen to be in it, and pyarrow would size the decimal to
+                # those -- so the first wider value later in the run cannot
+                # conform, splitting one immutable run prefix across two
+                # incompatible Parquet schemas.
+                self.schema = self._align_declared_schema(declared_schema, dataframe)
+            else:
+                inferred = pa.Table.from_pandas(dataframe, preserve_index=False).schema
+                self.schema = self._promote_null_fields(inferred)
 
         try:
             return pa.Table.from_pandas(dataframe, schema=self.schema, preserve_index=False)
@@ -177,7 +201,7 @@ class LandingRun:
             )
             return pa.Table.from_pandas(dataframe, preserve_index=False)
 
-    def write_batch(self, dataframe):
+    def write_batch(self, dataframe, declared_schema=None):
         """
         Write one batch as a new Snappy-compressed Parquet part-file. Safe
         to call repeatedly per run -- each call gets the next
@@ -193,7 +217,7 @@ class LandingRun:
         key = f"{self.prefix}/part-{self.file_count:05d}.parquet"
 
         try:
-            table = self._to_arrow(dataframe)
+            table = self._to_arrow(dataframe, declared_schema)
 
             # Buffer in memory rather than writing to local disk first --
             # Glue Python Shell's local disk is small/ephemeral, and these

@@ -11,6 +11,7 @@ Watermark fidelity is handled carefully here; see WATERMARK_CODECS below.
 """
 
 import pandas as pd
+import pyarrow as pa
 import snowflake.connector
 
 from data_ingest.checkpoints.watermark import WatermarkCheckpoint
@@ -50,6 +51,8 @@ _TYPE_TIMESTAMP_LTZ = 6
 _TYPE_TIMESTAMP_TZ = 7
 _TYPE_TIMESTAMP_NTZ = 8
 _TYPE_TIME = 12
+_TYPE_BINARY = 11
+_TYPE_BOOLEAN = 13
 
 
 class _Codec:
@@ -140,6 +143,55 @@ WATERMARK_CODECS = {
 }
 
 
+def arrow_type_for(type_code, precision, scale):
+    """
+    Map one Snowflake column's declared type to an Arrow type.
+
+    Uses the DECLARED type from cursor.description rather than inferring from
+    values, which is the whole point. pyarrow infers Decimal precision from
+    the first array element it sees, so a column declared NUMBER(38,3) whose
+    first batch happens to hold only small values infers as decimal128(4,3)
+    -- and the first batch containing a larger value then fails to conform,
+    splitting one run across two incompatible Parquet schemas. Snowflake
+    knows the real precision; ask it.
+    """
+    if type_code == _TYPE_FIXED:
+        # scale 0 is an integer in practice. int64 covers precision <= 18;
+        # beyond that only a decimal can hold the range.
+        if not scale:
+            return pa.int64() if (precision or 38) <= 18 else pa.decimal128(precision or 38, 0)
+        return pa.decimal128(precision or 38, scale)
+    if type_code == _TYPE_REAL:
+        return pa.float64()
+    if type_code == _TYPE_BOOLEAN:
+        return pa.bool_()
+    if type_code == _TYPE_DATE:
+        return pa.date32()
+    if type_code == _TYPE_TIME:
+        return pa.time64("ns")
+    if type_code in (_TYPE_TIMESTAMP, _TYPE_TIMESTAMP_NTZ):
+        return pa.timestamp("ns")
+    if type_code in (_TYPE_TIMESTAMP_LTZ, _TYPE_TIMESTAMP_TZ):
+        return pa.timestamp("ns", tz="UTC")
+    if type_code == _TYPE_BINARY:
+        return pa.binary()
+    # TEXT, VARIANT, OBJECT, ARRAY, GEOGRAPHY and anything unrecognized land
+    # as strings. The connector hands semi-structured columns back as JSON
+    # text, so string is both correct and stable.
+    return pa.string()
+
+
+def arrow_schema_from_description(description):
+    """Build a pyarrow schema from a DB-API cursor.description."""
+    fields = []
+    for column in description:
+        name, type_code = column[0], column[1]
+        precision = column[4] if len(column) > 4 else None
+        scale = column[5] if len(column) > 5 else None
+        fields.append(pa.field(name, arrow_type_for(type_code, precision, scale)))
+    return pa.schema(fields)
+
+
 def quote_identifier(value):
     """
     Quote a Snowflake identifier. Values come from our own configuration,
@@ -180,6 +232,7 @@ class SnowflakeSource(Source):
         self.prefetch_threads = prefetch_threads
 
         self._codec = None  # resolved lazily on first watermark read
+        self._arrow_schema = None  # set from cursor.description during extract()
 
         try:
             connection_args = {
@@ -230,6 +283,14 @@ class SnowflakeSource(Source):
                 quote_identifier(self.table),
             ]
         )
+
+    def arrow_schema(self):
+        """
+        The result set's declared Arrow schema, or None before extraction has
+        started. Lets the landing writer pin types from source metadata rather
+        than inferring them from whichever values land in the first batch.
+        """
+        return self._arrow_schema
 
     def metadata(self):
         return {
@@ -421,6 +482,11 @@ class SnowflakeSource(Source):
             # to build each batch's DataFrame with the correct headers
             # since fetchmany() returns bare row tuples.
             columns = [col[0] for col in cursor.description]
+
+            # Declared types for the whole result set, captured once. The
+            # landing writer uses this instead of inferring from batch 0 --
+            # see arrow_type_for() for why inference is not good enough.
+            self._arrow_schema = arrow_schema_from_description(cursor.description)
 
             batch_number = 0
             while True:

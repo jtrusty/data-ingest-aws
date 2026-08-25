@@ -245,7 +245,11 @@ def run_table(source, state_store, landing_writer, source_type, source_system, t
     # materialized in memory at once -- batch size is controlled by the
     # source adapter's fetch_size.
     for batch in source.extract(previous_checkpoint, current_checkpoint):
-        landing_run.write_batch(batch)
+        # arrow_schema() is populated once the source has described its
+        # result set, which happens before the first batch is yielded.
+        # Passing it lets the writer pin Parquet types from source metadata
+        # rather than inferring them from whichever values batch 0 contains.
+        landing_run.write_batch(batch, declared_schema=source.arrow_schema())
 
     # Generic checkpoint fields recorded in the manifest. `column` only
     # applies to watermark-style checkpoints; getattr() keeps this generic

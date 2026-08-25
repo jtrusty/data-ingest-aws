@@ -24,5 +24,18 @@ class Source(ABC):
     def metadata(self):
         """Return a dict describing the source object (database/schema/table etc)."""
 
+    def arrow_schema(self):
+        """
+        Declared Arrow schema for the extraction, or None if the adapter
+        cannot supply one.
+
+        Optional. When present, the landing writer pins Parquet types from it
+        instead of inferring them from the first batch -- which matters for
+        types whose width is not visible in a sample, notably decimals: a
+        NUMBER(38,3) column whose first batch holds only small values infers
+        as decimal128(4,3), and the first larger value then cannot conform.
+        """
+        return None
+
     def close(self):
         """Release any held resources. Default no-op."""

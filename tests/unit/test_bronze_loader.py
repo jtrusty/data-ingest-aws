@@ -63,6 +63,14 @@ def _write_run(s3, run_id, ingest_date="2026-08-24", status="SUCCESS",
                 "row_count": row_count,
                 "file_count": file_count,
                 "load_type": "incremental",
+                # The landing writer records the Arrow schema it actually
+                # wrote; Bronze derives its CREATE TABLE from this rather
+                # than from hand-maintained DDL that could drift.
+                "schema": [
+                    {"name": "ORDER_KEY", "type": "int64"},
+                    {"name": "AMOUNT", "type": "decimal128(38, 3)"},
+                    {"name": "LAST_UPDATE_DTTM", "type": "timestamp[ns]"},
+                ],
             }).encode(),
         )
     return prefix
@@ -97,6 +105,8 @@ def _load(s3, store, athena):
         athena=athena, s3_client=s3, processed_runs=store,
         bucket=BUCKET, landing_prefix="landing",
         source_key=SOURCE_KEY, table_config=make_table_config(),
+        bronze_location="s3://bronze-bucket/bronze",
+        partition_by=("month({checkpoint_column})",),
     )
 
 
@@ -282,4 +292,7 @@ def test_partition_is_registered_before_the_merge(env):
     _load(s3, store, athena)
 
     kinds = [s.split()[0] for s in athena.statements]
-    assert kinds == ["ALTER", "MERGE"]
+    assert kinds == ["CREATE", "CREATE", "ALTER", "MERGE"], (
+        "tables must be created before the partition is registered, and the "
+        "partition before the merge"
+    )

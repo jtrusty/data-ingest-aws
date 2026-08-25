@@ -135,3 +135,88 @@ def test_manifest_written_and_records_counts(s3_client):
     body = json.loads(obj["Body"].read())
     assert body["status"] == "SUCCESS"
     assert body["load_type"] == "full"
+
+
+# --------------------------------------------------------------------------
+# Declared schema vs inferred schema
+# --------------------------------------------------------------------------
+
+
+def test_declared_schema_prevents_decimal_precision_drift(s3_client):
+    """
+    The regression test for a real production warning:
+
+        Schema drift within run ... Decimal type with precision 5 does not
+        fit into precision inferred from first array element: 4
+
+    pyarrow sizes a decimal from the first array element it sees. A column
+    declared NUMBER(38,3) whose first batch holds only small values infers as
+    decimal128(4,3); the first larger value later in the run then cannot
+    conform, and the run splits across two incompatible Parquet schemas in
+    one immutable prefix that can never be rewritten.
+
+    The source knows the declared precision. Using it removes the guess.
+    """
+    import pyarrow as pa
+    from decimal import Decimal
+
+    declared = pa.schema([pa.field("AMT", pa.decimal128(38, 3))])
+
+    writer = LandingWriter(s3_client, BUCKET, "landing")
+    run = writer.start("acme", "orders", "run-1", "ACME", "PUBLIC", "ORDERS",
+                       ingest_date="2026-08-25")
+
+    # Batch 0 would infer decimal128(4,3); batch 1 needs more precision.
+    run.write_batch(pd.DataFrame({"AMT": [Decimal("1.234")]}), declared_schema=declared)
+    run.write_batch(pd.DataFrame({"AMT": [Decimal("12345.678")]}), declared_schema=declared)
+
+    assert run.file_count == 2
+    assert run.schema_drift is False, "declared types must remove the drift entirely"
+
+    base = "landing/acme/orders/ingest_date=2026-08-25/run_id=run-1"
+    schemas = [
+        pq.read_table(io.BytesIO(
+            s3_client.get_object(Bucket=BUCKET, Key=f"{base}/part-{i:05d}.parquet")["Body"].read()
+        )).schema
+        for i in (0, 1)
+    ]
+    assert schemas[0].equals(schemas[1])
+    assert schemas[0].field("AMT").type == pa.decimal128(38, 3)
+
+
+def test_inference_alone_would_have_drifted(s3_client):
+    """Confirms the test above is testing something -- without the declared
+    schema, the same two batches DO drift."""
+    from decimal import Decimal
+
+    writer = LandingWriter(s3_client, BUCKET, "landing")
+    run = writer.start("acme", "orders", "run-2", "ACME", "PUBLIC", "ORDERS",
+                       ingest_date="2026-08-25")
+
+    run.write_batch(pd.DataFrame({"AMT": [Decimal("1.234")]}))
+    run.write_batch(pd.DataFrame({"AMT": [Decimal("12345.678")]}))
+
+    assert run.schema_drift is True
+
+
+def test_declared_schema_covers_the_lineage_columns(s3_client):
+    """
+    The source describes its own columns only. Lineage columns are appended
+    by the writer, so a declared schema that omitted them would reject every
+    batch.
+    """
+    import pyarrow as pa
+
+    declared = pa.schema([pa.field("ID", pa.int64())])
+    writer = LandingWriter(s3_client, BUCKET, "landing")
+    run = writer.start("acme", "orders", "run-3", "ACME", "PUBLIC", "ORDERS",
+                       ingest_date="2026-08-25")
+
+    run.write_batch(pd.DataFrame({"ID": [1, 2]}), declared_schema=declared)
+
+    assert run.schema_drift is False
+    landed = _read_parquet_from_s3(
+        s3_client, "landing/acme/orders/ingest_date=2026-08-25/run_id=run-3/part-00000.parquet"
+    )
+    for column in LINEAGE_COLUMNS:
+        assert column in landed.columns

@@ -49,10 +49,23 @@ def run_bronze_job(argv=None):
 
     bronze = config.bronze
     if bronze is None and not (args.bronze_database and args.athena_output):
-        raise ConfigurationError(
-            "No bronze configuration found. Add a `bronze:` section to "
-            f"{args.config_uri!r}, or pass --bronze-database and --athena-output."
+        # Bronze is opt-in per source, so a landing-only config is a valid
+        # state, not an error -- a shared Bronze job pointed at several
+        # sources should skip the ones that have not opted in rather than
+        # failing the whole run.
+        #
+        # Warned loudly rather than logged at info, because the other reading
+        # is a misconfiguration: someone created a Bronze job and expected it
+        # to do something. A green job that silently did nothing is the worse
+        # outcome of the two.
+        logger.warning(
+            "SKIPPING BRONZE for %s: the config at %s has no `bronze:` section, so "
+            "this source has not opted in. Nothing was merged. If that is "
+            "unintended, add a `bronze:` block (database, location, athena_output) "
+            "or pass --bronze-database and --athena-output.",
+            config.source_key, args.config_uri,
         )
+        return []
 
     s3_bucket = _resolve(args.s3_bucket, config.landing.bucket, None)
     s3_prefix = _resolve(args.s3_prefix, config.landing.prefix, "landing")
@@ -109,6 +122,8 @@ def run_bronze_job(argv=None):
             source_key=config.source_key,
             tables=tables,
             fail_fast=fail_fast,
+            bronze_location=bronze.location if bronze else None,
+            partition_by=bronze.partition_by if bronze else (),
         )
     except Exception:
         logger.exception("Bronze load failed")
