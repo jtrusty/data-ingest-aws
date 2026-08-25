@@ -317,6 +317,51 @@ bronze:
     assert config.bronze.partition_by == ()
 
 
+def test_table_prefix_defaults_to_the_source_key():
+    """
+    The safe default: two sources can share one Glue database without
+    colliding. Dropping the prefix has to be a deliberate statement that the
+    database holds exactly one source.
+    """
+    config = parse_config(VALID_YAML + """
+bronze:
+  database: d
+  location: s3://x/bronze
+  athena_output: s3://x/results/
+""")
+    assert config.bronze.table_prefix == "source_key"
+
+
+def test_table_prefix_can_be_dropped():
+    config = parse_config(VALID_YAML + """
+bronze:
+  database: d
+  location: s3://x/bronze
+  athena_output: s3://x/results/
+  table_prefix: none
+""")
+    assert config.bronze.table_prefix == "none"
+
+
+def test_an_unknown_table_prefix_is_rejected_at_parse_time():
+    """
+    table_prefix decides what the Athena tables are CALLED, so a typo that
+    fell through to a default would silently name every table the other way
+    and strand whatever already exists. Both valid values are named in the
+    error, since the setting is not guessable.
+    """
+    with pytest.raises(ConfigurationError) as exc_info:
+        parse_config(VALID_YAML + """
+bronze:
+  database: d
+  location: s3://x/bronze
+  athena_output: s3://x/results/
+  table_prefix: no
+""")
+    message = str(exc_info.value)
+    assert "source_key" in message and "'none'" in message
+
+
 def test_partition_spec_is_validated_against_known_transforms():
     with pytest.raises(ConfigurationError, match="not a bare column name"):
         parse_config(VALID_YAML + """
