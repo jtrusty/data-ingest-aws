@@ -18,7 +18,7 @@ def test_merge_deduplicates_on_primary_key_plus_watermark():
         run_id="abc-123",
         primary_key=["ORDER_KEY"],
         watermark_column="LAST_UPDATE_DTTM",
-        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
+        columns=[("ORDER_KEY", "bigint"), ("LAST_UPDATE_DTTM", "timestamp")],
     )
 
     assert 'target."order_key" = source."order_key"' in sql
@@ -34,7 +34,7 @@ def test_merge_supports_composite_primary_keys():
         ingest_date="2026-08-24", run_id="r",
         primary_key=["ORDER_KEY", "LINE_NO"],
         watermark_column="UPDATED_AT",
-        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
+        columns=[("ORDER_KEY", "bigint"), ("LINE_NO", "int"), ("UPDATED_AT", "timestamp")],
     )
     for column in ("ORDER_KEY", "LINE_NO", "UPDATED_AT"):
         assert f'target."{column.lower()}" = source."{column.lower()}"' in sql
@@ -138,7 +138,7 @@ def test_identifiers_are_quoted_and_normalized():
         bronze_table="t", landing_table="l",
         ingest_date="2026-08-24", run_id="r",
         primary_key=["OrderKey"], watermark_column="LastUpdate",
-        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
+        columns=[("OrderKey", "bigint"), ("LastUpdate", "timestamp")],
     )
     assert '"orderkey"' in sql
     assert '"lastupdate"' in sql

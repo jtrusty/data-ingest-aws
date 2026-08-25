@@ -495,3 +495,126 @@ def test_tables_are_created_from_the_newest_run_schema(env):
     assert all("`added_later` string" in c for c in creates), (
         "the column only the newest run has must be present at creation"
     )
+
+
+# --------------------------------------------------------------------------
+# Runs that disagree about their columns
+# --------------------------------------------------------------------------
+
+BASE_SCHEMA = [
+    {"name": "ORDER_KEY", "type": "int64"},
+    {"name": "LAST_UPDATE_DTTM", "type": "timestamp[ns]"},
+]
+
+
+def _write_run_with_schema(s3, run_id, schema, ingest_date="2026-08-24"):
+    prefix = f"landing/{SOURCE_KEY}/{TABLE}/ingest_date={ingest_date}/run_id={run_id}"
+    s3.put_object(Bucket=BUCKET, Key=f"{prefix}/part-00000.parquet", Body=b"x")
+    s3.put_object(
+        Bucket=BUCKET, Key=f"{prefix}/_manifest.json",
+        Body=json.dumps({
+            "status": "SUCCESS", "run_id": run_id, "row_count": 1,
+            "file_count": 1, "load_type": "incremental", "schema": schema,
+        }).encode(),
+    )
+
+
+def test_tables_declare_every_column_any_pending_run_has(env):
+    """
+    Defining the tables from one run breaks the others. Too narrow and the
+    merge's `SELECT *` cannot resolve source.<col> for a run that has it --
+    Athena fails with "cannot find source column". The union is the only
+    column list that works for all of them.
+    """
+    s3, store = env
+    _write_run_with_schema(s3, "run-a", BASE_SCHEMA + [{"name": "OLD_COL", "type": "string"}],
+                           ingest_date="2026-08-01")
+    _write_run_with_schema(s3, "run-b", BASE_SCHEMA + [{"name": "NEW_COL", "type": "string"}],
+                           ingest_date="2026-08-25")
+
+    athena = FakeAthena()
+    _load(s3, store, athena)
+
+    creates = [s for s in athena.statements if s.startswith("CREATE")]
+    assert len(creates) == 2, "landing external table and bronze table"
+    for statement in creates:
+        assert "`old_col` string" in statement, "the dropped column must stay declared"
+        assert "`new_col` string" in statement, "the added column must be declared"
+
+
+def test_a_run_missing_a_column_simply_does_not_insert_it(env):
+    """
+    NULL is the honest value: that run genuinely carried nothing for the
+    column. Naming it in the INSERT list would require inventing a value.
+    """
+    s3, store = env
+    _write_run_with_schema(s3, "run-old", BASE_SCHEMA, ingest_date="2026-08-01")
+    _write_run_with_schema(s3, "run-new", BASE_SCHEMA + [{"name": "NEW_COL", "type": "string"}],
+                           ingest_date="2026-08-25")
+
+    athena = FakeAthena()
+    _load(s3, store, athena)
+
+    old_merge, new_merge = athena.merges
+    assert "new_col" not in old_merge, "the run that lacks it must leave it NULL"
+    assert '"new_col"' in new_merge, "the run that has it must insert it"
+
+
+def test_a_renamed_column_lands_as_a_new_column(env):
+    """
+    At the schema level a rename is indistinguishable from a drop plus an
+    add, and guessing rewrites history in a way nothing downstream flags. So
+    both names exist: rows before the rename carry the old one, rows after
+    carry the new one, and each reads NULL for the other.
+    """
+    s3, store = env
+    _write_run_with_schema(s3, "before", BASE_SCHEMA + [{"name": "CUST_ID", "type": "string"}],
+                           ingest_date="2026-08-01")
+    _write_run_with_schema(s3, "after", BASE_SCHEMA + [{"name": "CUSTOMER_ID", "type": "string"}],
+                           ingest_date="2026-08-25")
+
+    athena = FakeAthena()
+    _load(s3, store, athena)
+
+    create = next(s for s in athena.statements if s.startswith("CREATE"))
+    assert "`cust_id` string" in create and "`customer_id` string" in create
+
+    before_merge, after_merge = athena.merges
+    assert '"cust_id"' in before_merge and "customer_id" not in before_merge
+    assert '"customer_id"' in after_merge and "cust_id" not in after_merge
+
+
+def test_runs_that_disagree_on_a_column_type_are_refused(env):
+    """
+    One Athena table cannot describe both, and picking one silently loses
+    precision on the other -- the read-time HIVE_BAD_DATA this whole guard
+    exists to pre-empt.
+    """
+    s3, store = env
+    _write_run_with_schema(s3, "narrow", BASE_SCHEMA + [{"name": "AMOUNT", "type": "decimal128(10, 2)"}],
+                           ingest_date="2026-08-01")
+    _write_run_with_schema(s3, "wide", BASE_SCHEMA + [{"name": "AMOUNT", "type": "decimal128(38, 3)"}],
+                           ingest_date="2026-08-25")
+
+    athena = FakeAthena()
+    with pytest.raises(DataIngestError, match="disagree on the type"):
+        _load(s3, store, athena)
+
+    assert athena.statements == [], "nothing may run against an undecidable schema"
+
+
+def test_a_run_missing_its_match_columns_is_refused(env):
+    """
+    The ON clause would still parse -- the landing table declares the union
+    -- but compare against NULL, which never matches. Every row would be
+    re-inserted on every pass, duplicating Bronze silently.
+    """
+    s3, store = env
+    _write_run_with_schema(s3, "no-pk", [{"name": "LAST_UPDATE_DTTM", "type": "timestamp[ns]"},
+                                         {"name": "AMOUNT", "type": "int64"}])
+
+    athena = FakeAthena()
+    with pytest.raises(DataIngestError, match="deduplicates on"):
+        _load(s3, store, athena)
+
+    assert athena.merges == [], "no merge may be issued"

@@ -121,8 +121,62 @@ def columns_from_manifest_schema(manifest_schema):
     return [(field["name"], athena_type_for(field["type"])) for field in manifest_schema]
 
 
+def union_manifest_schemas(runs):
+    """
+    One column list covering every run that is about to be merged.
+
+    A single run's schema is not enough to define the tables. The runs being
+    merged in one pass can legitimately disagree:
+
+      * a run NEWER than the table adds a column -- the source gained one
+      * a run OLDER than the table lacks a column -- it predates the addition
+      * a run only some runs have -- the source dropped a column, or renamed
+        one, which at the schema level is indistinguishable from a drop plus
+        an add
+
+    Defining the tables from any one run breaks the others. Too narrow and
+    `SELECT *` from the landing table cannot resolve `source.<col>` for a run
+    that has it -- Athena fails with "cannot find source column". Too narrow
+    on the Bronze side and a column lands in Parquet and is invisible
+    forever, because CREATE TABLE IF NOT EXISTS is a no-op.
+
+    So take the union. A run missing a column simply does not name it in its
+    INSERT list and Iceberg writes NULL, which is the honest value: that run
+    genuinely carried nothing for it.
+
+    Order is newest-run-first, because that is the current source shape, with
+    columns only older runs have appended after. Returns [] when no run
+    records a schema.
+    """
+    ordered = []
+    types = {}
+    origin = {}
+    # Newest first so the current shape leads, then older runs contribute
+    # only what they alone still have.
+    for run in reversed(runs):
+        for name, athena_type in columns_from_manifest_schema(
+            run.manifest.get("schema")
+        ) or []:
+            key = name.lower()
+            if key not in types:
+                ordered.append(name)
+                types[key] = athena_type
+                origin[key] = run.run_id
+                continue
+            if types[key] != athena_type:
+                raise DataIngestError(
+                    f"Landing runs disagree on the type of column `{name}`: run "
+                    f"{origin[key]} landed it as {types[key]}, run {run.run_id} as "
+                    f"{athena_type}. One Athena table cannot describe both, and "
+                    f"guessing which is right would silently lose precision on the "
+                    f"other. Resolve it deliberately -- cast the column in the "
+                    f"source, or re-land the older runs -- then re-run."
+                )
+    return [(name, types[name.lower()]) for name in ordered]
+
+
 def _ensure_tables(athena, glue_client, database, bronze_table, landing_table,
-                   bronze_location, landing_location, manifest_schema,
+                   bronze_location, landing_location, columns,
                    table_config, partition_by):
     """
     Create both Athena tables if absent, or evolve them if the source has
@@ -132,7 +186,6 @@ def _ensure_tables(athena, glue_client, database, bronze_table, landing_table,
     once the table exists, so a column added in Snowflake would land in
     Parquet and then be invisible to Athena forever. See bronze/schema.py.
     """
-    columns = columns_from_manifest_schema(manifest_schema)
     if not columns:
         raise DataIngestError(
             f"Cannot create Athena tables for {table_config.name}: the landing "
@@ -222,10 +275,12 @@ def load_table_runs(
     # run and removes a manual bootstrap step that would otherwise have to
     # happen once per table, by hand, in the Athena console.
     #
-    # The column list comes from the manifest's recorded schema -- the
+    # The column list comes from the manifests' recorded schemas -- the
     # landing writer captures the Arrow schema it actually wrote, so the
     # Athena tables are defined from what is really in the Parquet rather
     # than from a hand-maintained DDL that can drift.
+    table_columns = union_manifest_schemas(runs)
+
     _ensure_tables(
         athena=athena,
         glue_client=glue_client,
@@ -234,12 +289,10 @@ def load_table_runs(
         landing_table=landing_table,
         bronze_location=bronze_location,
         landing_location=f"s3://{bucket}/{landing_prefix.rstrip('/')}/{source_key}/{table_name}",
-        # The NEWEST run, not the oldest: it reflects the current source
-        # shape. Anything older that lacks a column simply reads NULL for it,
-        # whereas creating from the oldest would omit every column added
-        # since and leave schema evolution to backfill what should have been
-        # right at creation.
-        manifest_schema=runs[-1].manifest.get("schema"),
+        # Every column any pending run has, not one run's view of the world.
+        # A run that lacks one reads NULL for it; a run that has one the
+        # others lack still resolves in the merge.
+        columns=table_columns,
         table_config=table_config,
         partition_by=partition_by,
     )

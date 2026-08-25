@@ -151,6 +151,24 @@ def merge_sql(bronze_table, landing_table, ingest_date, run_id, primary_key,
         )
 
     match_columns = list(primary_key) + [watermark_column]
+
+    # A run that does not carry its own match columns is not mergeable. The
+    # ON clause would still parse -- the landing table declares the union of
+    # every run's columns, so `source.<col>` resolves -- but it would read
+    # NULL, and NULL never equals anything. Every row would look unmatched
+    # and be inserted, silently duplicating rows already in Bronze on every
+    # single pass. Fail instead.
+    landed = {normalize_column(name) for name, _type in columns}
+    missing = [c for c in match_columns if normalize_column(c) not in landed]
+    if missing:
+        raise ConfigurationError(
+            f"Cannot merge {bronze_table}: this landing run did not land the "
+            f"column(s) {missing}, which Bronze deduplicates on. Matching on a "
+            f"column the run lacks compares against NULL, which never matches, so "
+            f"every row would be re-inserted on every pass. Check that "
+            f"primary_key and the checkpoint column still exist in the source."
+        )
+
     # Lowercased for the same reason as the DDL: the columns exist in the
     # catalog lowercased, and Iceberg matches case-sensitively.
     on_clause = "\n   AND ".join(
