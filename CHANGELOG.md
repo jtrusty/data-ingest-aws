@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.1.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.0.0...v1.1.0) (2026-08-25)
+
+
+### Features
+
+* **bronze:** apply added source columns instead of dropping them silently ([de0d6ac](https://github.com/jtrusty/data-ingest-aws/commit/de0d6ac164543ccd6cee30186cf731b4b2159185))
+
+
+### Bug Fixes
+
+* **config:** reject unknown keys instead of silently ignoring them ([540aa54](https://github.com/jtrusty/data-ingest-aws/commit/540aa545af38fdb973dd3f8f589a085ef54bd749))
+* pin Parquet types from source metadata, create Athena tables, skip Bronze cleanly ([35b0533](https://github.com/jtrusty/data-ingest-aws/commit/35b0533b6a80fd559ccc42dc4cdd2033042c301a))
+
+
+### Documentation
+
+* bring the README up to date with Bronze, and regroup by task ([a29f8e1](https://github.com/jtrusty/data-ingest-aws/commit/a29f8e135d4d232273ee09d535d398ab34e5eeaa))
+* **config:** comment out partition_by and flag its one-shot nature ([7f44571](https://github.com/jtrusty/data-ingest-aws/commit/7f445712fd1b9adc3ab3be20dd9d6189aba4374b))
+* state the versioning posture explicitly ([c123ed5](https://github.com/jtrusty/data-ingest-aws/commit/c123ed58b440b0c4df4bd0fad5eccd23d6b8de7a))
+
 ## [1.0.0](https://github.com/jtrusty/data-ingest-aws/compare/v0.1.2...v1.0.0) (2026-08-24)
 
 
