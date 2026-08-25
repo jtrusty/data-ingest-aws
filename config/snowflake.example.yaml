@@ -85,6 +85,26 @@ landing:
 # section is identical in shape no matter which source produced the data.
 bronze:
   database: bronze_acme                       # Glue Data Catalog database
+
+  # Whether Bronze table names carry the source key.
+  #
+  #   source_key (default)  bronze_acme.acme_snowflake_order_fact
+  #   none                  bronze_acme.order_fact
+  #
+  # The prefix keeps two sources from colliding in ONE Glue database. With a
+  # database per source that cannot happen, and the prefix is noise an
+  # analyst types forever -- the schema already says which source it is.
+  #
+  # >>> IDENTITY. SET IT WHEN ONBOARDING, THEN LEAVE IT ALONE. <<<
+  #
+  # It decides what the tables are CALLED. Changing it later does not rename
+  # them; it creates a SECOND set beside the first and strands everything
+  # already merged under a name nothing queries. The loader refuses when it
+  # detects this, but the only real fix is to drop the old tables, clear
+  # their processed-runs rows, and re-merge.
+  #
+  # Keep it as source_key if several sources share one Bronze database.
+  # table_prefix: none
   location: s3://my-data-lake-bucket/bronze   # Iceberg table root
   athena_output: s3://my-data-lake-bucket/athena-results/
   athena_workgroup: primary

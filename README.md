@@ -261,18 +261,60 @@ error anywhere.
 
 The Bronze role needs `glue:GetTable` for this.
 
+### Table naming  (`bronze.table_prefix`)
+
+| Setting | Table name | Use when |
+|---|---|---|
+| `source_key` (default) | `acme_snowflake_order_fact` | Several sources share one Bronze database |
+| `none` | `order_fact` | One Glue database per source |
+
+The prefix exists to stop two sources colliding in one Glue database. With a
+database per source that can't happen, and the prefix is noise an analyst
+types in every query — the schema already says which source it is.
+
+**This is identity.** It decides what the tables are *called*, and the loader
+cannot rename. Changing it after tables exist would create a second set
+beside the first and strand everything already merged under a name nothing
+queries — present in S3, absent from every query, nothing failing. The loader
+detects the mismatch and refuses, but the only real fix is to drop the old
+tables, clear their rows from the processed-runs table, and re-merge.
+
+Set it when onboarding a source, then leave it alone.
+
 ### Consuming from Redshift
 
+Bronze needs no Redshift-side DDL: the Glue Data Catalog already describes
+the Iceberg tables, and Spectrum reads them in place — no copy, no second
+storage location.
+
 ```sql
-CREATE EXTERNAL SCHEMA bronze
+CREATE EXTERNAL SCHEMA bronze_acme
 FROM DATA CATALOG DATABASE 'bronze_acme'
 IAM_ROLE 'arn:aws:iam::<account>:role/<redshift-role>';
 
-SELECT * FROM bronze.acme_snowflake_order_fact;
+GRANT USAGE ON SCHEMA bronze_acme TO GROUP analysts;
+GRANT SELECT ON ALL TABLES IN SCHEMA bronze_acme TO GROUP analysts;
+
+SELECT * FROM bronze_acme.order_fact;      -- with table_prefix: none
 ```
 
-Redshift reads the Iceberg tables in place through the Glue Data Catalog —
-no copy, no second storage location.
+New tables appear in the external schema automatically. A new *source* needs
+one more `CREATE EXTERNAL SCHEMA` only if it gets its own Glue database.
+
+The Redshift IAM role needs `glue:GetDatabase*` / `glue:GetTable*` /
+`glue:GetPartition*`, plus `s3:GetObject` and `s3:ListBucket` on the Bronze
+location. If the catalog is Lake Formation-managed, IAM alone is not enough —
+grant the role `SELECT` on the database in Lake Formation as well. The symptom
+otherwise is a permissions error naming the table while the S3 grants look
+correct.
+
+Two things to know before pointing analysts at it:
+
+- **Spectrum is read-only on Iceberg.** The Glue job owns all writes, which
+  is what keeps Bronze's history intact.
+- **Bronze retains every version of a row** — the merge identity is primary
+  key + watermark, so an order edited three times is three rows. Collapsing
+  to current state belongs in a view or in Silver, not here.
 
 ## Configuring a source
 
@@ -393,6 +435,13 @@ aws dynamodb create-table \
 aws glue create-database --region us-east-2 \
   --database-input '{"Name":"bronze_acme"}'
 ```
+
+One database per source, or one shared across all of them — both work,
+because every key already carries `source_key`. Pick on **access isolation**:
+Lake Formation grants are per database, so a source whose data shouldn't be
+visible to everyone wants its own. Otherwise share one and Redshift needs a
+single external schema forever. See `bronze.table_prefix` above, which should
+match the choice.
 
 ### Secrets Manager
 

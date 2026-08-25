@@ -53,7 +53,7 @@ class TableResult:
         return sum(1 for r in self.runs if r.status == "MERGED")
 
 
-def bronze_table_name(source_key, table_name):
+def bronze_table_name(source_key, table_name, table_prefix="source_key"):
     """
     Bronze table naming: "<source_key>_<table_name>", e.g.
     "acme_snowflake_order_fact".
@@ -63,13 +63,28 @@ def bronze_table_name(source_key, table_name):
     source_key in the name means two sources with a same-named table coexist
     in one Bronze database without collision -- the same reasoning that put
     source_key in the landing path and the checkpoint key.
+
+    With table_prefix="none" the prefix is dropped, giving "order_fact". That
+    is only safe when the Glue database holds ONE source, which is the point:
+    the database name already says which source it is, so
+    `bronze_olo.olo_snowflake_order_fact_v` repeats itself in every query an
+    analyst writes.
     """
+    if table_prefix == "none":
+        return table_name
     return f"{source_key}_{table_name}"
 
 
-def landing_table_name(source_key, table_name):
-    """External table over landing, namespaced to avoid colliding with Bronze."""
-    return f"landing_{source_key}_{table_name}"
+def landing_table_name(source_key, table_name, table_prefix="source_key"):
+    """
+    External table over landing, namespaced to avoid colliding with Bronze.
+
+    The `landing_` prefix is not optional -- it is what keeps this table
+    distinct from the Bronze table of the same name in the same database.
+    Only the source key follows bronze_table_name's setting, so the two stay
+    symmetric.
+    """
+    return f"landing_{bronze_table_name(source_key, table_name, table_prefix)}"
 
 
 ATHENA_TYPE_FOR_ARROW = {
@@ -175,9 +190,50 @@ def union_manifest_schemas(runs):
     return [(name, types[name.lower()]) for name in ordered]
 
 
+def _check_not_stranded(glue_client, database, chosen, alternate, table_prefix):
+    """
+    Refuse to create a second set of tables next to an existing first set.
+
+    bronze.table_prefix decides what the Athena tables are CALLED, so changing
+    it after tables exist does not rename anything. The loader would look for
+    a name that is not there, happily CREATE it, and merge into the new table
+    -- leaving every previously merged row under the old name. Present in S3,
+    absent from every query, nothing failing. The Redshift external schema
+    would show both, one of them silently truncated.
+
+    Deleting or renaming the old table automatically is not on the table:
+    either can destroy data that took hours to land. Refuse and let a person
+    decide.
+    """
+    if chosen == alternate:
+        return
+    try:
+        glue_client.get_table(DatabaseName=database, Name=chosen)
+        return  # The name in use matches the setting; nothing to warn about.
+    except glue_client.exceptions.EntityNotFoundException:
+        pass
+    try:
+        glue_client.get_table(DatabaseName=database, Name=alternate)
+    except glue_client.exceptions.EntityNotFoundException:
+        return  # Neither exists: a first run, which is the time to choose.
+
+    raise DataIngestError(
+        f"bronze.table_prefix is {table_prefix!r}, so this table would be created as "
+        f"`{database}.{chosen}` -- but `{database}.{alternate}` already exists, which "
+        f"is what the other setting produces. table_prefix is identity, not "
+        f"presentation: proceeding would create a second table beside the first and "
+        f"strand everything already merged under a name nothing queries. Either put "
+        f"table_prefix back to what it was, or drop the old table "
+        f"(`aws glue delete-table --database-name {database} --name {alternate}`), "
+        f"clear its rows from the processed-runs table, and let the landing runs "
+        f"re-merge under the new name."
+    )
+
+
 def _ensure_tables(athena, glue_client, s3_client, database, bronze_table,
                    landing_table, bronze_location, landing_location, columns,
-                   table_config, partition_by):
+                   table_config, partition_by, alternate_bronze_table=None,
+                   table_prefix="source_key"):
     """
     Create both Athena tables if absent, or evolve them if the source has
     gained columns since they were created.
@@ -186,6 +242,12 @@ def _ensure_tables(athena, glue_client, s3_client, database, bronze_table,
     once the table exists, so a column added in Snowflake would land in
     Parquet and then be invisible to Athena forever. See bronze/schema.py.
     """
+    # First, before ANY DDL: renaming is not something the loader can do, so
+    # a table_prefix change must be caught before it creates the landing
+    # table under the new name too.
+    _check_not_stranded(glue_client, database, bronze_table, alternate_bronze_table,
+                        table_prefix)
+
     if not columns:
         raise DataIngestError(
             f"Cannot create Athena tables for {table_config.name}: the landing "
@@ -234,6 +296,7 @@ def load_table_runs(
     partition_by=(),
     glue_client=None,
     database=None,
+    table_prefix="source_key",
 ):
     """
     Merge every un-processed committed run for one table.
@@ -244,8 +307,8 @@ def load_table_runs(
     behind them.
     """
     table_name = table_config.name
-    bronze_table = bronze_table_name(source_key, table_name)
-    landing_table = landing_table_name(source_key, table_name)
+    bronze_table = bronze_table_name(source_key, table_name, table_prefix)
+    landing_table = landing_table_name(source_key, table_name, table_prefix)
 
     runs = discover_runs(s3_client, bucket, landing_prefix, source_key, table_name)
 
@@ -299,6 +362,13 @@ def load_table_runs(
         # A run that lacks one reads NULL for it; a run that has one the
         # others lack still resolves in the merge.
         columns=table_columns,
+        # What this table would be called under the OTHER table_prefix, so a
+        # changed setting is caught before it strands the existing tables.
+        alternate_bronze_table=bronze_table_name(
+            source_key, table_name,
+            "none" if table_prefix == "source_key" else "source_key",
+        ),
+        table_prefix=table_prefix,
         table_config=table_config,
         partition_by=partition_by,
     )
@@ -394,6 +464,7 @@ def load_bronze(
     partition_by=(),
     glue_client=None,
     database=None,
+    table_prefix="source_key",
 ):
     """Run every requested table through load_table_runs."""
     results = []
@@ -414,6 +485,7 @@ def load_bronze(
                     partition_by=partition_by,
                     glue_client=glue_client,
                     database=database,
+                    table_prefix=table_prefix,
                 )
             )
         except Exception as exc:

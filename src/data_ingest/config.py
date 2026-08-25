@@ -180,6 +180,30 @@ class BronzeConfig:
     # ALTER, not a re-CREATE.
     partition_by: tuple = DEFAULT_PARTITION_BY
 
+    # Whether Bronze table names carry the source key:
+    #
+    #   "source_key" (default)  bronze_olo.olo_snowflake_order_fact_v
+    #   "none"                  bronze_olo.order_fact_v
+    #
+    # The prefix exists to keep two sources from colliding in ONE Glue
+    # database. With a database per source that cannot happen, and the prefix
+    # is pure noise an analyst types forever -- the schema already says which
+    # source it is.
+    #
+    # >>> THIS IS IDENTITY. <<<
+    #
+    # It decides what the Athena tables are CALLED. Changing it after tables
+    # exist does not rename them: the loader looks for a name that is not
+    # there, creates a second set of tables alongside the first, and the
+    # original data is stranded under the old names -- present in S3, absent
+    # from every query, with nothing failing. The loader refuses when it sees
+    # this rather than letting it happen quietly (see bronze/loader.py), but
+    # the only real fix is to re-land.
+    #
+    # Set it when onboarding a source and then leave it alone. If you share
+    # one Bronze database across sources, it MUST stay "source_key".
+    table_prefix: str = "source_key"
+
     @property
     def location_root(self):
         return self.location.rstrip("/")
@@ -480,8 +504,19 @@ def _parse_bronze(data):
     for spec in partition_by:
         _validate_partition_spec(spec)
 
+    table_prefix = data.get("table_prefix", "source_key")
+    if table_prefix not in ("source_key", "none"):
+        raise ConfigurationError(
+            f"bronze.table_prefix must be 'source_key' or 'none', got "
+            f"{table_prefix!r}. 'source_key' names tables "
+            f"<source_key>_<table> so several sources can share one Glue "
+            f"database; 'none' names them <table>, which is only safe when "
+            f"the database holds exactly one source."
+        )
+
     return BronzeConfig(
         partition_by=tuple(partition_by),
+        table_prefix=table_prefix,
         database=data["database"],
         location=data["location"],
         athena_output=data["athena_output"],
@@ -556,7 +591,7 @@ def parse_config(raw_text):
     _collect_unknown_keys(
         "bronze", data.get("bronze") or {},
         {"database", "location", "athena_output", "athena_workgroup",
-         "processed_runs_table", "partition_by"},
+         "processed_runs_table", "partition_by", "table_prefix"},
         problems,
     )
     for table_entry in data.get("tables") or []:

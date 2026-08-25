@@ -618,3 +618,106 @@ def test_a_run_missing_its_match_columns_is_refused(env):
         _load(s3, store, athena)
 
     assert athena.merges == [], "no merge may be issued"
+
+
+# --------------------------------------------------------------------------
+# bronze.table_prefix
+# --------------------------------------------------------------------------
+
+
+def _load_with_prefix(s3, store, athena, table_prefix, glue=None):
+    return load_table_runs(
+        athena=athena, s3_client=s3, processed_runs=store,
+        bucket=BUCKET, landing_prefix="landing",
+        source_key=SOURCE_KEY, table_config=make_table_config(),
+        bronze_location="s3://bronze-bucket/bronze",
+        partition_by=(),
+        glue_client=glue if glue is not None else FakeGlue(),
+        database="bronze_db",
+        table_prefix=table_prefix,
+    )
+
+
+def test_the_source_key_prefix_is_the_default():
+    # Two sources must be able to share one Glue database without colliding.
+    assert bronze_table_name("acme_snowflake", "order_fact") == \
+        "acme_snowflake_order_fact"
+    assert landing_table_name("acme_snowflake", "order_fact") == \
+        "landing_acme_snowflake_order_fact"
+
+
+def test_the_prefix_can_be_dropped_for_a_single_source_database():
+    """
+    With a Glue database per source the prefix is redundant -- the schema
+    already says which source it is, so bronze_olo.olo_snowflake_order_fact
+    repeats itself in every query an analyst writes.
+    """
+    assert bronze_table_name("acme_snowflake", "order_fact", "none") == "order_fact"
+
+
+def test_the_landing_prefix_survives_dropping_the_source_key():
+    # `landing_` is what keeps the external table distinct from the Bronze
+    # table of the same name in the same database; only the source key is
+    # optional.
+    assert landing_table_name("acme_snowflake", "order_fact", "none") == \
+        "landing_order_fact"
+
+
+def test_dropping_the_prefix_creates_unprefixed_tables(env):
+    s3, store = env
+    _write_run(s3, "run-1")
+
+    athena = FakeAthena()
+    _load_with_prefix(s3, store, athena, "none")
+
+    creates = [s for s in athena.statements if s.startswith("CREATE")]
+    assert any("`order_fact`" in c for c in creates), "bronze table, unprefixed"
+    assert any("`landing_order_fact`" in c for c in creates), "landing table"
+    # The source key still appears in the landing LOCATION -- it is the S3
+    # layout, which is unaffected. Only the table NAMES lose it.
+    assert not any(f"`{SOURCE_KEY}" in c for c in creates)
+
+
+def test_changing_the_prefix_after_tables_exist_is_refused(env):
+    """
+    table_prefix is identity, not presentation. The loader cannot rename, so
+    proceeding would CREATE a second table beside the first and strand
+    everything already merged under a name nothing queries -- present in S3,
+    absent from every query, nothing failing.
+    """
+    s3, store = env
+    _write_run(s3, "run-1")
+
+    # The table already exists under the OLD (prefixed) name.
+    glue = FakeGlue({f"{SOURCE_KEY}_{TABLE}": {"ORDER_KEY": "bigint"}})
+    athena = FakeAthena()
+
+    with pytest.raises(DataIngestError, match="table_prefix"):
+        _load_with_prefix(s3, store, athena, "none", glue=glue)
+
+    assert athena.statements == [], "nothing may run before a human decides"
+
+
+def test_the_reverse_prefix_change_is_refused_too(env):
+    # Going from "none" back to "source_key" strands data just as thoroughly.
+    s3, store = env
+    _write_run(s3, "run-1")
+
+    glue = FakeGlue({TABLE: {"ORDER_KEY": "bigint"}})
+    athena = FakeAthena()
+
+    with pytest.raises(DataIngestError, match="already exists"):
+        _load_with_prefix(s3, store, athena, "source_key", glue=glue)
+
+
+def test_a_first_run_chooses_freely(env):
+    # Neither name exists, which is exactly when the setting is meant to be
+    # decided. It must not be mistaken for a change.
+    s3, store = env
+    _write_run(s3, "run-1")
+
+    athena = FakeAthena()
+    result = _load_with_prefix(s3, store, athena, "none", glue=FakeGlue())
+
+    assert result.status == "SUCCESS"
+    assert athena.merges, "the merge must actually run"
