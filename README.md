@@ -453,6 +453,308 @@ database/schema/table mappings, which are configuration:
  "warehouse": "...", "role": "..."}
 ```
 
+## IAM roles
+
+Four roles, one per trust boundary. They are deliberately **not** one shared
+role: the landing job holds Snowflake credentials and never touches Athena;
+the Bronze job creates catalog tables and never sees a secret; Redshift reads
+and writes nothing. A single role would give every one of those the union.
+
+| Role | Trusted by | Holds |
+|---|---|---|
+| `data-ingest-landing-glue` | `glue.amazonaws.com` | Snowflake secret, write to landing, checkpoints |
+| `data-ingest-bronze-glue` | `glue.amazonaws.com` | Read landing, write Bronze, Athena, Glue Catalog |
+| `data-ingest-redshift-spectrum` | `redshift.amazonaws.com` | Read-only: Glue Catalog + Bronze S3 |
+| `data-ingest-gha-publisher` | GitHub OIDC | Write the wheel to the artifact bucket (optional) |
+
+Substitute `<account>`, `<region>`, `<data-lake-bucket>`, `<glue-assets-bucket>`,
+`<bronze-db>`, and the secret name throughout.
+
+### Trust policies
+
+Both Glue roles:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "glue.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+```
+
+Redshift: the same with `redshift.amazonaws.com`.
+
+### 1. Landing job role
+
+Every statement maps to a call the job actually makes: `GetSecretValue` for
+the Snowflake credentials, `PutObject` for Parquet and the manifest,
+`GetItem`/`PutItem`/`Query` for checkpoints, and `GetObject` for the config
+and the wheel.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SnowflakeCredentials",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:<region>:<account>:secret:<secret-name>-*"
+    },
+    {
+      "Sid": "WriteLanding",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::<data-lake-bucket>/landing/*"
+    },
+    {
+      "Sid": "ReadConfigAndWheel",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::<data-lake-bucket>/config/*",
+        "arn:aws:s3:::<glue-assets-bucket>/scripts/*",
+        "arn:aws:s3:::<glue-assets-bucket>/python/data_ingest/*"
+      ]
+    },
+    {
+      "Sid": "Checkpoints",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"],
+      "Resource": "arn:aws:dynamodb:<region>:<account>:table/<checkpoint-table>"
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:<region>:<account>:log-group:/aws-glue/*"
+    }
+  ]
+}
+```
+
+**No `s3:DeleteObject`.** Landing is immutable and lifecycle owns retention,
+so the job has no business deleting a landed run — and a bug therefore
+cannot. Clearing a prefix to re-land is a deliberate act by a human with
+their own credentials.
+
+**No `dynamodb:DeleteItem`.** Deleting a checkpoint triggers a full reload of
+that table. Same reasoning.
+
+### 2. Bronze job role
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListLandingForRunDiscovery",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::<data-lake-bucket>",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["landing/*", "bronze/*", "athena-results/*"] }
+      }
+    },
+    {
+      "Sid": "ReadLanding",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::<data-lake-bucket>/landing/*"
+    },
+    {
+      "Sid": "WriteBronzeAndAthenaResults",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject", "s3:PutObject",
+        "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
+      ],
+      "Resource": [
+        "arn:aws:s3:::<data-lake-bucket>/bronze/*",
+        "arn:aws:s3:::<data-lake-bucket>/athena-results/*"
+      ]
+    },
+    {
+      "Sid": "ReadConfigAndWheel",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::<data-lake-bucket>/config/*",
+        "arn:aws:s3:::<glue-assets-bucket>/scripts/*",
+        "arn:aws:s3:::<glue-assets-bucket>/python/data_ingest/*"
+      ]
+    },
+    {
+      "Sid": "RunAthenaStatements",
+      "Effect": "Allow",
+      "Action": [
+        "athena:StartQueryExecution",
+        "athena:GetQueryExecution",
+        "athena:StopQueryExecution",
+        "athena:GetWorkGroup"
+      ],
+      "Resource": "arn:aws:athena:<region>:<account>:workgroup/primary"
+    },
+    {
+      "Sid": "GlueCatalog",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetDatabase", "glue:GetDatabases",
+        "glue:GetTable", "glue:GetTables",
+        "glue:CreateTable", "glue:UpdateTable",
+        "glue:GetPartition", "glue:GetPartitions",
+        "glue:BatchGetPartition", "glue:BatchCreatePartition", "glue:CreatePartition"
+      ],
+      "Resource": [
+        "arn:aws:glue:<region>:<account>:catalog",
+        "arn:aws:glue:<region>:<account>:database/<bronze-db>",
+        "arn:aws:glue:<region>:<account>:table/<bronze-db>/*"
+      ]
+    },
+    {
+      "Sid": "ProcessedRuns",
+      "Effect": "Allow",
+      "Action": ["dynamodb:Query", "dynamodb:PutItem"],
+      "Resource": "arn:aws:dynamodb:<region>:<account>:table/<processed-runs-table>"
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:<region>:<account>:log-group:/aws-glue/*"
+    }
+  ]
+}
+```
+
+Why each of the less obvious ones:
+
+- **`s3:ListBucket`** — run discovery paginates `list_objects_v2` over the
+  landing tree. Without it Bronze reports "no committed landing runs found"
+  rather than an access error, which reads as a config mistake.
+- **`glue:UpdateTable`** — every Iceberg commit moves the table's
+  `metadata_location` pointer. Without it the MERGE fails *after* writing
+  data files.
+- **`glue:BatchCreatePartition`** — the landing external table is Hive, and
+  each run is registered with `ALTER TABLE ... ADD PARTITION`.
+- **`glue:GetTable`** — read before write: schema evolution diffs the live
+  catalog schema, and the orphaned-metadata check reads
+  `metadata_location`.
+- **`athena:GetWorkGroup`** — `StartQueryExecution` resolves the workgroup's
+  result configuration before running.
+
+**No `glue:DeleteTable` or `glue:DeleteDatabase`.** Nothing in the loader
+drops a table, and the recovery procedures that do (a stale Iceberg catalog
+entry, a `table_prefix` change) are deliberately manual. The error messages
+print the `aws glue delete-table` command precisely because the job cannot
+run it itself.
+
+**No `s3:DeleteObject`.** The merge only ever inserts, so Iceberg writes new
+files and never rewrites or deletes. If an `UPDATE`/`DELETE` clause is ever
+added to the merge, this becomes required — treat needing it as a signal that
+Bronze's retention model changed.
+
+### 3. Redshift Spectrum role
+
+Read-only. Spectrum cannot write Iceberg, and the Glue job owning all writes
+is what keeps Bronze's history intact.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadCatalog",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetDatabase", "glue:GetDatabases",
+        "glue:GetTable", "glue:GetTables",
+        "glue:GetPartition", "glue:GetPartitions", "glue:BatchGetPartition"
+      ],
+      "Resource": [
+        "arn:aws:glue:<region>:<account>:catalog",
+        "arn:aws:glue:<region>:<account>:database/<bronze-db>",
+        "arn:aws:glue:<region>:<account>:table/<bronze-db>/*"
+      ]
+    },
+    {
+      "Sid": "ReadBronzeData",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": [
+        "arn:aws:s3:::<data-lake-bucket>",
+        "arn:aws:s3:::<data-lake-bucket>/bronze/*"
+      ]
+    }
+  ]
+}
+```
+
+Attach it to the cluster or Serverless namespace under **Associated IAM
+roles**, then reference the ARN in `CREATE EXTERNAL SCHEMA`.
+
+Scope `Resource` to one database per source if you run a database per source
+and the isolation is meant to bind the Redshift role too, not just analysts.
+
+### 4. GitHub Actions publisher (optional)
+
+Only needed if CI uploads the wheel to S3 rather than a human doing it.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:PutObject"],
+    "Resource": "arn:aws:s3:::<glue-assets-bucket>/python/data_ingest/*"
+  }]
+}
+```
+
+Trusted through GitHub's OIDC provider, with the subject condition pinned to
+this repository so another repo cannot assume it:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:<org>/data-ingest-aws:ref:refs/tags/v*"
+      }
+    }
+  }]
+}
+```
+
+Pinning `sub` to tag refs means only a released tag can publish — a pull
+request from a fork cannot. No long-lived AWS keys in GitHub secrets.
+
+### Two things these policies assume
+
+**SSE-KMS.** If any bucket, the DynamoDB tables, or the secret use a customer
+managed key, IAM alone is not enough — every role touching them also needs
+`kms:Decrypt`, and the writing roles `kms:GenerateDataKey`, on that key ARN,
+plus a matching key policy. Symptom is `AccessDenied` on an object whose
+bucket policy plainly allows the call.
+
+**Lake Formation.** If the Glue Data Catalog is LF-managed, IAM is only half
+the check. The Bronze role needs LF `CREATE_TABLE`/`ALTER`/`DESCRIBE` on the
+database, and the Redshift role `SELECT` (plus `lakeformation:GetDataAccess`).
+Symptom is a permissions error naming the table while the S3 and Glue grants
+look correct.
+
 ## Glue job arguments
 
 Only `--config-uri` is required. `--state-table`, `--s3-bucket`,
@@ -629,31 +931,7 @@ before touching any dependency pin.
 
 ### IAM the Glue roles need
 
-The **landing** role needs Secrets Manager `GetSecretValue`, S3
-`PutObject`/`GetObject`/`ListBucket` on the landing prefix, and DynamoDB
-`GetItem`/`PutItem` on the checkpoint table. Deliberately **not**
-`s3:DeleteObject` — landing is immutable, and lifecycle owns retention.
-
-The **Bronze** role needs S3 read on landing plus read/write on the Bronze
-prefix and the Athena output location, DynamoDB `Query`/`PutItem` on the
-processed-runs table, Athena `StartQueryExecution`/`GetQueryExecution`/
-`StopQueryExecution`, and Glue Data Catalog access
-(including `glue:GetTable`, used to read the live schema before each merge)
-for the databases and tables it creates, evolves, and merges into.
-
-Both roles must be able to write logs, or the job runs blind:
-
-```
-logs:CreateLogGroup
-logs:CreateLogStream
-logs:PutLogEvents      on arn:aws:logs:*:*:log-group:/aws-glue/*
-```
-
-These come with the managed `AWSGlueServiceRole` policy, so this only bites
-on a hand-rolled least-privilege role. The log groups are created lazily on
-first write, so a missing permission shows up as "log group does not exist"
-rather than an access error — indistinguishable at a glance from a job that
-never ran.
+See [IAM roles](#iam-roles) above for the full policies.
 
 ### The two Glue job definitions
 
