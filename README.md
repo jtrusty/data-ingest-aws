@@ -292,8 +292,13 @@ CREATE EXTERNAL SCHEMA bronze_acme
 FROM DATA CATALOG DATABASE 'bronze_acme'
 IAM_ROLE 'arn:aws:iam::<account>:role/<redshift-role>';
 
+-- USAGE is the read grant for a Spectrum external schema. It covers every
+-- table in it, including ones created later, so onboarding a table needs no
+-- Redshift change. There is no GRANT SELECT here: per-table grants on
+-- external tables only work when the schema is registered with Lake
+-- Formation, and against a plain Glue catalog the statement fails.
+-- Authorization to the data itself is the IAM role above, not this grant.
 GRANT USAGE ON SCHEMA bronze_acme TO GROUP analysts;
-GRANT SELECT ON ALL TABLES IN SCHEMA bronze_acme TO GROUP analysts;
 
 SELECT * FROM bronze_acme.order_fact;      -- with table_prefix: none
 ```
