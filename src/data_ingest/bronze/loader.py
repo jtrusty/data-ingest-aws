@@ -22,7 +22,7 @@ from typing import List, Optional
 
 from data_ingest.bronze import ddl
 from data_ingest.bronze.discovery import discover_runs
-from data_ingest.bronze.schema import evolve_table
+from data_ingest.bronze.schema import check_iceberg_metadata, evolve_table
 from data_ingest.exceptions import DataIngestError
 from data_ingest.logging import get_logger
 
@@ -175,8 +175,8 @@ def union_manifest_schemas(runs):
     return [(name, types[name.lower()]) for name in ordered]
 
 
-def _ensure_tables(athena, glue_client, database, bronze_table, landing_table,
-                   bronze_location, landing_location, columns,
+def _ensure_tables(athena, glue_client, s3_client, database, bronze_table,
+                   landing_table, bronze_location, landing_location, columns,
                    table_config, partition_by):
     """
     Create both Athena tables if absent, or evolve them if the source has
@@ -202,6 +202,11 @@ def _ensure_tables(athena, glue_client, database, bronze_table, landing_table,
             ddl.create_landing_table_sql(landing_table, columns, landing_location),
             description=f"create landing table {landing_table}",
         )
+
+    # Before trusting the catalog's answer about the Bronze table: a catalog
+    # entry whose Iceberg metadata was deleted looks healthy here and fails
+    # far later, at merge time, with ICEBERG_MISSING_METADATA.
+    check_iceberg_metadata(glue_client, s3_client, database, bronze_table)
 
     if not evolve_table(athena, glue_client, database, bronze_table, columns,
                         label="bronze table"):
@@ -284,6 +289,7 @@ def load_table_runs(
     _ensure_tables(
         athena=athena,
         glue_client=glue_client,
+        s3_client=s3_client,
         database=database,
         bronze_table=bronze_table,
         landing_table=landing_table,

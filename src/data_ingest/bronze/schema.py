@@ -58,6 +58,56 @@ def get_table_columns(glue_client, database, table):
     return columns
 
 
+def check_iceberg_metadata(glue_client, s3_client, database, table):
+    """
+    Verify that an Iceberg table's metadata file still exists in S3.
+
+    An Iceberg table is two things: a Glue catalog entry, and a metadata file
+    in S3 that the entry points at via the `metadata_location` parameter.
+    Deleting the S3 prefix removes the second but not the first, leaving a
+    catalog entry that looks entirely healthy -- get_table succeeds, the
+    columns are all there, so evolve_table reports the table as existing and
+    the loader skips CREATE. The failure surfaces much later, at merge time:
+
+        ICEBERG_MISSING_METADATA: Metadata not found in metadata location
+        for table <db>.<table>
+
+    which names Athena and the table but not the cause, and not the fix.
+
+    This is a normal consequence of clearing S3 to re-land data, so it is
+    worth one HEAD request per table per run to say what actually happened.
+    Deliberately NOT self-healing: dropping the catalog entry automatically
+    would discard a real table on any transient S3 error.
+    """
+    try:
+        response = glue_client.get_table(DatabaseName=database, Name=table)
+    except glue_client.exceptions.EntityNotFoundException:
+        return  # Not created yet; the caller will create it.
+
+    parameters = response["Table"].get("Parameters") or {}
+    location = parameters.get("metadata_location")
+    if not location or not location.startswith("s3://"):
+        return  # Not an Iceberg table, or a catalog that does not record it.
+
+    bucket, _, key = location[len("s3://"):].partition("/")
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return
+    except Exception as exc:  # noqa: BLE001 - any failure to confirm is fatal
+        if "404" not in str(exc) and "Not Found" not in str(exc):
+            raise
+
+    raise SchemaChangeError(
+        f"Iceberg table `{database}.{table}` is registered in the Glue Data "
+        f"Catalog but its metadata file is gone: {location} does not exist. "
+        f"This is what clearing the S3 prefix without dropping the table looks "
+        f"like -- the catalog entry survives, so nothing recreates the table, "
+        f"and the merge fails with ICEBERG_MISSING_METADATA. Drop the stale "
+        f"entry and re-run, which will recreate it: "
+        f"`aws glue delete-table --database-name {database} --name {table}`."
+    )
+
+
 def diff_columns(existing, desired):
     """
     Compare a catalog schema against the schema a landing run actually wrote.

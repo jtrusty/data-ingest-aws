@@ -11,6 +11,7 @@ import pytest
 
 from data_ingest.bronze.schema import (
     SchemaChangeError,
+    check_iceberg_metadata,
     add_columns_sql,
     diff_columns,
     evolve_table,
@@ -202,3 +203,84 @@ def test_add_columns_sql_uses_hive_backtick_quoting():
     # use_different_quoting in test_bronze_ddl.py.
     sql = add_columns_sql("my_table", [("MixedCase", "string")])
     assert sql == "ALTER TABLE `my_table` ADD COLUMNS (`mixedcase` string)"
+
+
+# --------------------------------------------------------------------------
+# Orphaned Iceberg catalog entries
+# --------------------------------------------------------------------------
+
+
+class FakeGlueWithParameters(FakeGlue):
+    def __init__(self, metadata_location):
+        super().__init__({"t": {"columns": {"ID": "bigint"}}})
+        self.metadata_location = metadata_location
+
+    def get_table(self, DatabaseName, Name):
+        response = super().get_table(DatabaseName, Name)
+        if self.metadata_location is not None:
+            response["Table"]["Parameters"] = {
+                "metadata_location": self.metadata_location,
+                "table_type": "ICEBERG",
+            }
+        return response
+
+
+class FakeS3:
+    def __init__(self, keys=()):
+        self.keys = set(keys)
+
+    def head_object(self, Bucket, Key):
+        if (Bucket, Key) not in self.keys:
+            raise Exception("An error occurred (404) when calling HeadObject: Not Found")
+        return {}
+
+
+def test_a_catalog_entry_whose_metadata_was_deleted_is_named_as_such():
+    """
+    An Iceberg table is a catalog entry PLUS a metadata file. Clearing the S3
+    prefix to re-land data removes the second and leaves the first, so
+    get_table succeeds, the table looks healthy, CREATE is skipped -- and the
+    failure surfaces much later as ICEBERG_MISSING_METADATA, naming Athena
+    but not the cause.
+    """
+    glue = FakeGlueWithParameters("s3://bronze-bucket/bronze/t/metadata/00001.json")
+
+    with pytest.raises(SchemaChangeError) as exc_info:
+        check_iceberg_metadata(glue, FakeS3(), "db", "t")
+
+    message = str(exc_info.value)
+    assert "metadata file is gone" in message
+    assert "s3://bronze-bucket/bronze/t/metadata/00001.json" in message
+    assert "delete-table" in message, "the message must carry the fix"
+
+
+def test_a_healthy_iceberg_table_passes():
+    location = "s3://bronze-bucket/bronze/t/metadata/00001.json"
+    glue = FakeGlueWithParameters(location)
+    s3 = FakeS3({("bronze-bucket", "bronze/t/metadata/00001.json")})
+    check_iceberg_metadata(glue, s3, "db", "t")  # no raise
+
+
+def test_a_table_that_does_not_exist_yet_is_not_an_error():
+    # The caller creates it; a missing table is the normal bootstrap path.
+    check_iceberg_metadata(FakeGlue(), FakeS3(), "db", "absent")
+
+
+def test_a_non_iceberg_table_is_left_alone():
+    # The landing external table is Hive, and records no metadata_location.
+    check_iceberg_metadata(FakeGlueWithParameters(None), FakeS3(), "db", "t")
+
+
+def test_an_s3_error_that_is_not_a_404_propagates():
+    """
+    A permissions failure or a throttle is not evidence the table is
+    orphaned. Telling the operator to drop a healthy table on a transient
+    error would destroy real data.
+    """
+    class AngryS3:
+        def head_object(self, Bucket, Key):
+            raise Exception("An error occurred (AccessDenied) when calling HeadObject")
+
+    glue = FakeGlueWithParameters("s3://b/k.json")
+    with pytest.raises(Exception, match="AccessDenied"):
+        check_iceberg_metadata(glue, AngryS3(), "db", "t")
