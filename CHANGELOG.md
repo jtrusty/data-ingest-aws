@@ -1,5 +1,31 @@
 # Changelog
 
+## [1.2.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.1.0...v1.2.0) (2026-08-25)
+
+
+### Features
+
+* **bronze:** make the source_key table prefix optional ([783917f](https://github.com/jtrusty/data-ingest-aws/commit/783917f63584f1486c2f85f7b6802ccb0e33f707))
+* **config:** let tables inherit database and schema from the source ([7acdf43](https://github.com/jtrusty/data-ingest-aws/commit/7acdf4384ca0620147691060a34f3ee583d069a6))
+* define Bronze tables from the union of every pending run's schema ([ef43872](https://github.com/jtrusty/data-ingest-aws/commit/ef438724a277bdcf0d5949dc55dceb90bf6ca93f))
+
+
+### Bug Fixes
+
+* **bronze:** normalize column names to lowercase in generated SQL ([8a586d1](https://github.com/jtrusty/data-ingest-aws/commit/8a586d1f074fcb98775bf7da763c54099af97366))
+* **bronze:** use an explicit INSERT column list; Trino has no INSERT * ([42bb8a7](https://github.com/jtrusty/data-ingest-aws/commit/42bb8a72b103f5826653fa83498e34965a1072bc))
+* **bronze:** use Hive backtick quoting in DDL, not Trino double quotes ([5662c89](https://github.com/jtrusty/data-ingest-aws/commit/5662c893da861fff8d398a2e57a47582a53c9eed))
+* cast a non-conforming batch to the pinned schema before declaring drift ([fe14651](https://github.com/jtrusty/data-ingest-aws/commit/fe146516ca007b70541a5abc3cd02286ce3e7272))
+* detect an Iceberg catalog entry whose metadata file was deleted ([65e6b71](https://github.com/jtrusty/data-ingest-aws/commit/65e6b717f23dd9ff4a036b092319efacac356774))
+* refuse drifted landing runs, and stop the manifest claiming a schema it lacks ([1c8bc2f](https://github.com/jtrusty/data-ingest-aws/commit/1c8bc2f69b7006a868a13d53645b503f38280a42))
+
+
+### Documentation
+
+* correct the Redshift grant -- USAGE only, not GRANT SELECT ([b0f806a](https://github.com/jtrusty/data-ingest-aws/commit/b0f806a6753950a334f2fd50810cc970726d19dc))
+* full IAM role reference, derived from the calls the code actually makes ([b99796d](https://github.com/jtrusty/data-ingest-aws/commit/b99796d3a203d60f6666e86d2ab0cbe3e110b4c6))
+* state what the code does, not what it used to do ([da7b9fc](https://github.com/jtrusty/data-ingest-aws/commit/da7b9fc8fff9a3e0e8126210a6f868b331a94903))
+
 ## [1.1.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.0.0...v1.1.0) (2026-08-25)
 
 
