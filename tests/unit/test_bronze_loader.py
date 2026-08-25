@@ -31,6 +31,30 @@ def make_table_config():
     )
 
 
+class FakeGlue:
+    """Catalog stand-in. `tables` maps name -> {column: type}; absent = not created."""
+
+    class exceptions:
+        class EntityNotFoundException(Exception):
+            pass
+
+    def __init__(self, tables=None):
+        self.tables = tables or {}
+
+    def get_table(self, DatabaseName, Name):
+        if Name not in self.tables:
+            raise self.exceptions.EntityNotFoundException(Name)
+        return {
+            "Table": {
+                "StorageDescriptor": {
+                    "Columns": [
+                        {"Name": n, "Type": t} for n, t in self.tables[Name].items()
+                    ]
+                }
+            }
+        }
+
+
 class FakeAthena:
     """Records statements instead of running them."""
 
@@ -100,13 +124,15 @@ def env():
         yield s3, store
 
 
-def _load(s3, store, athena):
+def _load(s3, store, athena, glue=None):
     return load_table_runs(
         athena=athena, s3_client=s3, processed_runs=store,
         bucket=BUCKET, landing_prefix="landing",
         source_key=SOURCE_KEY, table_config=make_table_config(),
         bronze_location="s3://bronze-bucket/bronze",
         partition_by=("month({checkpoint_column})",),
+        glue_client=glue if glue is not None else FakeGlue(),
+        database="bronze_db",
     )
 
 
@@ -296,3 +322,109 @@ def test_partition_is_registered_before_the_merge(env):
         "tables must be created before the partition is registered, and the "
         "partition before the merge"
     )
+
+
+# --------------------------------------------------------------------------
+# Schema evolution, end to end
+# --------------------------------------------------------------------------
+
+
+def test_a_column_added_in_the_source_reaches_bronze(env):
+    """
+    The silent-drop bug, end to end. CREATE TABLE IF NOT EXISTS is a no-op
+    once the tables exist, so without evolution a column added in Snowflake
+    lands in Parquet and is then invisible to Athena forever -- present in
+    S3, absent from Bronze, and no error anywhere.
+    """
+    s3, store = env
+    _write_run(s3, "run-with-new-column")
+
+    # Both tables already exist, with the OLD column set.
+    old_columns = {
+        "ORDER_KEY": "bigint",
+        "AMOUNT": "decimal(38,3)",
+        "LAST_UPDATE_DTTM": "timestamp",
+    }
+    glue = FakeGlue({
+        "acme_snowflake_order_fact": old_columns,
+        "landing_acme_snowflake_order_fact": old_columns,
+    })
+
+    # The run's manifest carries a column the tables do not have yet.
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"landing/{SOURCE_KEY}/{TABLE}/ingest_date=2026-08-24/run_id=run-with-new-column/_manifest.json",
+        Body=json.dumps({
+            "status": "SUCCESS", "run_id": "run-with-new-column",
+            "row_count": 10, "file_count": 1, "load_type": "incremental",
+            "schema": [
+                {"name": "ORDER_KEY", "type": "int64"},
+                {"name": "AMOUNT", "type": "decimal128(38, 3)"},
+                {"name": "LAST_UPDATE_DTTM", "type": "timestamp[ns]"},
+                {"name": "PROMO_CODE", "type": "string"},   # <- new
+            ],
+        }).encode(),
+    )
+
+    athena = FakeAthena()
+    _load(s3, store, athena, glue=glue)
+
+    alters = [s for s in athena.statements if s.startswith("ALTER TABLE") and "ADD COLUMNS" in s]
+    assert len(alters) == 2, "both the landing external table AND bronze must gain it"
+    assert all('"PROMO_CODE" string' in a for a in alters)
+
+    # And the tables are NOT recreated -- they already exist.
+    assert not any(s.startswith("CREATE") for s in athena.statements)
+
+
+def test_an_unchanged_schema_adds_no_ddl(env):
+    # Evolution runs on every load, so a steady-state run must not accumulate
+    # pointless DDL statements.
+    s3, store = env
+    _write_run(s3, "run-1")
+
+    existing = {
+        "ORDER_KEY": "bigint",
+        "AMOUNT": "decimal(38,3)",
+        "LAST_UPDATE_DTTM": "timestamp",
+    }
+    glue = FakeGlue({
+        "acme_snowflake_order_fact": existing,
+        "landing_acme_snowflake_order_fact": existing,
+    })
+
+    athena = FakeAthena()
+    _load(s3, store, athena, glue=glue)
+
+    kinds = [s.split()[0] for s in athena.statements]
+    assert kinds == ["ALTER", "MERGE"], "only the partition add and the merge"
+    assert "ADD COLUMNS" not in " ".join(athena.statements)
+
+
+def test_a_source_type_change_stops_the_load(env):
+    """
+    Fails before merging rather than after. A merge against a mismatched
+    column type could truncate silently, and Bronze is append-only -- there
+    is no correcting it afterwards.
+    """
+    from data_ingest.bronze.schema import SchemaChangeError
+
+    s3, store = env
+    _write_run(s3, "run-1")
+
+    narrowed = {
+        "ORDER_KEY": "bigint",
+        "AMOUNT": "decimal(10,2)",          # source now declares (38,3)
+        "LAST_UPDATE_DTTM": "timestamp",
+    }
+    glue = FakeGlue({
+        "acme_snowflake_order_fact": narrowed,
+        "landing_acme_snowflake_order_fact": narrowed,
+    })
+
+    athena = FakeAthena()
+    with pytest.raises(SchemaChangeError, match="AMOUNT"):
+        _load(s3, store, athena, glue=glue)
+
+    assert not any(s.startswith("MERGE") for s in athena.statements)
+    assert store.processed_run_ids(SOURCE_KEY, TABLE) == set(), "run stays retryable"

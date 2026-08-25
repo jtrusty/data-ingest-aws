@@ -231,6 +231,36 @@ outside this config.
 `partition_by` is override-only; omitting it uses the default above. The
 example config leaves it commented out for that reason.
 
+### Schema evolution
+
+Source schemas change, and Athena tables created with `CREATE TABLE IF NOT
+EXISTS` do not follow. Before each merge, the loader compares the run's
+manifest schema against the live catalog schema and applies the difference,
+using Iceberg's own policy:
+
+| source change | Bronze |
+|---|---|
+| column **added** | `ALTER TABLE ADD COLUMNS` on both tables, automatically. Existing rows read NULL for it. |
+| column **removed** | left alone. Older Parquet still has the values; newer files read NULL. Dropping it would discard history Bronze exists to retain. |
+| type **changed** | **fails before merging**, naming the column and both types. |
+
+Type changes stop the load rather than resolving themselves. Widening a
+decimal or turning an int into a string is ambiguous and can lose precision,
+and Bronze is append-only — a silently truncated column cannot be corrected
+afterwards. Resolve it deliberately (widen the column in Athena, or land the
+source column under a new name) and re-run.
+
+Renames are deliberately not special-cased: at the schema level a rename is
+indistinguishable from "drop one column, add another", and guessing wrong
+would rewrite history in a way nothing downstream would flag.
+
+This matters because the failure it prevents is silent. Athena returns only
+the columns a table declares, so without evolution a column added upstream
+lands in Parquet and is then invisible — data in S3, absent from Bronze, no
+error anywhere.
+
+The Bronze role needs `glue:GetTable` for this.
+
 ### Consuming from Redshift
 
 ```sql
@@ -558,8 +588,9 @@ The **landing** role needs Secrets Manager `GetSecretValue`, S3
 The **Bronze** role needs S3 read on landing plus read/write on the Bronze
 prefix and the Athena output location, DynamoDB `Query`/`PutItem` on the
 processed-runs table, Athena `StartQueryExecution`/`GetQueryExecution`/
-`StopQueryExecution`, and Glue Data Catalog access for the databases and
-tables it creates and merges into.
+`StopQueryExecution`, and Glue Data Catalog access
+(including `glue:GetTable`, used to read the live schema before each merge)
+for the databases and tables it creates, evolves, and merges into.
 
 Both roles must be able to write logs, or the job runs blind:
 

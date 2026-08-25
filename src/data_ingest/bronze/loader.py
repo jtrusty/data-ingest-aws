@@ -22,6 +22,7 @@ from typing import List, Optional
 
 from data_ingest.bronze import ddl
 from data_ingest.bronze.discovery import discover_runs
+from data_ingest.bronze.schema import evolve_table
 from data_ingest.exceptions import DataIngestError
 from data_ingest.logging import get_logger
 
@@ -120,9 +121,17 @@ def columns_from_manifest_schema(manifest_schema):
     return [(field["name"], athena_type_for(field["type"])) for field in manifest_schema]
 
 
-def _ensure_tables(athena, bronze_table, landing_table, bronze_location,
-                   landing_location, manifest_schema, table_config, partition_by):
-    """Create the landing external table and the Iceberg target if absent."""
+def _ensure_tables(athena, glue_client, database, bronze_table, landing_table,
+                   bronze_location, landing_location, manifest_schema,
+                   table_config, partition_by):
+    """
+    Create both Athena tables if absent, or evolve them if the source has
+    gained columns since they were created.
+
+    Creating is not enough on its own: CREATE TABLE IF NOT EXISTS is a no-op
+    once the table exists, so a column added in Snowflake would land in
+    Parquet and then be invisible to Athena forever. See bronze/schema.py.
+    """
     columns = columns_from_manifest_schema(manifest_schema)
     if not columns:
         raise DataIngestError(
@@ -131,21 +140,28 @@ def _ensure_tables(athena, bronze_table, landing_table, bronze_location,
             f"that writes `schema` into _manifest.json, or create the tables by hand."
         )
 
-    athena.execute(
-        ddl.create_landing_table_sql(landing_table, columns, landing_location),
-        description=f"create landing table {landing_table}",
-    )
+    # The landing external table must declare every column before the merge
+    # reads from it -- Athena returns only declared columns, so a missing one
+    # is silently absent from the merge source rather than an error.
+    if not evolve_table(athena, glue_client, database, landing_table, columns,
+                        label="landing table"):
+        athena.execute(
+            ddl.create_landing_table_sql(landing_table, columns, landing_location),
+            description=f"create landing table {landing_table}",
+        )
 
-    resolved_partitions = ddl.resolve_partition_spec(
-        partition_by, table_config.checkpoint.column
-    )
-    athena.execute(
-        ddl.create_bronze_table_sql(
-            bronze_table, columns, f"{bronze_location.rstrip('/')}/{bronze_table}",
-            resolved_partitions,
-        ),
-        description=f"create bronze table {bronze_table}",
-    )
+    if not evolve_table(athena, glue_client, database, bronze_table, columns,
+                        label="bronze table"):
+        resolved_partitions = ddl.resolve_partition_spec(
+            partition_by, table_config.checkpoint.column
+        )
+        athena.execute(
+            ddl.create_bronze_table_sql(
+                bronze_table, columns, f"{bronze_location.rstrip('/')}/{bronze_table}",
+                resolved_partitions,
+            ),
+            description=f"create bronze table {bronze_table}",
+        )
 
 
 def load_table_runs(
@@ -158,6 +174,8 @@ def load_table_runs(
     table_config,
     bronze_location=None,
     partition_by=(),
+    glue_client=None,
+    database=None,
 ):
     """
     Merge every un-processed committed run for one table.
@@ -195,6 +213,8 @@ def load_table_runs(
     # than from a hand-maintained DDL that can drift.
     _ensure_tables(
         athena=athena,
+        glue_client=glue_client,
+        database=database,
         bronze_table=bronze_table,
         landing_table=landing_table,
         bronze_location=bronze_location,
@@ -289,6 +309,8 @@ def load_bronze(
     fail_fast=True,
     bronze_location=None,
     partition_by=(),
+    glue_client=None,
+    database=None,
 ):
     """Run every requested table through load_table_runs."""
     results = []
@@ -307,6 +329,8 @@ def load_bronze(
                     table_config=table_config,
                     bronze_location=bronze_location,
                     partition_by=partition_by,
+                    glue_client=glue_client,
+                    database=database,
                 )
             )
         except Exception as exc:

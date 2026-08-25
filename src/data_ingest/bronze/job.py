@@ -124,6 +124,11 @@ def run_bronze_job(argv=None):
             fail_fast=fail_fast,
             bronze_location=bronze.location if bronze else None,
             partition_by=bronze.partition_by if bronze else (),
+            # Used to read the CURRENT catalog schema, so a column added in
+            # the source is applied to the Athena tables rather than silently
+            # dropped. See bronze/schema.py.
+            glue_client=boto3.client("glue"),
+            database=database,
         )
     except Exception:
         logger.exception("Bronze load failed")
