@@ -18,11 +18,12 @@ def test_merge_deduplicates_on_primary_key_plus_watermark():
         run_id="abc-123",
         primary_key=["ORDER_KEY"],
         watermark_column="LAST_UPDATE_DTTM",
+        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
     )
 
     assert 'target."order_key" = source."order_key"' in sql
     assert 'target."last_update_dttm" = source."last_update_dttm"' in sql
-    assert "WHEN NOT MATCHED THEN INSERT" in sql
+    assert "WHEN NOT MATCHED THEN INSERT (" in sql
     # No update/delete clause: Bronze retains history rather than mutating it.
     assert "WHEN MATCHED" not in sql
 
@@ -33,6 +34,7 @@ def test_merge_supports_composite_primary_keys():
         ingest_date="2026-08-24", run_id="r",
         primary_key=["ORDER_KEY", "LINE_NO"],
         watermark_column="UPDATED_AT",
+        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
     )
     for column in ("ORDER_KEY", "LINE_NO", "UPDATED_AT"):
         assert f'target."{column.lower()}" = source."{column.lower()}"' in sql
@@ -45,6 +47,7 @@ def test_merge_scopes_the_source_to_exactly_one_run():
         bronze_table="t", landing_table="l",
         ingest_date="2026-08-24", run_id="abc-123",
         primary_key=["ID"], watermark_column="UPDATED_AT",
+        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
     )
     assert "ingest_date = '2026-08-24'" in sql
     assert "run_id = 'abc-123'" in sql
@@ -56,7 +59,8 @@ def test_merge_without_primary_key_is_rejected():
             bronze_table="t", landing_table="l",
             ingest_date="2026-08-24", run_id="r",
             primary_key=[], watermark_column="UPDATED_AT",
-        )
+        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
+    )
 
 
 def test_merge_without_watermark_is_rejected():
@@ -65,7 +69,8 @@ def test_merge_without_watermark_is_rejected():
             bronze_table="t", landing_table="l",
             ingest_date="2026-08-24", run_id="r",
             primary_key=["ID"], watermark_column=None,
-        )
+        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
+    )
 
 
 @pytest.mark.parametrize(
@@ -133,6 +138,7 @@ def test_identifiers_are_quoted_and_normalized():
         bronze_table="t", landing_table="l",
         ingest_date="2026-08-24", run_id="r",
         primary_key=["OrderKey"], watermark_column="LastUpdate",
+        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
     )
     assert '"orderkey"' in sql
     assert '"lastupdate"' in sql
@@ -206,7 +212,8 @@ def test_ddl_and_dml_use_different_quoting():
         assert "`" in sql
 
     # MERGE INTO is genuinely Trino DML, where double quotes are correct.
-    merge = ddl.merge_sql("t", "l", "2026-08-25", "abc", ["ID"], "UPDATED_AT")
+    merge = ddl.merge_sql("t", "l", "2026-08-25", "abc", ["ID"], "UPDATED_AT",
+                          columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")])
     assert '"' in merge
     assert "`" not in merge
 
@@ -250,7 +257,8 @@ def test_partition_transform_matches_the_declared_column_case():
 def test_merge_references_match_the_declared_column_case():
     # The merge must reference the same lowercased names the DDL declared,
     # or Iceberg cannot resolve the ON clause.
-    sql = ddl.merge_sql("t", "l", "2026-08-25", "abc", ["ORDER_KEY"], "LAST_UPDATE_DTTM")
+    sql = ddl.merge_sql("t", "l", "2026-08-25", "abc", ["ORDER_KEY"], "LAST_UPDATE_DTTM",
+                        columns=[("ORDER_KEY", "bigint"), ("LAST_UPDATE_DTTM", "timestamp")])
     assert "ORDER_KEY" not in sql
     assert 'target."order_key"' in sql
 
@@ -260,3 +268,43 @@ def test_landing_table_columns_are_normalized_too():
     sql = ddl.create_landing_table_sql("l", [("ORDER_KEY", "bigint")], "s3://b/l")
     assert "`order_key` bigint" in sql
     assert "ORDER_KEY" not in sql
+
+
+def test_merge_uses_an_explicit_column_list_not_insert_star():
+    """
+    Regression for:
+
+        line 8:30: mismatched input '*'. Expecting: '(', 'VALUES'
+
+    `INSERT *` is Spark/Databricks syntax. Trino -- and therefore Athena --
+    requires INSERT (cols) VALUES (...).
+    """
+    sql = ddl.merge_sql(
+        "t", "l", "2026-08-25", "abc", ["ID"], "UPDATED_AT",
+        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp"), ("STATUS", "string")],
+    )
+    assert "INSERT *" not in sql
+    assert 'INSERT ("id", "updated_at", "status")' in sql
+    assert 'VALUES (source."id", source."updated_at", source."status")' in sql
+
+
+def test_insert_targets_are_unprefixed_while_values_are_prefixed():
+    """
+    The two lists look symmetric but are not: Athena requires the target
+    columns in INSERT (...) to be bare, and the VALUES expressions to carry
+    the source alias.
+    """
+    sql = ddl.merge_sql(
+        "t", "l", "2026-08-25", "abc", ["ID"], "UPDATED_AT",
+        columns=[("ID", "bigint"), ("UPDATED_AT", "timestamp")],
+    )
+    insert_clause = sql.split("INSERT (")[1].split(")")[0]
+    values_clause = sql.split("VALUES (")[1].split(")")[0]
+
+    assert "source." not in insert_clause, "target columns must not be alias-prefixed"
+    assert values_clause.count("source.") == 2, "every value must be alias-prefixed"
+
+
+def test_merge_without_a_column_list_is_rejected():
+    with pytest.raises(ConfigurationError, match="no column list"):
+        ddl.merge_sql("t", "l", "2026-08-25", "abc", ["ID"], "UPDATED_AT", columns=[])

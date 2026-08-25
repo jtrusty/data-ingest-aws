@@ -111,7 +111,8 @@ def add_partition_sql(landing_table, ingest_date, run_id, location):
     )
 
 
-def merge_sql(bronze_table, landing_table, ingest_date, run_id, primary_key, watermark_column):
+def merge_sql(bronze_table, landing_table, ingest_date, run_id, primary_key,
+              watermark_column, columns):
     """
     Merge one landing run into Bronze, deduplicating on primary_key +
     watermark.
@@ -143,6 +144,11 @@ def merge_sql(bronze_table, landing_table, ingest_date, run_id, primary_key, wat
             f"primary_key + watermark; without a watermark, re-landed rows cannot be "
             f"distinguished from new versions."
         )
+    if not columns:
+        raise ConfigurationError(
+            f"Cannot merge {bronze_table}: no column list. Athena requires an explicit "
+            f"INSERT (cols) VALUES (...) -- `INSERT *` is Spark syntax, not Trino."
+        )
 
     match_columns = list(primary_key) + [watermark_column]
     # Lowercased for the same reason as the DDL: the columns exist in the
@@ -153,6 +159,17 @@ def merge_sql(bronze_table, landing_table, ingest_date, run_id, primary_key, wat
         for c in match_columns
     )
 
+    # Athena requires an explicit column list: `INSERT *` is Spark/Databricks
+    # syntax and Trino rejects it with
+    #     mismatched input '*'. Expecting: '(', 'VALUES'
+    #
+    # Per the Athena docs, the target columns in INSERT (...) must NOT be
+    # alias-prefixed while the VALUES expressions MUST be -- the two lists
+    # look symmetric but are not.
+    insert_columns = [normalize_column(name) for name, _type in columns]
+    insert_list = ", ".join(quote_identifier(c) for c in insert_columns)
+    values_list = ", ".join(f"source.{quote_identifier(c)}" for c in insert_columns)
+
     return (
         f"MERGE INTO {quote_identifier(bronze_table)} AS target\n"
         f"USING (\n"
@@ -160,7 +177,8 @@ def merge_sql(bronze_table, landing_table, ingest_date, run_id, primary_key, wat
         f"  WHERE ingest_date = '{ingest_date}' AND run_id = '{run_id}'\n"
         f") AS source\n"
         f"   ON {on_clause}\n"
-        f"WHEN NOT MATCHED THEN INSERT *"
+        f"WHEN NOT MATCHED THEN INSERT ({insert_list})\n"
+        f"  VALUES ({values_list})"
     )
 
 

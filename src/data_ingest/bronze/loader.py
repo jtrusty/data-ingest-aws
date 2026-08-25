@@ -269,6 +269,10 @@ def load_table_runs(
                     run_id=run.run_id,
                     primary_key=table_config.primary_key,
                     watermark_column=table_config.checkpoint.column,
+                    # Per-run: a later run may carry columns an earlier one
+                    # lacked, and the merge must insert whatever that run
+                    # actually landed.
+                    columns=columns_from_manifest_schema(run.manifest.get("schema")),
                 ),
                 description=f"merge {table_name} run_id={run.run_id} ({run.row_count} rows)",
             )
