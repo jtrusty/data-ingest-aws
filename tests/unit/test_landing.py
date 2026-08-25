@@ -299,3 +299,32 @@ def test_values_beyond_int64_survive_the_declared_precision(s3_client):
         s3_client, "landing/acme/orders/ingest_date=2026-08-25/run_id=r-big/part-00000.parquet"
     )
     assert landed["BIG_ID"].iloc[0] == big
+
+
+def test_a_drifted_run_reports_no_schema(s3_client):
+    """
+    On drift, some batches were written with their own inferred types rather
+    than the pinned schema, so the run's files do not share one schema.
+    Reporting the pinned schema would be a claim the data does not support --
+    and Bronze would create a table from it, then fail at read time with
+    HIVE_BAD_DATA pointing at the file rather than the extraction.
+    """
+    from decimal import Decimal
+
+    writer = LandingWriter(s3_client, BUCKET, "landing")
+    run = writer.start("acme", "orders", "r-drift", "ACME", "PUBLIC", "ORDERS",
+                       ingest_date="2026-08-25")
+
+    # No declared schema, so inference drifts between batches.
+    run.write_batch(pd.DataFrame({"AMT": [Decimal("1.234")]}))
+    run.write_batch(pd.DataFrame({"AMT": [Decimal("12345.678")]}))
+    assert run.schema_drift is True
+
+    manifest = run.write_manifest(
+        source_metadata={"database": "D", "schema": "S", "table": "T"},
+        primary_key=["ID"],
+        checkpoint_manifest={"type": "watermark"},
+        load_type="full",
+    )
+    assert manifest.schema is None, "a drifted run must not claim a single schema"
+    assert manifest.schema_drift is True, "but must still say why"

@@ -428,3 +428,70 @@ def test_a_source_type_change_stops_the_load(env):
 
     assert not any(s.startswith("MERGE") for s in athena.statements)
     assert store.processed_run_ids(SOURCE_KEY, TABLE) == set(), "run stays retryable"
+
+
+def test_a_drifted_run_is_refused_before_any_athena_work(env):
+    """
+    Regression for a production failure:
+
+        HIVE_BAD_DATA: Malformed Parquet file. Field vender_id's type INT64
+        in parquet file is incompatible with type decimal(38,0) defined in
+        table schema.
+
+    A run whose files disagree with each other cannot be described by one
+    table schema. Athena accepts the CREATE and then fails at READ time,
+    blaming the file -- far from the extraction that produced it. Refusing up
+    front puts the error next to the cause.
+    """
+    s3, store = env
+    prefix = f"landing/{SOURCE_KEY}/{TABLE}/ingest_date=2026-08-25/run_id=drifted"
+    s3.put_object(Bucket=BUCKET, Key=f"{prefix}/part-00000.parquet", Body=b"x")
+    s3.put_object(
+        Bucket=BUCKET, Key=f"{prefix}/_manifest.json",
+        Body=json.dumps({
+            "status": "SUCCESS", "run_id": "drifted", "row_count": 5,
+            "file_count": 2, "load_type": "full",
+            "schema_drift": True, "schema": None,
+        }).encode(),
+    )
+
+    athena = FakeAthena()
+    with pytest.raises(DataIngestError, match="schema_drift"):
+        _load(s3, store, athena)
+
+    assert athena.statements == [], "nothing may run against inconsistent files"
+
+
+def test_tables_are_created_from_the_newest_run_schema(env):
+    """
+    The newest run reflects the current source shape. Creating from the
+    oldest would omit every column added since and leave evolution to
+    backfill what should have been right at creation.
+    """
+    s3, store = env
+    _write_run(s3, "old-run", ingest_date="2026-08-01")
+
+    newest = f"landing/{SOURCE_KEY}/{TABLE}/ingest_date=2026-08-25/run_id=new-run"
+    s3.put_object(Bucket=BUCKET, Key=f"{newest}/part-00000.parquet", Body=b"x")
+    s3.put_object(
+        Bucket=BUCKET, Key=f"{newest}/_manifest.json",
+        Body=json.dumps({
+            "status": "SUCCESS", "run_id": "new-run", "row_count": 1,
+            "file_count": 1, "load_type": "incremental",
+            "schema": [
+                {"name": "ORDER_KEY", "type": "int64"},
+                {"name": "AMOUNT", "type": "decimal128(38, 3)"},
+                {"name": "LAST_UPDATE_DTTM", "type": "timestamp[ns]"},
+                {"name": "ADDED_LATER", "type": "string"},
+            ],
+        }).encode(),
+    )
+
+    athena = FakeAthena()
+    _load(s3, store, athena)
+
+    creates = [s for s in athena.statements if s.startswith("CREATE")]
+    assert creates, "tables should have been created"
+    assert all("`added_later` string" in c for c in creates), (
+        "the column only the newest run has must be present at creation"
+    )

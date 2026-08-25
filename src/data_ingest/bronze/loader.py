@@ -190,6 +190,21 @@ def load_table_runs(
     landing_table = landing_table_name(source_key, table_name)
 
     runs = discover_runs(s3_client, bucket, landing_prefix, source_key, table_name)
+
+    # A run whose files disagree with each other cannot be described by one
+    # table schema. Athena would accept the CREATE and then fail at read time
+    # with HIVE_BAD_DATA -- "type INT64 in parquet file is incompatible with
+    # decimal(38,0) defined in table schema" -- pointing at Athena rather than
+    # at the extraction that produced inconsistent files. Refuse up front.
+    drifted = [r.run_id for r in runs if r.manifest.get("schema_drift")]
+    if drifted:
+        raise DataIngestError(
+            f"[{table_name}] landing run(s) {', '.join(drifted)} were written with "
+            f"inconsistent Parquet schemas (schema_drift). Their files cannot be "
+            f"described by a single Athena table, so merging them would fail at read "
+            f"time. Re-land those runs with a build that pins types from source "
+            f"metadata, then delete the drifted prefixes."
+        )
     if not runs:
         # Deliberately loud. This returns SUCCESS, so a wrong landing path or
         # a source_key mismatch would otherwise show up as a green job that
@@ -219,7 +234,12 @@ def load_table_runs(
         landing_table=landing_table,
         bronze_location=bronze_location,
         landing_location=f"s3://{bucket}/{landing_prefix.rstrip('/')}/{source_key}/{table_name}",
-        manifest_schema=runs[0].manifest.get("schema"),
+        # The NEWEST run, not the oldest: it reflects the current source
+        # shape. Anything older that lacks a column simply reads NULL for it,
+        # whereas creating from the oldest would omit every column added
+        # since and leave schema evolution to backfill what should have been
+        # right at creation.
+        manifest_schema=runs[-1].manifest.get("schema"),
         table_config=table_config,
         partition_by=partition_by,
     )

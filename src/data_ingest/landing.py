@@ -296,10 +296,19 @@ class LandingRun:
 
     def _schema_manifest(self):
         """
-        The run's pinned Arrow schema as plain JSON-able dicts, or None if
-        the run landed no rows (so no schema was ever established).
+        The run's schema as plain JSON-able dicts.
+
+        None when the run landed no rows, and ALSO None when schema drift
+        occurred. On drift some batches were written with their own inferred
+        types rather than the pinned schema, so the files in this run do not
+        share one schema -- reporting the pinned one would be a claim the
+        data does not support. Downstream then reads a decimal column that
+        is actually INT64 and fails at query time, far from the cause.
+
+        schema_drift stays true in the manifest either way, so a consumer can
+        tell "no rows" from "inconsistent".
         """
-        if self.schema is None:
+        if self.schema is None or self.schema_drift:
             return None
         return [{"name": field.name, "type": str(field.type)} for field in self.schema]
 
