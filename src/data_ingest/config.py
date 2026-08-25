@@ -490,16 +490,32 @@ def _parse_bronze(data):
     )
 
 
-def _parse_table(data):
-    required = ["name", "database", "schema", "table", "primary_key"]
+def _parse_table(data, default_database=None, default_schema=None):
+    # database and schema fall back to the source-level defaults, so a config
+    # whose tables all live in one schema states it once instead of per table.
+    # `name` deliberately has no such shortcut and is never derived from
+    # `table`: it is the identity key, and deriving it from the physical
+    # object would make a Snowflake rename silently change identity and
+    # orphan the checkpoint.
+    database = data.get("database", default_database)
+    schema = data.get("schema", default_schema)
+
+    required = ["name", "table", "primary_key"]
     missing = [field_name for field_name in required if field_name not in data]
+    if not database:
+        missing.append("database (or source.database)")
+    if not schema:
+        missing.append("schema (or source.schema)")
     if missing:
-        raise ConfigurationError(f"Table config missing required fields: {missing}")
+        raise ConfigurationError(
+            f"Table {data.get('name', '?')!r} is missing required field(s): "
+            f"{', '.join(missing)}"
+        )
 
     return TableConfig(
         name=data["name"],
-        database=data["database"],
-        schema=data["schema"],
+        database=database,
+        schema=schema,
         table=data["table"],
         primary_key=list(data["primary_key"]),
         checkpoint=_parse_checkpoint(data),
@@ -527,7 +543,7 @@ def parse_config(raw_text):
         {"source", "connection", "landing", "bronze", "defaults", "tables"},
         problems,
     )
-    _collect_unknown_keys("source", source, {"name", "type"}, problems)
+    _collect_unknown_keys("source", source, {"name", "type", "database", "schema"}, problems)
     _collect_unknown_keys("connection", connection, {"secret_id"}, problems)
     _collect_unknown_keys(
         "landing", data.get("landing") or {},
@@ -556,7 +572,10 @@ def parse_config(raw_text):
         )
     _raise_if_problems(problems)
 
-    tables = [_parse_table(t) for t in data.get("tables", [])]
+    tables = [
+        _parse_table(t, source.get("database"), source.get("schema"))
+        for t in data.get("tables", [])
+    ]
     if not tables:
         raise ConfigurationError("Configuration must define at least one table")
 

@@ -36,6 +36,13 @@ source:
   # zero tables. Must be a registered type -- currently: snowflake.
   type: snowflake
 
+  # Optional defaults for every table below, so a source whose tables mostly
+  # share a database and schema states it once instead of per table. Any
+  # table may override either. These are LOCATION, not identity -- nothing
+  # keys off them, so changing one is safe (see the tables: section).
+  database: MY_DATABASE
+  schema: MY_SCHEMA
+
 connection:
   # Secrets Manager secret ID, not the credentials themselves. The secret
   # holds: account, username, password, warehouse, and optionally role.
@@ -155,10 +162,15 @@ tables:
     #
     # Give it the logical name you want downstream (Bronze/Iceberg) to use,
     # not the physical object name.
+    #
+    # `name` deliberately has no shortcut and is never derived from `table`.
+    # Deriving it would mean a Snowflake rename silently changed identity and
+    # orphaned the checkpoint -- the exact coupling this design removes.
   - name: fact_order
-    database: MY_DATABASE
-    schema: MY_SCHEMA
     table: MY_TABLE_OR_VIEW     # a view is fine; nothing here assumes a table
+    # database and schema inherit from source: above. Override either here
+    # for a table that lives elsewhere:
+    #   schema: SOME_OTHER_SCHEMA
     primary_key:
       - ORDER_KEY               # recorded in the manifest for downstream dedupe
     checkpoint:

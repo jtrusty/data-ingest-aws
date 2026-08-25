@@ -475,3 +475,95 @@ def test_every_problem_is_reported_at_once():
     for expected in ("state", "landing.bucket", "landing.prefix", "defaults.fetch_sizee"):
         assert expected in message, f"{expected} missing from the combined report"
     assert "4 problems" in message
+
+
+# --------------------------------------------------------------------------
+# Source-level database/schema defaults
+# --------------------------------------------------------------------------
+
+SOURCE_DEFAULTS_YAML = """
+source:
+  name: acme
+  type: snowflake
+  database: ACME_WAREHOUSE
+  schema: REPORTING
+
+connection:
+  secret_id: s
+
+tables:
+  - name: orders
+    table: ORDERS_V
+    primary_key: [ORDER_ID]
+    checkpoint: {type: watermark, column: UPDATED_AT}
+
+  - name: legacy
+    schema: LEGACY_SCHEMA
+    table: OLD_V
+    primary_key: [ID]
+    checkpoint: {type: watermark, column: UPDATED_AT}
+"""
+
+
+def test_tables_inherit_the_source_database_and_schema():
+    # 30 tables in one schema should state it once, not sixty times -- each
+    # repetition being another chance to typo one of them.
+    config = parse_config(SOURCE_DEFAULTS_YAML)
+    orders = config.get_table("orders")
+    assert orders.database == "ACME_WAREHOUSE"
+    assert orders.schema == "REPORTING"
+    assert orders.source_object == "ACME_WAREHOUSE.REPORTING.ORDERS_V"
+
+
+def test_a_table_can_override_just_the_schema():
+    config = parse_config(SOURCE_DEFAULTS_YAML)
+    legacy = config.get_table("legacy")
+    assert legacy.database == "ACME_WAREHOUSE", "unspecified fields still inherit"
+    assert legacy.schema == "LEGACY_SCHEMA"
+
+
+def test_a_table_can_still_specify_both_explicitly():
+    config = parse_config("""
+source: {name: acme, type: snowflake}
+connection: {secret_id: s}
+tables:
+  - name: t
+    database: D
+    schema: S
+    table: T
+    primary_key: [ID]
+    checkpoint: {type: watermark, column: UPDATED_AT}
+""")
+    assert config.get_table("t").source_object == "D.S.T"
+
+
+def test_missing_database_names_both_places_it_could_come_from():
+    with pytest.raises(ConfigurationError, match=r"database \(or source.database\)"):
+        parse_config("""
+source: {name: acme, type: snowflake}
+connection: {secret_id: s}
+tables:
+  - name: t
+    schema: S
+    table: T
+    primary_key: [ID]
+    checkpoint: {type: watermark, column: UPDATED_AT}
+""")
+
+
+def test_name_is_never_derived_from_the_table():
+    """
+    `name` deliberately has no shortcut. It is the identity key -- it forms
+    the landing path and the checkpoint -- so deriving it from the physical
+    object would make a Snowflake rename silently change identity and orphan
+    the checkpoint, which is the coupling this design removed.
+    """
+    with pytest.raises(ConfigurationError, match="name"):
+        parse_config("""
+source: {name: acme, type: snowflake, database: D, schema: S}
+connection: {secret_id: s}
+tables:
+  - table: ORDERS_V
+    primary_key: [ID]
+    checkpoint: {type: watermark, column: UPDATED_AT}
+""")
