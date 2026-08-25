@@ -43,6 +43,11 @@ def run_bronze_job(argv=None):
     configure_logging()
     args = parse_job_args(argv)
 
+    # First line of the job, before any AWS call. When something does not run,
+    # the question is always "what did it think it was configured with" -- and
+    # answering that from an exit code alone is guesswork.
+    logger.info("Bronze job starting: config_uri=%s tables=%s", args.config_uri, args.tables)
+
     s3_client = boto3.client("s3")
     config = load_config(args.config_uri, s3_client=s3_client)
     tables = config.resolve_tables(args.tables)
@@ -108,8 +113,10 @@ def run_bronze_job(argv=None):
     )
 
     logger.info(
-        "Bronze load: source=%s tables=%s bronze_db=%s landing=s3://%s/%s",
-        config.source_key, [t.name for t in tables], database, s3_bucket, s3_prefix,
+        "Bronze load resolved: source_key=%s tables=%s bronze_db=%s "
+        "landing=s3://%s/%s athena_output=%s processed_runs_table=%s",
+        config.source_key, [t.name for t in tables], database,
+        s3_bucket, s3_prefix, athena_output, processed_runs_table or "(none)",
     )
 
     try:

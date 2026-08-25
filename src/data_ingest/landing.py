@@ -154,6 +154,55 @@ class LandingRun:
         ]
         return pa.schema(fields)
 
+    @staticmethod
+    def _coerce_to_declared(dataframe, schema):
+        """
+        Make a batch's Python types match the schema the source declared.
+
+        The declared type is authoritative -- it comes from Snowflake's own
+        column metadata -- but the values arrive as whatever the DB-API
+        driver chose to build. Those disagree for scale-0 NUMBER columns:
+        Snowflake declares NUMBER(38,0), so the schema says decimal128(38,0),
+        while the connector hands back Python ints and pandas types the
+        column int64. pyarrow cannot cast int64 to decimal128, so every batch
+        fails to conform and the writer falls back to per-batch inference --
+        which is exactly the schema drift the declared schema was added to
+        prevent.
+
+        Adapting the data rather than loosening the declaration keeps the
+        source's precision, which matters for IDs wider than int64.
+        """
+        import decimal
+
+        converted = None
+        for field in schema:
+            if field.name not in dataframe.columns:
+                continue
+            if not pa.types.is_decimal(field.type):
+                continue
+            column = dataframe[field.name]
+            is_integer = pandas.api.types.is_integer_dtype(column)
+            is_float = pandas.api.types.is_float_dtype(column)
+            if not (is_integer or is_float):
+                continue
+            if converted is None:
+                converted = dataframe.copy()
+            # Float, not just int, because a nullable integer column comes
+            # back as float64: pandas has no NaN for int64, so a single NULL
+            # in an ID column retypes the whole batch. Skipping floats would
+            # mean the coercion worked until the first null and then silently
+            # stopped.
+            #
+            # Decimal(str(v)) for floats rather than Decimal(v), which would
+            # carry binary floating-point artifacts into a decimal column.
+            converted[field.name] = [
+                None if v is None or pandas.isna(v)
+                else decimal.Decimal(int(v)) if is_integer or float(v).is_integer()
+                else decimal.Decimal(str(v))
+                for v in column
+            ]
+        return converted if converted is not None else dataframe
+
     def _to_arrow(self, dataframe, declared_schema=None):
         """
         Convert a batch to an Arrow table, holding the schema stable across
@@ -180,7 +229,8 @@ class LandingRun:
                 self.schema = self._promote_null_fields(inferred)
 
         try:
-            return pa.Table.from_pandas(dataframe, schema=self.schema, preserve_index=False)
+            conformed = self._coerce_to_declared(dataframe, self.schema)
+            return pa.Table.from_pandas(conformed, schema=self.schema, preserve_index=False)
         except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as exc:
             # A later batch genuinely doesn't fit the pinned schema (a column
             # the source widened mid-extraction, a mixed-type object column).

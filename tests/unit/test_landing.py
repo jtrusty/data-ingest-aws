@@ -220,3 +220,82 @@ def test_declared_schema_covers_the_lineage_columns(s3_client):
     )
     for column in LINEAGE_COLUMNS:
         assert column in landed.columns
+
+
+def test_scale_zero_number_columns_conform_to_the_declared_decimal(s3_client):
+    """
+    Regression for a second drift warning, on ORDER_ID:
+
+        Got bytestring of length 8 (expected 16)
+        Conversion failed for column ORDER_ID with type int64
+
+    Snowflake's default NUMBER(38,0) declares as decimal128(38,0), but the
+    connector returns Python ints for scale-0 columns, so pandas types the
+    batch int64 -- and pyarrow cannot cast int64 to decimal128. Every ID
+    column therefore failed to conform and fell back to per-batch inference.
+
+    The declared type stays authoritative (it preserves precision beyond
+    int64); the data is adapted to it.
+    """
+    import pyarrow as pa
+
+    declared = pa.schema([pa.field("ORDER_ID", pa.decimal128(38, 0))])
+    writer = LandingWriter(s3_client, BUCKET, "landing")
+    run = writer.start("acme", "orders", "r-int", "ACME", "PUBLIC", "ORDERS",
+                       ingest_date="2026-08-25")
+
+    run.write_batch(pd.DataFrame({"ORDER_ID": [1, 2, 3]}), declared_schema=declared)
+
+    assert run.schema_drift is False
+    assert run.schema.field("ORDER_ID").type == pa.decimal128(38, 0)
+
+
+def test_a_null_in_an_id_column_does_not_break_conformance(s3_client):
+    """
+    pandas has no NaN for int64, so one NULL retypes the whole batch to
+    float64. Coercing only integer dtypes would work until the first null and
+    then silently stop -- drift appearing partway through a run for no
+    visible reason.
+    """
+    import pyarrow as pa
+
+    declared = pa.schema([pa.field("ORDER_ID", pa.decimal128(38, 0))])
+    writer = LandingWriter(s3_client, BUCKET, "landing")
+    run = writer.start("acme", "orders", "r-null", "ACME", "PUBLIC", "ORDERS",
+                       ingest_date="2026-08-25")
+
+    run.write_batch(pd.DataFrame({"ORDER_ID": [1, 2]}), declared_schema=declared)
+    run.write_batch(pd.DataFrame({"ORDER_ID": [3, None]}), declared_schema=declared)
+
+    assert run.schema_drift is False, "a null must not trigger drift"
+    assert run.file_count == 2
+
+    base = "landing/acme/orders/ingest_date=2026-08-25/run_id=r-null"
+    schemas = [
+        pq.read_table(io.BytesIO(
+            s3_client.get_object(Bucket=BUCKET, Key=f"{base}/part-{i:05d}.parquet")["Body"].read()
+        )).schema
+        for i in (0, 1)
+    ]
+    assert schemas[0].equals(schemas[1])
+
+
+def test_values_beyond_int64_survive_the_declared_precision(s3_client):
+    # Preserving the declared decimal, rather than loosening it to int64, is
+    # what keeps a NUMBER(38,0) key that genuinely exceeds int64 intact.
+    import pyarrow as pa
+    from decimal import Decimal
+
+    big = Decimal("123456789012345678901234567890")
+    declared = pa.schema([pa.field("BIG_ID", pa.decimal128(38, 0))])
+    writer = LandingWriter(s3_client, BUCKET, "landing")
+    run = writer.start("acme", "orders", "r-big", "ACME", "PUBLIC", "ORDERS",
+                       ingest_date="2026-08-25")
+
+    run.write_batch(pd.DataFrame({"BIG_ID": [big]}), declared_schema=declared)
+
+    assert run.schema_drift is False
+    landed = _read_parquet_from_s3(
+        s3_client, "landing/acme/orders/ingest_date=2026-08-25/run_id=r-big/part-00000.parquet"
+    )
+    assert landed["BIG_ID"].iloc[0] == big
