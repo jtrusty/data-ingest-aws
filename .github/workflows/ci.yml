@@ -12,8 +12,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The suite runs against two dependency sets, because they answer different
+  # questions and a green run on either alone is misleading.
+  #
+  #   glue-pinned  the EXACT versions Glue Python Shell 3.9 preinstalls.
+  #                This is the combination that actually ships, and this
+  #                package's behaviour is coupled to it: int64 -> decimal128
+  #                coercion, from_pandas being stricter than Table.cast, and
+  #                all-NULL columns inferring as Arrow `null` are all pandas
+  #                and pyarrow semantics that move between versions. A suite
+  #                green only on floating versions can be green about
+  #                behaviour Glue does not have.
+  #
+  #   floating     whatever pip resolves today. Catches the opposite failure
+  #                -- our code breaking on modern pandas/numpy -- which is
+  #                the early warning for Glue shipping a newer runtime. See
+  #                "WHEN GLUE CHANGES" in constraints-glue.txt.
+  #
+  # Both block. The coverage floor is enforced once, on the pinned set, so it
+  # is not counted twice.
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: glue-pinned
+            constraints: "-c constraints-glue.txt"
+            coverage: true
+          - name: floating
+            constraints: ""
+            coverage: false
+    name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v4
 
@@ -23,14 +53,44 @@ jobs:
           python-version: "3.9"
 
       - name: Install (with the Snowflake extra the Glue job actually uses)
-        run: pip install -e ".[dev,snowflake]"
+        run: pip install ${{ matrix.constraints }} -e ".[dev,snowflake]"
+
+      # Only `-c`-listed packages are pinned; pytest/moto/werkzeug still
+      # float even on the pinned leg. Printing the versions that actually
+      # resolved means a failure caused by an upstream release is visible in
+      # the log rather than needing a local repro. moto against Glue's
+      # botocore 1.24.21 is a pairing nobody upstream tests -- if moto drops
+      # support for it, pin moto in the dev extra rather than loosening the
+      # constraints file.
+      - name: Record the resolved stack
+        run: |
+          pip check
+          pip list | grep -iE "^(pandas|numpy|pyarrow|boto3|botocore|moto|snowflake-connector-python) "
+
+      - name: Tests
+        if: ${{ !matrix.coverage }}
+        run: pytest -q
 
       - name: Tests, with a coverage floor
+        if: ${{ matrix.coverage }}
         # A floor rather than a target. It exists to catch a whole module
         # arriving untested -- which happened: the Bronze job and Athena
         # client shipped at 23% and 29% while everything around them was
         # covered, and nothing flagged it.
         run: pytest -q --cov=data_ingest --cov-report=term-missing --cov-fail-under=90
+
+  # Packaging and runtime-compatibility checks. Separate from `test` because
+  # they build their own venvs and do not depend on how the test job
+  # installed anything -- running them once per matrix leg would double the
+  # work to reach the identical result.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
 
       - name: Build wheel and sdist
         run: |

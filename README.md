@@ -876,23 +876,49 @@ automates that.
 ## CI/CD
 
 - **`.github/workflows/ci.yml`** — every PR and push to `main`, on Python
-  3.9 (the Glue runtime version):
-  1. run pytest;
-  2. build the wheel;
-  3. install *the built wheel* into a throwaway venv and import the Glue
+  3.9 (the Glue runtime version), in two jobs.
+
+  **`test`** runs the suite twice, against two dependency sets, because a
+  green run on either alone is misleading:
+
+  | leg | install | catches |
+  |---|---|---|
+  | `glue-pinned` | `-c constraints-glue.txt` | behaviour that differs on the versions Glue actually ships |
+  | `floating` | whatever pip resolves today | our code breaking on modern pandas/numpy |
+
+  The pinned leg matters because this package's behaviour is coupled to
+  pandas and pyarrow semantics that move between versions — int64 →
+  decimal128 coercion, `from_pandas` being stricter than `Table.cast`,
+  all-NULL columns inferring as Arrow `null`. The floating leg is the early
+  warning for Glue shipping a newer runtime. Both block; the coverage floor
+  is enforced once, on the pinned leg.
+
+  Only `-c`-listed packages are pinned — `pytest`, `moto`, and `werkzeug`
+  float on both legs, so each records its resolved versions in the log. moto
+  against Glue's botocore 1.24.21 is a pairing nobody upstream tests; if moto
+  drops support for it, pin moto in the `dev` extra rather than loosening
+  `constraints-glue.txt`.
+
+  **`package`** builds and validates the artifact that actually ships:
+
+  1. build the wheel and sdist;
+  2. install *the built wheel* into a throwaway venv and import the Glue
      entry point's full chain (including `SnowflakeSource`, which is what
      transitively pulls `snowflake.connector`);
-  4. `pip check` for internal consistency;
-  5. install the wheel against `constraints-glue.txt` and assert the
+  3. `pip check` for internal consistency;
+  4. install the wheel against `constraints-glue.txt` and assert the
      interpreter **exits 0** — a shutdown segfault (exit 139) would make
      Glue mark a successful run FAILED and retry it, duplicating a landing
      run;
-  6. install the wheel on top of Glue's exact preinstalled versions and
+  5. install the wheel on top of Glue's exact preinstalled versions and
      fail if pip would replace any of them.
 
-  Step 6 is the highest-value job here: this package's whole risk profile is
-  "does it coexist with Glue's preinstalled stack," and it catches a bad pin
-  before it can reach a job definition.
+  Step 5 is the highest-value check here: this package's whole risk profile
+  is "does it coexist with Glue's preinstalled stack," and it catches a bad
+  pin before it can reach a job definition. `package` is a separate job
+  because it builds its own venvs and does not depend on how `test`
+  installed anything — running it per matrix leg would double the work for
+  an identical result.
 - **`.github/workflows/release-please.yml`** — on push to `main`,
   [Release Please](https://github.com/googleapis/release-please) maintains
   a standing release PR derived from
