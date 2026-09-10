@@ -15,6 +15,7 @@ from typing import List, Optional
 import yaml
 
 from data_ingest.checkpoints import _TYPE_REGISTRY
+from data_ingest.config_par_pos_s3 import ParPosS3Config, parse_s3_config
 from data_ingest.exceptions import ConfigurationError
 
 
@@ -51,11 +52,12 @@ class TableConfig:
 
     primary_key: List[str]
     checkpoint: CheckpointConfig
+    s3: Optional[ParPosS3Config] = None
 
     @property
     def source_object(self):
         """"DATABASE.SCHEMA.TABLE" -- lineage/logging only; never an identity key."""
-        return f"{self.database}.{self.schema}.{self.table}"
+        return self.s3.location if self.s3 else f"{self.database}.{self.schema}.{self.table}"
 
 
 @dataclass(frozen=True)
@@ -214,7 +216,7 @@ class ConnectionConfig:
     # Only a Secrets Manager pointer -- actual credentials never live in
     # this config (see "Secrets vs config" in README.md). Database/schema/table mappings are
     # config, not secrets, and live on TableConfig instead.
-    secret_id: str
+    secret_id: Optional[str] = None  # S3 adapters use the Glue job's IAM role.
 
 
 @dataclass(frozen=True)
@@ -525,7 +527,30 @@ def _parse_bronze(data):
     )
 
 
-def _parse_table(data, default_database=None, default_schema=None):
+def _parse_s3_table(data):
+    if not isinstance(data.get("name"), str) or not data["name"]:
+        raise ConfigurationError("par_pos_s3 tables require a nonempty name")
+    settings = parse_s3_config(data.get("s3"))
+    checkpoint = _parse_checkpoint({**data, "checkpoint": data.get("checkpoint", {
+        "type": "watermark", "column": "_s3_last_modified", "lookback_minutes": 15,
+    })})
+    primary_key = data.get("primary_key", ["_source_record_id"])
+    if primary_key != ["_source_record_id"]:
+        raise ConfigurationError("par_pos_s3 primary_key must be [_source_record_id] for replay safety")
+    if checkpoint.type != "watermark" or checkpoint.column != "_s3_last_modified":
+        raise ConfigurationError("par_pos_s3 checkpoint must watermark _s3_last_modified")
+    if checkpoint.lookback_minutes < 1:
+        raise ConfigurationError("par_pos_s3 requires positive lookback_minutes for boundary arrivals")
+    bucket, prefix = split_s3_uri(settings.location)
+    return TableConfig(
+        name=data["name"], database=bucket, schema="s3", table=prefix or data["name"],
+        primary_key=list(primary_key), checkpoint=checkpoint, s3=settings,
+    )
+
+
+def _parse_table(data, default_database=None, default_schema=None, source_type=None):
+    if source_type == "par_pos_s3":
+        return _parse_s3_table(data)
     # database and schema fall back to the source-level defaults, so a config
     # whose tables all live in one schema states it once instead of per table.
     # `name` deliberately has no such shortcut and is never derived from
@@ -564,11 +589,16 @@ def parse_config(raw_text):
     except yaml.YAMLError as exc:
         raise ConfigurationError(f"Invalid YAML configuration: {exc}") from exc
 
-    if not data or "source" not in data or "connection" not in data:
-        raise ConfigurationError("Configuration must define 'source' and 'connection'")
+    if not data or "source" not in data:
+        raise ConfigurationError("Configuration must define 'source'")
 
     source = data["source"]
-    connection = data["connection"]
+    connection = data.get("connection") or {}
+    if source.get("type") == "par_pos_s3":
+        if connection.get("secret_id"):
+            raise ConfigurationError("par_pos_s3 uses the Glue IAM role; omit connection.secret_id")
+    elif not connection.get("secret_id"):
+        raise ConfigurationError("Configuration must define connection.secret_id")
 
     # One pass over every section, so a config several keys out of date
     # reports all of them at once rather than one per upload.
@@ -598,7 +628,8 @@ def parse_config(raw_text):
         label = f"tables[{table_entry.get('name', '?')}]"
         _collect_unknown_keys(
             label, table_entry,
-            {"name", "database", "schema", "table", "primary_key", "checkpoint"},
+            ({"name", "s3", "primary_key", "checkpoint"} if source.get("type") == "par_pos_s3"
+             else {"name", "database", "schema", "table", "primary_key", "checkpoint"}),
             problems,
         )
         _collect_unknown_keys(
@@ -608,7 +639,7 @@ def parse_config(raw_text):
     _raise_if_problems(problems)
 
     tables = [
-        _parse_table(t, source.get("database"), source.get("schema"))
+        _parse_table(t, source.get("database"), source.get("schema"), source.get("type"))
         for t in data.get("tables", [])
     ]
     if not tables:
@@ -649,7 +680,7 @@ def parse_config(raw_text):
     return IngestionConfig(
         source_name=source["name"],
         source_type=source["type"],
-        connection=ConnectionConfig(secret_id=connection["secret_id"]),
+        connection=ConnectionConfig(secret_id=connection.get("secret_id")),
         tables=tables,
         landing=LandingConfig(
             location=landing_location,

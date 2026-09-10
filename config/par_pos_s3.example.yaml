@@ -1,0 +1,49 @@
+# Copy to restaurant_par_pos_s3.yaml and replace bucket names/start_at.
+# Source files: s3://pos-events/orders/yyyy/mm/dd/hh/<filename>.json.gz
+# Immutable objects; folders must reflect upload time in folder_timezone.
+source:
+  name: restaurant
+  type: par_pos_s3
+
+# No connection/secret: this source uses the Glue job's IAM role.
+landing:
+  location: s3://my-data-lake/landing
+  checkpoint_table: ingestion-checkpoints
+
+bronze:
+  database: bronze_restaurant
+  location: s3://my-data-lake/bronze
+  athena_output: s3://my-data-lake/athena-results/
+  processed_runs_table: bronze-processed-runs
+  # Defaults to month(_s3_last_modified); set before first Bronze run.
+  # partition_by: ["month({checkpoint_column})"]
+
+defaults:
+  fetch_size: 250
+  fail_fast: true
+
+tables:
+  - name: orders
+    s3:
+      location: s3://pos-events/orders
+      # Inclusive first-load boundary in upload time. Quote to keep a string.
+      # Set to the earliest upload to ingest; existing checkpoints take precedence.
+      start_at: "2026-09-01T00:00:00Z"
+      folder_timezone: UTC  # Confirm with producer; e.g. America/Chicago.
+      compression: auto    # Inner payload gzip or zlib. Outer is always gzip.
+      safety_delay_seconds: 120
+      # Dotted path to the order identity in the DECODED payload. The parent
+      # envelope carries the same value as "guid:<order_id>" in its `id`, which
+      # lands separately as event_id; this reads the payload copy directly.
+      order_id_path: id
+      # max_object_bytes: 33554432   # 32 MiB compressed S3 object
+      # max_outer_bytes: 134217728   # 128 MiB decompressed outer JSON
+      # max_payload_bytes: 16777216  # 16 MiB per decoded payload
+
+    # These defaults are shown explicitly. Keep file identity/time separate
+    # from order_id/order_version. Config rejects changing the identity fields.
+    primary_key: [_source_record_id]
+    checkpoint:
+      type: watermark
+      column: _s3_last_modified
+      lookback_minutes: 15

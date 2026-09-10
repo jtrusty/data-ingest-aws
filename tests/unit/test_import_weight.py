@@ -50,6 +50,21 @@ def test_bronze_entry_point_via_the_package_stays_light():
     assert _loaded_heavy_modules("from data_ingest import run_bronze_job") == []
 
 
+def test_bronze_stays_light_while_parsing_a_par_pos_s3_config():
+    """
+    Bronze parses whatever config it is handed, and the par_pos_s3 branch pulls in
+    config_s3 -> zoneinfo. That must not drag the data stack in behind it, or
+    the 0.0625 DPU sizing stops being viable for POS sources specifically.
+    """
+    assert _loaded_heavy_modules(
+        """
+        from data_ingest.bronze.job import run_bronze_job
+        from data_ingest.config import parse_config
+        parse_config(open('config/par_pos_s3.example.yaml').read())
+        """
+    ) == []
+
+
 def test_ingestion_job_does_load_the_data_stack():
     """
     The counterpart. Landing genuinely needs pandas and pyarrow -- it writes

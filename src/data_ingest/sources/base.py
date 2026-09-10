@@ -3,8 +3,9 @@ from abc import ABC, abstractmethod
 
 class Source(ABC):
     """
-    Generic extraction source. Implementations must not write to S3, touch
-    DynamoDB, or build manifests -- that's the pipeline/landing writer's job.
+    Generic extraction source. Implementations must not write landing data,
+    update DynamoDB, or build manifests -- that's the pipeline/landing writer's job.
+    An S3 source may read its own upstream bucket.
     A source only knows how to talk to the thing it's extracting from.
     """
 

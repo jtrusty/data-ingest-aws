@@ -110,6 +110,7 @@ jobs:
           /tmp/wheel-check/bin/python -c "
           from data_ingest import run_job, run_table
           from data_ingest.sources.snowflake import SnowflakeSource
+          from data_ingest.sources.par_pos_s3 import ParPosS3Source
           print('entry point imports OK')
           "
 
@@ -131,6 +132,7 @@ jobs:
           from data_ingest import run_job, run_table
           from data_ingest.landing import LandingWriter
           from data_ingest.sources.snowflake import SnowflakeSource
+          from data_ingest.sources.par_pos_s3 import ParPosS3Source
           "
             status=$?
             if [ $status -ne 0 ]; then

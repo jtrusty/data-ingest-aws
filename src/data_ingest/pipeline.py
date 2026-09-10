@@ -424,7 +424,7 @@ def run_job(argv=None, expected_source_type=None):
     # One secret, one connection-shape, shared by every table in this
     # source (per-table DB/schema/table selection lives in config, not
     # in Secrets Manager -- see "Secrets vs config" in README.md).
-    credentials = get_secret(config.connection.secret_id)
+    credentials = get_secret(config.connection.secret_id) if config.connection.secret_id else {}
     state_store = DynamoDBStateStore(dynamodb.Table(state_table))
     landing_writer = LandingWriter(s3_client, s3_bucket, s3_prefix)
 

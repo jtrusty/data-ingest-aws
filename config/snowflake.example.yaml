@@ -33,7 +33,7 @@ source:
   # `type` selects the source adapter (data_ingest.sources.registry) AND is
   # asserted by the Glue job script via expected_source_type, so a config
   # pointed at the wrong job fails at startup instead of silently matching
-  # zero tables. Must be a registered type -- currently: snowflake.
+  # zero tables. Other source types have their own example config and job.
   type: snowflake
 
   # Optional defaults for every table below, so a source whose tables mostly
