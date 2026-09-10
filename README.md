@@ -25,7 +25,9 @@ Bronze            Apache Iceberg via Athena MERGE INTO,
 Redshift Spectrum / Athena
 ```
 
-Both jobs ship in the same wheel and read the same config file. Landing is
+Both jobs ship in the same wheel and read that source's config file --
+one file per source, carrying both its `landing:` and `bronze:` sections;
+config files are never shared *between* sources. Landing is
 the normalization boundary: once a run is Parquet plus a valid manifest in
 the standard layout, Bronze does not care which source produced it, so one
 Bronze job serves Snowflake, REST, and CSV sources alike.
@@ -464,9 +466,12 @@ is a *different adapter* -- one new module plus one line in the registry (see
 format flag on this one. This adapter always requires the POS envelope.
 
 Use [config/par_pos_s3.example.yaml](config/par_pos_s3.example.yaml) with
-`jobs/landing_load_par_pos_s3.py`, then pass **the same config file** to the
-existing `jobs/bronze_load.py`. No Snowflake credentials or relational
-source names are required; this source uses the Glue job's IAM role.
+`jobs/landing_load_par_pos_s3.py`, then pass **that same file** to
+`jobs/bronze_load.py` -- this source's own config, not the Snowflake one.
+Each source gets its own config file and its own pair of Glue job
+definitions; the sharing is only between one source's two jobs. No Snowflake
+credentials or relational source names are required; this source uses the
+Glue job's IAM role.
 
 Expected source layout:
 
@@ -605,8 +610,11 @@ as Glue Python Shell 3.9, analytics library set, 1 DPU, using the wheel and
 `jobs/landing_load_par_pos_s3.py`. Supply `--config-uri` and install
 `--additional-python-modules pyarrow==10.0.1,PyYAML==6.0.2,tzdata` (or
 equivalent approved wheels in S3). The Snowflake connector is not needed for
-this job. Keep the existing Bronze job definition and pass this source's
-config -- **one config file serves both jobs**, exactly as with Snowflake.
+this job. Add a **second Bronze job definition** for this source rather
+than reusing the Snowflake one: same script and wheel, different
+`--config-uri`, so the two do not contend for `MaxConcurrentRuns 1` or share
+a schedule. Within this source, one config file serves both of its jobs,
+exactly as with Snowflake.
 
 `tzdata` is not optional padding. `zoneinfo` reads the system tz database and
 has no built-in UTC, so on an image without one `ZoneInfo(folder_timezone)`
@@ -1250,7 +1258,8 @@ See [IAM roles](#iam-roles) above for the full policies.
 
 ### The two Glue job definitions
 
-Both use the same wheel and the same config file; they differ in script,
+Both use the same wheel and, for a given source, the same config file (a
+different file per source); they differ in script,
 sizing, and which extras they need.
 
 **Landing job** — one per source type. For Snowflake,
@@ -1283,21 +1292,55 @@ MaxConcurrentRuns      1
 --config-uri           s3://<bucket>/ingestion-config/<source>_par_pos_s3.yaml
 ```
 
-**Bronze job** — `jobs/bronze_load.py`, one total, whatever the source:
+**Bronze job** — `jobs/bronze_load.py`, **one script, but one job definition
+per source**:
 
 ```
 Python version         3.9
 Max capacity           0.0625         # 16x cheaper; Athena does the work
+MaxConcurrentRuns      1
 --extra-py-files       s3://<artifact-bucket>/python/data_ingest/<version>/data_ingest-<version>-py3-none-any.whl
 --config-uri           s3://<bucket>/ingestion-config/<source>_<type>.yaml
 ```
+
+The script is source-agnostic — it reads the landing layout, not any source
+— so the *same script and wheel* back every Bronze job definition. Only
+`--config-uri` differs. Do not try to serve two sources from one definition:
+`MaxConcurrentRuns 1` is what stops two passes racing, and a shared
+definition makes two sources contend for that single slot, so a scheduled
+run arriving while the other source is mid-merge fails with
+`ConcurrentRunsExceededException`. A definition per source also lets each
+follow its own extraction schedule, which is the point — POS runs every 15
+minutes, a nightly Snowflake table does not.
+
+Nothing in the state is shared: processed runs are keyed
+`<source_key>:<table_name>`, so the two never see each other's rows even
+when they share one `processed_runs_table`.
 
 Note what the Bronze job does **not** need: no `--library-set`, no
 `--additional-python-modules`, no Snowflake connector. It imports no pandas
 or pyarrow (asserted in tests), which is what lets it run at the smallest
 capacity — and that holds for a POS config too, which loads only `yaml` and
-`zoneinfo` on top of the standard library. It never opens a source connection — it reads the landing layout
-and drives Athena.
+`zoneinfo` on top of the standard library. It never opens a source
+connection — it reads the landing layout and drives Athena.
+
+### What that adds up to
+
+Per source: one config file, one landing job definition, one Bronze job
+definition. Config files are **never shared between sources** — each has its
+own `source:`, its own tables, and its own `bronze:` section. The sharing is
+only *within* a source: its landing job and its Bronze job read the same
+file, because the `bronze:` section lives beside the `landing:` section.
+
+| | Snowflake source | POS source |
+|---|---|---|
+| Config | `olo_snowflake.yaml` | `restaurant_par_pos_s3.yaml` |
+| Landing job | `landing_load_snowflake.py`, 1 DPU | `landing_load_par_pos_s3.py`, 1 DPU |
+| Bronze job | `bronze_load.py`, 0.0625 DPU | `bronze_load.py`, 0.0625 DPU |
+| `source_key` | `olo_snowflake` | `restaurant_par_pos_s3` |
+
+Four Glue job definitions, two scripts for landing, one script for Bronze,
+one wheel, two config files.
 
 ### Dependency pins
 
