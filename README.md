@@ -891,6 +891,42 @@ their own credentials.
 **No `dynamodb:DeleteItem`.** Deleting a checkpoint triggers a full reload of
 that table. Same reasoning.
 
+#### The same role for an S3 POS source
+
+Two differences: there is no Secrets Manager statement at all (the adapter
+uses the role itself), and the source bucket has to be readable. `ListBucket`
+is scoped with a prefix condition so the role cannot enumerate the rest of
+the bucket, which matters when the bucket belongs to the vendor.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListPosPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<pos-source-bucket>",
+      "Condition": {"StringLike": {"s3:prefix": ["<pos-prefix>/*"]}}
+    },
+    {
+      "Sid": "ReadPosObjects",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::<pos-source-bucket>/<pos-prefix>/*"
+    }
+  ]
+}
+```
+
+Keep the `WriteLanding`, `ReadConfigAndWheel`, `Checkpoints`, and `Logs`
+statements from above; drop `SnowflakeCredentials`. If the source bucket is
+SSE-KMS encrypted, add `kms:Decrypt` on that key **and** allow this role in
+the key's own policy — a key policy that does not name the role denies it
+regardless of what the role's policy says. If the bucket is owned by another
+account, its bucket policy must also grant this role access; cross-account S3
+needs the grant on both sides.
+
 ### 2. Bronze job role
 
 ```json
