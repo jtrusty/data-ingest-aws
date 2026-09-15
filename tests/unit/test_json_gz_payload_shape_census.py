@@ -139,3 +139,46 @@ def test_glue_injected_arguments_are_ignored(capsys):
     out = _run([_envelope({"id": 1})], capsys,
                argv_extra=("--job-name", "census", "--scriptLocation", "s3://x/y.py"))
     assert "adapter as written handles this feed" in out
+
+
+def test_emit_config_camel_cases_down_and_flags_partial_keys(capsys):
+    out = _run([_envelope({"businessDate": "2026-09-10", "lineItems": [{"sku": "A"}]}),
+                _envelope({"businessDate": "2026-09-10"})],
+               capsys, argv_extra=("--emit-config",))
+    assert "business_date: businessDate" in out
+    # Present on only half the records: called out, because a key that comes
+    # and goes is exactly the one worth a second look before it is mapped.
+    assert "line_items: lineItems" in out and "on 50.0% of records" in out
+
+
+def test_emit_config_can_drop_rare_keys(capsys):
+    out = _run([_envelope({"always": 1, "rare": 2}), _envelope({"always": 1})],
+               capsys, argv_extra=("--emit-config", "--min-presence", "0.9"))
+    assert "always: always" in out
+    assert "rare: rare" not in out
+    assert "1 key(s) below --min-presence omitted" in out
+
+
+def test_emit_config_sanitizes_column_names_for_athena(capsys):
+    # Athena lowercases identifiers and Iceberg then matches case-sensitively,
+    # so the generated block must never propose a name config would reject.
+    out = _run([_envelope({"Weird-Key.Name": 1})], capsys, argv_extra=("--emit-config",))
+    assert "weird_key_name: Weird-Key.Name" in out
+
+
+@pytest.mark.parametrize("key", [
+    "businessDate", "lineItems", "Weird-Key.Name", "UPPER", "with spaces",
+    "123numeric", "trailing__", "orderID",
+])
+def test_generated_column_names_are_accepted_by_the_config_layer(key):
+    """
+    The generated block exists to be pasted unedited, so every name it
+    proposes must survive the same validation a hand-written one does.
+    """
+    from data_ingest.config_s3_json_gz import parse_s3_config
+
+    settings = parse_s3_config({
+        "location": "s3://b/p", "start_at": "2026-09-01T00:00:00Z",
+        "payload_fields": {census.to_column(key): key},
+    })
+    assert list(settings.payload_fields) == [census.to_column(key)]

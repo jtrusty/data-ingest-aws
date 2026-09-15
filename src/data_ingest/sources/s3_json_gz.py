@@ -41,12 +41,33 @@ def _utc(value):
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
-def _scalar(value, field):
+def _value(value, _field):
+    """
+    Project one payload/envelope value to a string column.
+
+    Objects and arrays are serialized as exact JSON rather than rejected: a
+    real feed has nested structure, and refusing it would mean either failing
+    the run or leaving the field unmapped. As JSON text it stays queryable in
+    Athena (`json_extract_scalar`, or `CAST(json_parse(col) AS ARRAY(ROW(...)))`
+    to UNNEST line items in Silver) and it round-trips losslessly, because
+    dumps_json emits Decimals as exact numeric tokens.
+
+    Everything is a string column. That is deliberate: Bronze fails a load
+    outright when a column's type changes between runs, and a feed that sends
+    42 one day and "42" the next would otherwise stop ingestion. Typing
+    belongs in Silver, where a cast can be fixed without re-landing.
+    """
     if value is None:
         return None
-    if isinstance(value, (str, int, float, Decimal, bool)):
+    if isinstance(value, (dict, list, tuple)):
+        return dumps_json(value)
+    if isinstance(value, bool):
+        # Before the int branch: bool is a subclass of int, and str(True)
+        # would otherwise be reached only by accident of ordering.
+        return 'true' if value else 'false'
+    if isinstance(value, (str, int, float, Decimal)):
         return str(value)
-    raise ExtractionError(f'Field {field} must be a scalar or null')
+    raise ExtractionError(f'Unsupported JSON value type {type(value).__name__}')
 
 
 def _at_path(payload, path):
@@ -162,9 +183,9 @@ class S3JsonGzSource(Source):
             '_s3_bucket': self.bucket, '_s3_key': item['Key'], '_s3_etag': item['ETag'],
             '_s3_record_index': ordinal,
             _WATERMARK: _utc(item['LastModified']).replace(tzinfo=None),
-            **{column: _scalar(_at_path(envelope, path), path)
+            **{column: _value(_at_path(envelope, path), path)
                for column, path in self._envelope_columns},
-            **{column: _scalar(_at_path(payload, path), path)
+            **{column: _value(_at_path(payload, path), path)
                for column, path in self._payload_columns},
             'envelope_json': dumps_json(envelope), 'payload_json': payload_json,
         }

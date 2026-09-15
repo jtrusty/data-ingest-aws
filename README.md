@@ -467,6 +467,54 @@ Three rules make this safe to get wrong:
 
 Config order fixes column order, so the Parquet schema is stable across runs.
 
+**Nested values are projected, not refused.** An object or array lands as
+exact JSON text in its column, so line items and sub-objects can be mapped
+like anything else and stay queryable:
+
+```sql
+-- a scalar inside a projected object
+SELECT json_extract_scalar(totals, '$.net') FROM bronze_par_pos.orders;
+
+-- explode a projected array in Silver
+SELECT o.order_id, i.sku, i.qty
+FROM bronze_par_pos.orders o
+CROSS JOIN UNNEST(
+  CAST(json_parse(o.line_items) AS ARRAY(ROW(sku VARCHAR, qty INTEGER)))
+) AS i (sku, qty);
+```
+
+Every column is a string, deliberately. Bronze **fails a load** when a
+column's type changes between runs, so a feed that sends `42` one day and
+`"42"` the next would stop ingestion outright. Typing belongs in Silver,
+where a wrong cast is fixed with a query rather than by re-landing.
+
+**Generate the projection rather than writing it by hand:**
+
+```bash
+python scripts/json_gz_payload_shape_census.py --uri s3://<bucket>/<prefix> \
+    --sample 50 --emit-config
+```
+
+It samples real objects and prints a `payload_fields:` block covering every
+key it saw, with `camelCase` folded to `snake_case`, names sanitized to what
+the config layer accepts, and any key present on only some records flagged
+inline. `--min-presence 0.9` omits rare ones.
+
+### Why the projection is not inferred at run time
+
+Exploding whatever keys happen to be present would be less configuration, and
+it breaks on this pipeline's own guarantees. The landing writer pins one
+Parquet schema per run, from the first batch. A key that first appears midway
+through a run does not fit that schema, so the batch lands with its own schema
+and the run is flagged `schema_drift` -- and a drifted run is one of the things
+[Bronze refuses](#what-bronze-refuses) outright. One late-arriving key would
+strand a whole run.
+
+An explicit block avoids that, keeps the column set reviewable in a diff, and
+means new columns arrive through Bronze's additive schema evolution when you
+deliberately extend it. Nothing is lost in the meantime: an unmapped key is
+still in `payload_json`.
+
 **Set the projection before the first run.** Adding a mapping later applies
 only to new rows -- Bronze never revisits what it already inserted.
 

@@ -99,12 +99,62 @@ def outer_records(body):
     return value if isinstance(value, list) else [value]
 
 
+def to_column(key):
+    """
+    Derive an Athena-safe column name from a source key.
+
+    Athena lowercases identifiers and Iceberg then matches case-sensitively,
+    so the generated block must never propose a name the config layer would
+    reject -- the point of generating it is to paste it without editing.
+    """
+    column = re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower()
+    column = re.sub(r"[^a-z0-9_]+", "_", column)
+    column = re.sub(r"_+", "_", column).strip("_")
+    return column if column[:1].isalpha() or column[:1] == "_" else f"f_{column}"
+
+
+def emit_config(payload_keys, records, min_presence):
+    """
+    Print a payload_fields: block covering the keys actually observed.
+
+    Generated rather than inferred at runtime on purpose. The landing writer
+    pins one Parquet schema per run from the first batch, so a key that first
+    appears midway through a run would not fit it -- the run gets flagged
+    schema_drift, and Bronze refuses to load a drifted run at all. An explicit
+    block keeps the schema stable, keeps the diff reviewable, and lets Bronze's
+    additive evolution add columns deliberately when you extend it later.
+
+    Nested values are still projected: they land as exact JSON text, queryable
+    with json_extract_scalar or CAST(json_parse(...) AS ARRAY(ROW(...))).
+    """
+    print("\n--- generated payload_fields (paste under the table's s3:) ---")
+    print("      payload_fields:")
+    skipped = 0
+    for key, seen in sorted(payload_keys.items()):
+        presence = seen / max(records, 1)
+        if presence < min_presence:
+            skipped += 1
+            continue
+        column = to_column(key)
+        note = "" if presence > 0.999 else f"   # on {100 * presence:.1f}% of records"
+        print(f"        {column}: {key}{note}")
+    if skipped:
+        print(f"      # {skipped} key(s) below --min-presence omitted; "
+              f"they remain in payload_json")
+    print("      # Review before use: column names are derived from the source keys,")
+    print("      # and they are IDENTITY once Bronze has created the table.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--uri", required=True)
     ap.add_argument("--sample", type=int, default=50, help="objects to download (default 50)")
     ap.add_argument("--hours-back", type=int, default=6, help="spread the sample over the last N hours (default 6)")
     ap.add_argument("--show-keys", type=int, default=30, help="top-level payload keys to list (default 30)")
+    ap.add_argument("--emit-config", action="store_true",
+                    help="print a payload_fields: block covering every key seen, ready to paste")
+    ap.add_argument("--min-presence", type=float, default=0.0,
+                    help="with --emit-config, skip keys present on fewer than this fraction of records")
     args, _unknown = ap.parse_known_args()
 
     bucket, prefix = parse_uri(args.uri)
@@ -208,6 +258,9 @@ def main():
     show("  id value types:", id_types)
     show("  vs envelope 'guid:<order_id>' suffix:", envelope_id_matches)
     show("version found at:", version_found, records)
+
+    if args.emit_config:
+        emit_config(payload_keys, records, args.min_presence)
 
     print("\n--- what this means for the config ---")
     if id_found:

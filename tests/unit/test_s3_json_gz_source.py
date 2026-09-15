@@ -45,6 +45,14 @@ def config(**overrides):
     return parse_s3_config(settings)
 
 
+def packed_payload(payload_json):
+    """`payload_json` is JSON TEXT, so tests control the exact numeric tokens."""
+    if not isinstance(payload_json, str):
+        payload_json = json.dumps(payload_json)
+    return {'id': 'event-1', 'time': '2026-09-10T09:20:00Z', 'type': 'order',
+            'data_base64': base64.b64encode(gzip.compress(payload_json.encode())).decode()}
+
+
 def packed(version=1):
     payload = {'order': {'id': 'order-1'}, 'version': version, 'businessDate': '2026-09-09', 'nested': [1, 2]}
     return {'id': 'event-1', 'time': '2026-09-10T09:20:00Z', 'businessdate': '2026-09-09',
@@ -147,11 +155,43 @@ def test_nullable_and_large_versions(version):
     assert frame.order_version[0] == (None if version is None else str(version))
 
 
-def test_non_scalar_order_identity_fails_without_payload_in_error():
-    source, _, _, _ = setup_source([packed({'sensitive': 'secret'})])
-    with pytest.raises(ExtractionError) as caught:
-        list(source.extract(None, source.get_current_checkpoint()))
-    assert 'secret' not in str(caught.value)
+def test_objects_and_arrays_land_as_exact_json_text():
+    """
+    A projected field that is nested structure is serialized, not rejected.
+    Real feeds carry line items and sub-objects; refusing them would force the
+    field to go unmapped. As JSON text it stays queryable in Athena and
+    round-trips exactly, including numbers pandas/float would round.
+    """
+    # Raw JSON text: 0.85 is not representable as a float, so writing it as a
+    # literal is the only way to prove nothing rounds it on the way through.
+    payload = ('{"order":{"id":"order-1"},'
+               '"items":[{"sku":"A","qty":2},{"sku":"B","qty":1}],'
+               '"totals":{"net":10.1,"tax":0.85},'
+               '"void":null,"paid":true}')
+    source, _, _, _ = setup_source(
+        [packed_payload(payload)],
+        payload_fields={'items': 'items', 'totals': 'totals',
+                        'void': 'void', 'paid': 'paid'},
+    )
+    frame = list(source.extract(None, source.get_current_checkpoint()))[0]
+
+    assert json.loads(frame['items'][0]) == [{'sku': 'A', 'qty': 2}, {'sku': 'B', 'qty': 1}]
+    # Exact decimal tokens: 0.85 is not representable as a float, so a
+    # round-trip through one would change the value stored in Bronze.
+    assert frame['totals'][0] == '{"net":10.1,"tax":0.85}'
+    assert frame['void'][0] is None          # absent stays NULL, not "None"
+    assert frame['paid'][0] == 'true'        # JSON spelling, not Python's
+
+
+def test_a_projected_array_is_unnestable_in_athena():
+    # The Silver pattern this enables: CAST(json_parse(col) AS ARRAY(ROW(...)))
+    # then UNNEST. Verify the text is valid JSON of the expected shape.
+    source, _, _, _ = setup_source(
+        [packed_payload({'items': [{'sku': 'A', 'qty': 2}]})],
+        payload_fields={'items': 'items'},
+    )
+    items = json.loads(list(source.extract(None, source.get_current_checkpoint()))[0]['items'][0])
+    assert [i['sku'] for i in items] == ['A']
 
 
 @pytest.mark.parametrize('failure', ['listed_size', 'body_size', 'conditional', 'corrupt'])
