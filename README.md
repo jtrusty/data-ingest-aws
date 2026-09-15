@@ -507,8 +507,35 @@ boundary is covered only while that folder remains in the scan window.
 If the producer backfills old folders, use a deliberate checkpoint rewind
 and replay; for unbounded lateness, switch discovery to a full-prefix
 reconciliation or durable S3 event queue. Changing `start_at` alone does
-not rewind an existing checkpoint. Confirm the folder timezone and arrival
-contract before enabling the schedule.
+not rewind an existing checkpoint.
+
+**This contract was measured, not assumed.** Against the live PAR bucket,
+`scripts/pos_folder_contract_check.py` listed 377,558 objects and replayed
+the discovery rule over them at the shipped settings (15-minute schedule,
+15-minute lookback, 120-second safety delay):
+
+| Lateness past folder end | Objects | |
+|---|---:|---:|
+| in-hour | 370,410 | 98.1% |
+| <= 15m late | 7,148 | 1.9% |
+| > 15m late | 0 | 0% |
+
+**Zero objects would have been missed**, and no object predated its folder
+hour, which confirms `folder_timezone: UTC`. This is why the design stayed
+on prefix scanning with a DynamoDB watermark rather than moving to S3 event
+notifications: the failure mode a queue protects against does not occur in
+this feed, and a queue would add SNS fan-out, visibility timeouts, a DLQ,
+and 14-day retention to the operational surface for no measured benefit.
+
+Two things follow. **The lookback is load-bearing** -- 1.9% of objects land
+after their folder hour closes, so `lookback_minutes: 0` would silently lose
+roughly one file in fifty. And the real margin is wider than 15 minutes: the
+scan floors its lower bound to the hour, so the window reaches back 32-92
+minutes depending on where in the hour a run fires. Exposure begins past an
+hour of lateness, and nothing in the sample came close.
+
+Re-run the check if the producer changes, and see
+[Watch for](#watch-for) below for the signal that this has drifted.
 
 DynamoDB advances only after the Parquet run's manifest commits. Empty
 intervals also commit, keeping idle sources from rescanning their history.
@@ -647,14 +674,33 @@ string-data row guard leaves room for lineage below Athena's hard 32 MB
 row limit; it fails before committing unreadable data.
 [Athena limits](https://docs.aws.amazon.com/athena/latest/ug/other-notable-limitations.html).
 
-At 1,000 files/hour, a 15-minute interval contains roughly 250 new files;
-the default overlap replays roughly another 250 at steady state. Thousands
-of files/hour do not accumulate in memory, but achievable throughput depends
-on actual file size, record size, S3 latency, and compression. Measure a
-representative backlog in Glue before assuming a 15-minute completion time;
-local tests do not benchmark AWS throughput. Monitor job duration, source
-file errors, and checkpoint lag. Expected data freshness includes the
-schedule interval, cutoff delay, extraction, and Bronze runtime.
+The measured rate on the live bucket is roughly 1,100 files/hour, so a
+15-minute interval contains ~280 new files and the default overlap replays
+roughly another 280 at steady state. Thousands of files/hour do not
+accumulate in memory, but achievable throughput depends on actual file size,
+record size, S3 latency, and compression. Measure a representative backlog in
+Glue before assuming a 15-minute completion time; local tests do not
+benchmark AWS throughput. Expected data freshness includes the schedule
+interval, cutoff delay, extraction, and Bronze runtime.
+
+### Watch for
+
+Prefix-scan discovery is correct only while the upload-hour contract holds,
+and the way it breaks is **silent** -- a missed file produces no error and no
+gap in the checkpoint. So monitor the things that would show drift:
+
+- **Job duration and checkpoint lag.** A run that stops finishing inside the
+  15-minute interval means the overlap is shrinking against the schedule.
+- **Source file errors**, which surface a producer changing format or
+  compression.
+- **Row counts per business date** against what the POS is expected to emit.
+  A sustained shortfall is the symptom of late arrivals being dropped.
+- **Re-run `scripts/pos_folder_contract_check.py` periodically**, and
+  whenever the producer changes anything. It is read-only, needs only
+  `s3:ListBucket`, and answers the question in one pass. If the `> 15m late`
+  row stops being zero, widen `lookback_minutes` first; if lateness exceeds
+  an hour, prefix scanning is no longer the right discovery model and the
+  event-driven design becomes worth its complexity.
 
 ## Secrets vs config
 
