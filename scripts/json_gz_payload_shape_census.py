@@ -12,10 +12,10 @@ variations are actually present, so the adapter can be relaxed exactly as far
 as the data requires and no further.
 
 The last section is the important one: it reports where `id` and `version`
-really live, which is what `s3.order_id_path` must be set to. Getting that
+really live, which is what `s3.payload_fields` must be set to. Getting that
 wrong does not fail -- it lands NULL and silver silently drops the row.
 
-    python scripts/pos_payload_shape_census.py --uri s3://pos-events/orders --sample 50
+    python scripts/json_gz_payload_shape_census.py --uri s3://pos-events/orders --sample 50
 
 Needs s3:ListBucket and s3:GetObject. Downloads --sample objects, writes
 nothing, and prints no payload values -- only key names, types and counts.
@@ -212,7 +212,7 @@ def main():
     print("\n--- what this means for the config ---")
     if id_found:
         best = id_found.most_common(1)[0]
-        print(f"  s3.order_id_path: {best[0]}"
+        print(f"  s3.payload_fields.order_id: {best[0]}"
               f"   (present on {100 * best[1] / max(records, 1):.1f}% of records)")
         if len(id_found) > 1:
             print(f"  WARNING: id appears at more than one path {sorted(id_found)} -- "

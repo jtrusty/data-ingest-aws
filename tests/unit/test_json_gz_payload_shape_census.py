@@ -1,6 +1,6 @@
 """
 The census decides how far the adapter has to be relaxed and what
-s3.order_id_path must be set to, so its classifications are tested rather
+s3.payload_fields must be set to, so its classifications are tested rather
 than trusted -- particularly the ones that distinguish a shape the adapter
 accepts from one it rejects.
 """
@@ -16,8 +16,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-SCRIPT = Path(__file__).parents[2] / "scripts" / "pos_payload_shape_census.py"
-spec = importlib.util.spec_from_file_location("pos_payload_shape_census", SCRIPT)
+SCRIPT = Path(__file__).parents[2] / "scripts" / "json_gz_payload_shape_census.py"
+spec = importlib.util.spec_from_file_location("json_gz_payload_shape_census", SCRIPT)
 census = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(census)
 
@@ -88,14 +88,14 @@ def _envelope(payload, oid="12345678901234"):
 def test_a_feed_the_adapter_handles_is_reported_as_such(capsys):
     out = _run([_envelope({"id": 12345678901234, "version": 1})], capsys)
     assert "adapter as written handles this feed: YES" in out
-    assert "s3.order_id_path: id" in out
+    assert "s3.payload_fields.order_id: id" in out
 
 
 def test_nested_order_is_reported_as_the_path_to_configure(capsys):
-    # The dangerous shape: order_id_path 'id' would land NULL here and silver
+    # The dangerous shape: a payload_fields order_id of 'id' would land NULL here and silver
     # would drop the row, with nothing failing anywhere.
     out = _run([_envelope({"order": {"id": 12345678901234, "version": 1}})], capsys)
-    assert "s3.order_id_path: order.id" in out
+    assert "s3.payload_fields.order_id: order.id" in out
     assert "{'order': ...}" in out
 
 
