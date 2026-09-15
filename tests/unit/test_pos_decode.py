@@ -118,3 +118,30 @@ def test_decimal_json_serialization_supports_nested_values():
     assert json.loads(dumps_json(value), parse_float=Decimal) == value
     with pytest.raises(ValueError):
         dumps_json(Decimal("NaN"))
+
+
+@pytest.mark.parametrize("encoder", [base64.b64encode, base64.encodebytes])
+def test_line_wrapped_base64_is_accepted(encoder):
+    """
+    RFC 2045 permits base64 wrapped at 76 characters, which Java's MIME
+    encoder and OpenSSL both emit. It encodes the same bytes, so rejecting it
+    would fail an entire run over a formatting choice by the producer.
+    """
+    payload = b'{"id": 12345678901234, "version": 1}'
+    envelope = {"data_base64": encoder(gzip.compress(payload)).decode()}
+    outer = gzip.compress(json.dumps(envelope).encode())
+
+    (_env, decoded, text), = decode_records(
+        outer, max_outer_bytes=1 << 20, max_payload_bytes=1 << 20
+    )
+    assert decoded["id"] == 12345678901234
+    assert text == payload.decode()
+
+
+def test_corrupt_base64_still_raises_rather_than_decoding_short():
+    # The lenient default would DISCARD the '!' and decode a truncated
+    # payload; validate=True must still reject it after whitespace stripping.
+    envelope = {"data_base64": "!!!" + base64.b64encode(gzip.compress(b"{}")).decode()}
+    outer = gzip.compress(json.dumps(envelope).encode())
+    with pytest.raises(ExtractionError, match="Invalid data_base64 encoding"):
+        list(decode_records(outer, max_outer_bytes=1 << 20, max_payload_bytes=1 << 20))

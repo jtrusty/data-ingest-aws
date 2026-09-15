@@ -3,11 +3,14 @@
 import base64
 import binascii
 import json
+import re
 import zlib
 from decimal import Decimal
 from typing import Any, Dict, Iterator, Tuple
 
 from data_ingest.exceptions import ExtractionError
+
+_WHITESPACE = re.compile(r"\s+")
 
 
 def _inflate(compressed: bytes, limit: int, compression: str, label: str) -> bytes:
@@ -73,7 +76,13 @@ def _payload(envelope: Dict[str, Any], limit: int, compression: str):
     if not isinstance(encoded, str) or not encoded:
         raise ExtractionError("Each outer JSON record requires nonempty data_base64")
     try:
-        compressed = base64.b64decode(encoded, validate=True)
+        # validate=True rejects any non-alphabet byte, which is the point --
+        # the lenient default silently DISCARDS them, so corruption decodes to
+        # a shorter payload instead of failing. Whitespace is stripped first
+        # because RFC 2045 permits line-wrapped base64 (Java's MIME encoder,
+        # OpenSSL) and that is a legitimate encoding of the same bytes, not
+        # corruption. Everything else still raises.
+        compressed = base64.b64decode(_WHITESPACE.sub("", encoded), validate=True)
     except (ValueError, binascii.Error):
         raise ExtractionError("Invalid data_base64 encoding") from None
     text = _utf8(_inflate(compressed, limit, compression, "payload"), "payload")

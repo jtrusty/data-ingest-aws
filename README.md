@@ -547,8 +547,12 @@ Incomplete landing runs remain invisible to Bronze.
 The outer gzip file holds an array of parent event records; a single object
 or JSONL is also accepted. For each record, `data_base64` is strictly decoded and decompressed
 as gzip or zlib; the inner document must be a JSON object. `compression:
-auto` recognizes gzip headers and otherwise tries zlib. Raw deflate, plain
-uncompressed JSON, concatenated gzip members, and other codecs are rejected.
+auto` recognizes gzip headers and otherwise tries zlib. Line-wrapped base64
+(RFC 2045, as Java's MIME encoder and OpenSSL emit) is accepted, since it
+encodes the same bytes; any other non-alphabet byte is rejected rather than
+discarded, so corruption cannot decode to a silently shorter payload. Raw
+deflate, plain uncompressed JSON, concatenated gzip members, and other codecs
+are rejected.
 Malformed records fail the run instead of being silently skipped.
 
 Bronze retains these fields:
