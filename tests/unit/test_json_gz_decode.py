@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 
 from data_ingest.exceptions import ExtractionError
-from data_ingest.sources.pos_decode import decode_records, dumps_json
+from data_ingest.sources.json_gz_decode import decode_records, dumps_json
 
 
 def envelope(payload=b'{"version": 2}', compressor=gzip.compress):

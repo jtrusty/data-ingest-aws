@@ -2,8 +2,8 @@
 """Glue Python Shell entry point for hourly S3 POS events -> S3 landing."""
 
 from data_ingest import run_job
-from data_ingest.sources.par_pos_s3 import ParPosS3Source  # noqa: F401 -- fail fast on runtime dependencies
+from data_ingest.sources.s3_json_gz import S3JsonGzSource  # noqa: F401 -- fail fast on runtime dependencies
 
 
 if __name__ == "__main__":
-    run_job(expected_source_type="par_pos_s3")
+    run_job(expected_source_type="s3_json_gz")

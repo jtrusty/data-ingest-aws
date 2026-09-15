@@ -51,8 +51,8 @@ src/data_ingest/
     base.py         Source interface (get_current_checkpoint / extract / metadata)
     registry.py     source.type -> adapter module; add a source with one line here
     snowflake.py    Snowflake adapter (fetchmany batching; lossless watermark codecs)
-    par_pos_s3.py       hourly S3 POS events, modification-time checkpoint + overlap
-    pos_decode.py   bounded gzip/base64 decoding with exact JSON preservation
+    s3_json_gz.py       hourly S3 POS events, modification-time checkpoint + overlap
+    json_gz_decode.py   bounded gzip/base64 decoding with exact JSON preservation
   checkpoints/
     base.py         Checkpoint interface
     watermark.py    single-column watermark checkpoint (+ optional lookback_minutes)
@@ -74,9 +74,9 @@ jobs/                      thin Glue entry points, named <layer>_load[_<source>]
   bronze_load.py             landing -> bronze. No source suffix: landing is
                              the normalization boundary, so one script serves
                              every source.
-  landing_load_par_pos_s3.py     hourly S3 POS JSON -> landing, using the job IAM role
+  landing_load_s3_json_gz.py     hourly S3 POS JSON -> landing, using the job IAM role
 config/snowflake.example.yaml  example config; real ones are gitignored
-config/par_pos_s3.example.yaml     POS source template, including bootstrap date
+config/s3_json_gz.example.yaml     POS source template, including bootstrap date
 constraints-glue.txt       frozen dependency set matching the Glue runtime
 tests/unit/                pytest suite (moto-mocked AWS)
 tests/conftest.py          pins AWS region/credentials so tests don't inherit
@@ -415,12 +415,12 @@ names) and are uploaded to S3, where the job reads them via `--config-uri`.
 Adding table #13 is a YAML change only — no Python, no new DynamoDB setup
 (the first run for a new table creates its own state record).
 
-## S3 POS order events  (`par_pos_s3`)
+## Gzipped JSON events in S3  (`s3_json_gz`)
 
 Same two jobs as any other source; only the extraction end changes:
 
 ```
-S3 POS bucket  --jobs/landing_load_par_pos_s3.py-->  Landing  --jobs/bronze_load.py-->  Bronze
+S3 POS bucket  --jobs/landing_load_s3_json_gz.py-->  Landing  --jobs/bronze_load.py-->  Bronze
   (the source)                                  (Parquet + _manifest.json)
 ```
 
@@ -429,33 +429,74 @@ The POS bucket is a **source**, not a landing area. Bronze finds work by
 cannot read that bucket directly. The landing job is what decodes,
 watermarks, and normalizes to Parquet.
 
+### What is generic and what is configured
+
+The adapter carries no vocabulary from any one producer. Discovery, the
+watermark checkpoint, bounded gzip/base64 decoding, `Decimal` preservation,
+record identity, batching, and landing are the same for every feed. What
+differs is a projection, declared per table:
+
+```yaml
+source:
+  name: par_pos
+  type: s3_json_gz
+  location: s3://pos-events/orders   # inherited by every table below
+
+tables:
+  - name: orders
+    s3:
+      start_at: "2026-09-01T00:00:00Z"
+      envelope_fields:               # producer extensions past CloudEvents core
+        group_id: groupid
+      payload_fields:                # dotted paths into the decoded payload
+        order_id: id
+        order_version: version
+```
+
+Three rules make this safe to get wrong:
+
+- **A projection is never lossy.** `envelope_json` and `payload_json` always
+  retain the complete records, so a field nobody thought to map is still in
+  Bronze and can be extracted later in SQL.
+- **A path that matches nothing lands NULL rather than failing.** Feeds
+  legitimately omit optional fields, and one missing key should not stop a
+  15-minute run.
+- **Column names are validated**, and reserved ones are refused. Athena
+  lowercases identifiers and Iceberg then matches case-sensitively, so
+  `Order_Id` is rejected rather than silently becoming a second column.
+
+Config order fixes column order, so the Parquet schema is stable across runs.
+
+**Set the projection before the first run.** Adding a mapping later applies
+only to new rows -- Bronze never revisits what it already inserted.
+
 ### Invoking it
 
-Nothing to write: `jobs/landing_load_par_pos_s3.py` already is the entry
+Nothing to write: `jobs/landing_load_s3_json_gz.py` already is the entry
 point, and it is three lines.
 
 ```python
 from data_ingest import run_job
-from data_ingest.sources.par_pos_s3 import ParPosS3Source  # noqa: F401 -- fail fast
+from data_ingest.sources.s3_json_gz import S3JsonGzSource  # noqa: F401 -- fail fast
 
-run_job(expected_source_type="par_pos_s3")
+run_job(expected_source_type="s3_json_gz")
 ```
 
 `expected_source_type` is a **registered adapter type, not a file
 extension** -- `"json.gz"` or `"csv"` are not valid values. The string
-`par_pos_s3` has to agree in exactly three places, and the job asserts it at
+`s3_json_gz` has to agree in exactly three places, and the job asserts it at
 startup so a config pointed at the wrong script fails immediately instead of
 quietly matching zero tables:
 
 | Where | What |
 |---|---|
-| `sources/registry.py` | `"par_pos_s3": "data_ingest.sources.par_pos_s3"` |
-| the config's `source.type` | `type: par_pos_s3` |
-| the job script | `run_job(expected_source_type="par_pos_s3")` |
+| `sources/registry.py` | `"s3_json_gz": "data_ingest.sources.s3_json_gz"` |
+| the config's `source.type` | `type: s3_json_gz` |
+| the job script | `run_job(expected_source_type="s3_json_gz")` |
 
 It also fixes identity: `source_key` is `<source.name>_<source.type>`, so
-`name: restaurant` here lands under `landing/restaurant_par_pos_s3/…` and
-keys DynamoDB on `restaurant_par_pos_s3`. Changing the type after a run has
+`name: restaurant` here lands under `landing/s3_json_gz_json_gz/…` and
+keys DynamoDB on `s3_json_gz_json_gz`. Changing the type after a run has
 committed re-partitions landing and orphans the checkpoint -- see
 [Identity](#identity).
 
@@ -465,8 +506,8 @@ is a *different adapter* -- one new module plus one line in the registry (see
 [Adding a future source adapter](#adding-a-future-source-adapter)) -- not a
 format flag on this one. This adapter always requires the POS envelope.
 
-Use [config/par_pos_s3.example.yaml](config/par_pos_s3.example.yaml) with
-`jobs/landing_load_par_pos_s3.py`, then pass **that same file** to
+Use [config/s3_json_gz.example.yaml](config/s3_json_gz.example.yaml) with
+`jobs/landing_load_s3_json_gz.py`, then pass **that same file** to
 `jobs/bronze_load.py` -- this source's own config, not the Snowflake one.
 Each source gets its own config file and its own pair of Glue job
 definitions; the sharing is only between one source's two jobs. No Snowflake
@@ -561,10 +602,9 @@ Bronze retains these fields:
 |---|---|
 | `envelope_json` | Complete parent record, including all fields and `data_base64`; numeric precision is preserved. |
 | `payload_json` | Full decoded JSON text, unchanged, including nested keys and arrays. |
-| `event_type`, `event_specversion`, `event_source`, `event_id`, `event_time` | Parent `type`, `specversion`, `source`, `id`, and `time`, as strings. |
-| `group_id`, `business_date`, `historical_data_type`, `data_content_type` | Parent `groupid`, `businessdate`, `historicaldatatype`, and `datacontenttype`. |
-| `payload_business_date`, `order_version` | Decoded `businessDate` and `version`, as strings; missing values remain NULL. |
-| `order_id` | Decoded field selected by `s3.order_id_path` -- `id` for this producer. NULL if the path is unset or absent from a payload. |
+| `event_type`, `event_specversion`, `event_source`, `event_id`, `event_time`, `data_content_type` | CloudEvents core attributes, landed for every feed. |
+| configured `envelope_fields` | One string column per entry, for producer extensions past the CloudEvents core. For PAR: `group_id`, `business_date`, `historical_data_type`. |
+| configured `payload_fields` | One string column per entry, read by dotted path from the decoded payload. For PAR: `order_id`, `order_version`, `payload_business_date`. A path absent from a record lands NULL. |
 | `_s3_bucket`, `_s3_key`, `_s3_etag`, `_s3_record_index` | Source object and zero-based record position. |
 | `_source_record_id`, `_s3_last_modified` | Stable replay identity and UTC upload timestamp used by Bronze. |
 
@@ -585,7 +625,7 @@ retained. Order identity is deliberately not part of that match key.
 This producer's parent `id` is not a bare GUID: it is `<guid>:<order_id>`,
 where `order_id` is the 14-digit order number, and the decoded payload
 repeats that number in its own `id`. The example config therefore sets
-`order_id_path: id`, reading the payload copy rather than parsing a prefix
+`payload_fields: {order_id: id}`, reading the payload copy rather than parsing a prefix
 off the envelope. The full `<guid>:<order_id>` string is still landed
 verbatim as `event_id`, so the two can be reconciled in Athena:
 
@@ -629,7 +669,7 @@ versions before using that cast (string sorting would put `"10"` before
 `"2"`). Tiebreakers make selection deterministic; they cannot establish
 business precedence between conflicting payloads with the same revision.
 Monitor missing identity/version values instead of treating this filtered
-query as a complete Silver load. `order_id_path` is set in the example config
+query as a complete Silver load. `payload_fields.order_id` is set in the example config
 because changing the mapping later does not update Bronze rows already
 inserted -- the alternative is extracting the key from `payload_json`
 downstream.
@@ -638,7 +678,7 @@ downstream.
 
 Infrastructure stays outside this repository. Configure the extraction job
 as Glue Python Shell 3.9, analytics library set, 1 DPU, using the wheel and
-`jobs/landing_load_par_pos_s3.py`. Supply `--config-uri` and install
+`jobs/landing_load_s3_json_gz.py`. Supply `--config-uri` and install
 `--additional-python-modules pyarrow==10.0.1,PyYAML==6.0.2,tzdata` (or
 equivalent approved wheels in S3). The Snowflake connector is not needed for
 this job. Add a **second Bronze job definition** for this source rather
@@ -1365,7 +1405,7 @@ The `[pandas]` extra is **load-bearing**: Glue's analytics library-set does
 not ship pyarrow, and that extra is what supplies it (pinned by the
 connector to `>=10.0.1,<10.1.0`). Dropping `[pandas]` breaks Parquet writing.
 
-For the S3 POS source, `jobs/landing_load_par_pos_s3.py`, same shape without the
+For the S3 POS source, `jobs/landing_load_s3_json_gz.py`, same shape without the
 connector — pyarrow has to be named directly, since nothing else supplies it:
 
 ```
@@ -1375,7 +1415,7 @@ MaxConcurrentRuns      1
 --library-set          analytics
 --additional-python-modules  pyarrow==10.0.1,PyYAML==6.0.2,tzdata
 --extra-py-files       s3://<artifact-bucket>/python/data_ingest/<version>/data_ingest-<version>-py3-none-any.whl
---config-uri           s3://<bucket>/ingestion-config/<source>_par_pos_s3.yaml
+--config-uri           s3://<bucket>/ingestion-config/<source>_s3_json_gz.yaml
 ```
 
 **Bronze job** — `jobs/bronze_load.py`, **one script, but one job definition
@@ -1420,10 +1460,10 @@ file, because the `bronze:` section lives beside the `landing:` section.
 
 | | Snowflake source | POS source |
 |---|---|---|
-| Config | `olo_snowflake.yaml` | `restaurant_par_pos_s3.yaml` |
-| Landing job | `landing_load_snowflake.py`, 1 DPU | `landing_load_par_pos_s3.py`, 1 DPU |
+| Config | `olo_snowflake.yaml` | `s3_json_gz_json_gz.yaml` |
+| Landing job | `landing_load_snowflake.py`, 1 DPU | `landing_load_s3_json_gz.py`, 1 DPU |
 | Bronze job | `bronze_load.py`, 0.0625 DPU | `bronze_load.py`, 0.0625 DPU |
-| `source_key` | `olo_snowflake` | `restaurant_par_pos_s3` |
+| `source_key` | `olo_snowflake` | `s3_json_gz_json_gz` |
 
 Four Glue job definitions, two scripts for landing, one script for Bronze,
 one wheel, two config files.

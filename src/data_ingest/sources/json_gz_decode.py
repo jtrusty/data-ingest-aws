@@ -1,4 +1,4 @@
-"""Bounded decoding of gzip POS exports and their compressed event payloads."""
+"""Bounded decoding of gzip exports and their compressed event payloads."""
 
 import base64
 import binascii

@@ -1,9 +1,14 @@
-"""Bounded extraction of immutable, hourly partitioned S3 POS events.
+"""Bounded extraction of immutable, hourly partitioned gzipped-JSON S3 events.
+
+Reads CloudEvents-shaped records whose payload is a compressed, base64-encoded
+JSON document. Which fields beyond the CloudEvents core become columns is
+configuration (`envelope_fields` / `payload_fields`), so the adapter carries no
+vocabulary from any one producer; `envelope_json` and `payload_json` retain
+everything the projection does not select.
 
 Folder hours must correspond to object upload time. The configured lookback
 replays recent files; bronze deduplicates source-record identities, retaining
-separate publications of the same order. No order-version comparison occurs
-in this adapter.
+separate publications of the same record. No version comparison occurs here.
 """
 
 import hashlib
@@ -20,27 +25,15 @@ from data_ingest.checkpoints.watermark import WatermarkCheckpoint
 from data_ingest.config import split_s3_uri
 from data_ingest.exceptions import ConfigurationError, ExtractionError
 from data_ingest.sources.base import Source
-from data_ingest.sources.pos_decode import decode_records, dumps_json
+from data_ingest.sources.json_gz_decode import decode_records, dumps_json
 
 _WATERMARK = '_s3_last_modified'
 _BATCH_BYTES = 16 * 1024 * 1024
 _MAX_ROW_BYTES = 30 * 1024 * 1024
-_STRING_COLUMNS = (
-    '_source_record_id', '_s3_bucket', '_s3_key', '_s3_etag',
-    'event_type', 'event_specversion', 'event_source', 'event_id', 'event_time',
-    'group_id', 'business_date', 'historical_data_type', 'data_content_type',
-    'payload_business_date', 'order_version', 'order_id', 'envelope_json', 'payload_json',
-)
-_SCHEMA = pa.schema(
-    [(name, pa.string()) for name in _STRING_COLUMNS]
-    + [('_s3_record_index', pa.int64()), (_WATERMARK, pa.timestamp('us'))]
-)
-_ENVELOPE_FIELDS = (
-    ('event_type', 'type'), ('event_specversion', 'specversion'),
-    ('event_source', 'source'), ('event_id', 'id'), ('event_time', 'time'),
-    ('group_id', 'groupid'), ('business_date', 'businessdate'),
-    ('historical_data_type', 'historicaldatatype'), ('data_content_type', 'datacontenttype'),
-)
+# Landed for every feed: S3 provenance, then the two JSON columns that keep
+# the record whole whatever the configured projection happens to select.
+_LINEAGE_COLUMNS = ('_source_record_id', '_s3_bucket', '_s3_key', '_s3_etag')
+_JSON_COLUMNS = ('envelope_json', 'payload_json')
 
 
 def _utc(value):
@@ -53,7 +46,7 @@ def _scalar(value, field):
         return None
     if isinstance(value, (str, int, float, Decimal, bool)):
         return str(value)
-    raise ExtractionError(f'POS field {field} must be a scalar or null')
+    raise ExtractionError(f'Field {field} must be a scalar or null')
 
 
 def _at_path(payload, path):
@@ -65,7 +58,7 @@ def _at_path(payload, path):
     return current
 
 
-class ParPosS3Source(Source):
+class S3JsonGzSource(Source):
     """S3-backed Source using IAM credentials and wall-clock checkpoints."""
 
     def __init__(self, s3_config, lookback_minutes=15, fetch_size=10_000,
@@ -81,13 +74,30 @@ class ParPosS3Source(Source):
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._folder_timezone = ZoneInfo(s3_config.folder_timezone)
         self._start = _utc(s3_config.start_at)
+        self._envelope_columns = tuple(s3_config.envelope_columns)
+        self._payload_columns = tuple(s3_config.payload_fields.items())
+        # Built per table rather than as a module constant: which projected
+        # columns exist is now configuration. Order is fixed by the config so
+        # the Parquet schema is stable from run to run.
+        names = (
+            *_LINEAGE_COLUMNS,
+            *(column for column, _ in self._envelope_columns),
+            *(column for column, _ in self._payload_columns),
+            *_JSON_COLUMNS,
+        )
+        self._schema = pa.schema(
+            [(name, pa.string()) for name in names]
+            + [('_s3_record_index', pa.int64()), (_WATERMARK, pa.timestamp('us'))]
+        )
 
     def metadata(self):
         return {'bucket': self.bucket, 'prefix': self.prefix,
-                'folder_timezone': self.config.folder_timezone}
+                'folder_timezone': self.config.folder_timezone,
+                'envelope_fields': dict(self.config.envelope_fields),
+                'payload_fields': dict(self.config.payload_fields)}
 
     def arrow_schema(self):
-        return _SCHEMA
+        return self._schema
 
     def get_current_checkpoint(self):
         high = _utc(self._now()) - timedelta(seconds=self.config.safety_delay_seconds)
@@ -126,20 +136,20 @@ class ParPosS3Source(Source):
                         if item['Key'].endswith('.json.gz') and low <= _utc(item['LastModified']) <= high:
                             yield item
             except Exception:
-                raise ExtractionError(f'Failed to list POS objects at s3://{self.bucket}/{prefix}') from None
+                raise ExtractionError(f'Failed to list objects at s3://{self.bucket}/{prefix}') from None
 
     def _read(self, item):
         limit = self.config.max_object_bytes
         if item.get('Size', 0) > limit:
-            raise ExtractionError('POS S3 object exceeds max_object_bytes')
+            raise ExtractionError('S3 object exceeds max_object_bytes')
         response = self._client.get_object(Bucket=self.bucket, Key=item['Key'], IfMatch=item['ETag'])
         body = response['Body']
         try:
             if response.get('ContentLength', 0) > limit:
-                raise ExtractionError('POS S3 object exceeds max_object_bytes')
+                raise ExtractionError('S3 object exceeds max_object_bytes')
             compressed = body.read(limit + 1)
             if len(compressed) > limit:
-                raise ExtractionError('POS S3 object exceeds max_object_bytes')
+                raise ExtractionError('S3 object exceeds max_object_bytes')
             return compressed
         finally:
             body.close()
@@ -152,11 +162,10 @@ class ParPosS3Source(Source):
             '_s3_bucket': self.bucket, '_s3_key': item['Key'], '_s3_etag': item['ETag'],
             '_s3_record_index': ordinal,
             _WATERMARK: _utc(item['LastModified']).replace(tzinfo=None),
-            **{column: _scalar(envelope.get(key), key) for column, key in _ENVELOPE_FIELDS},
-            'payload_business_date': _scalar(payload.get('businessDate'), 'businessDate'),
-            'order_version': _scalar(payload.get('version'), 'version'),
-            'order_id': _scalar(_at_path(payload, self.config.order_id_path), 'order_id')
-            if self.config.order_id_path else None,
+            **{column: _scalar(_at_path(envelope, path), path)
+               for column, path in self._envelope_columns},
+            **{column: _scalar(_at_path(payload, path), path)
+               for column, path in self._payload_columns},
             'envelope_json': dumps_json(envelope), 'payload_json': payload_json,
         }
 
@@ -170,12 +179,12 @@ class ParPosS3Source(Source):
                 yield self._row(item, ordinal, envelope, payload, payload_json)
         except ExtractionError as exc:
             raise ExtractionError(
-                f'Failed to extract POS object s3://{self.bucket}/{item["Key"]}: {exc}'
+                f'Failed to extract object s3://{self.bucket}/{item["Key"]}: {exc}'
             ) from None
         except Exception:
             # Do not include exception details: SDK/parser errors may contain
-            # full response bodies or order payload values.
-            raise ExtractionError(f'Failed to extract POS object s3://{self.bucket}/{item["Key"]}') from None
+            # full response bodies or payload values.
+            raise ExtractionError(f'Failed to extract object s3://{self.bucket}/{item["Key"]}') from None
 
     def extract(self, previous_checkpoint, current_checkpoint):
         if current_checkpoint.value is None:
@@ -193,20 +202,20 @@ class ParPosS3Source(Source):
                 row_bytes = sum(len(value.encode('utf-8')) for value in row.values() if isinstance(value, str))
                 if row_bytes > _MAX_ROW_BYTES:
                     raise ExtractionError(
-                        f'POS row exceeds {_MAX_ROW_BYTES} UTF-8 bytes '
+                        f'Row exceeds {_MAX_ROW_BYTES} UTF-8 bytes '
                         f'({row_bytes} bytes) at s3://{self.bucket}/{item["Key"]}'
                     )
                 if batch and (len(batch) >= self.fetch_size or byte_count + row_bytes > _BATCH_BYTES):
-                    yield pd.DataFrame(batch, columns=_SCHEMA.names)
+                    yield pd.DataFrame(batch, columns=self._schema.names)
                     batch = []
                     byte_count = 0
                 batch.append(row)
                 byte_count += row_bytes
         if batch:
-            yield pd.DataFrame(batch, columns=_SCHEMA.names)
+            yield pd.DataFrame(batch, columns=self._schema.names)
 
 
 def build_source(credentials, table_config, fetch_size):
     """Registry factory: boto3 obtains credentials from the Glue IAM role."""
-    return ParPosS3Source(table_config.s3, lookback_minutes=table_config.checkpoint.lookback_minutes,
+    return S3JsonGzSource(table_config.s3, lookback_minutes=table_config.checkpoint.lookback_minutes,
                        fetch_size=fetch_size)

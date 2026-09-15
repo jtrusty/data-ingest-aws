@@ -12,7 +12,8 @@ import pytest
 
 from data_ingest.checkpoints.watermark import WatermarkCheckpoint
 from data_ingest.exceptions import ExtractionError
-from data_ingest.sources.par_pos_s3 import ParPosS3Source, build_source
+from data_ingest.config_s3_json_gz import parse_s3_config
+from data_ingest.sources.s3_json_gz import S3JsonGzSource, build_source
 
 
 def instant(value):
@@ -23,11 +24,25 @@ def checkpoint(value):
     return WatermarkCheckpoint('_s3_last_modified', value, value_type='TIMESTAMP')
 
 
+ENVELOPE_FIELDS = {'group_id': 'groupid', 'business_date': 'businessdate',
+                   'historical_data_type': 'historicaldatatype'}
+PAYLOAD_FIELDS = {'order_id': 'order.id', 'order_version': 'version',
+                  'payload_business_date': 'businessDate'}
+
+
 def config(**overrides):
-    return SimpleNamespace(**dict(dict(location='s3://pos/orders', start_at='2026-09-10T09:00:00Z',
+    """
+    Build via the real parser rather than a stand-in: envelope_columns and the
+    field maps define the Parquet schema, so a hand-rolled namespace that drifts
+    from the parser would let the adapter be tested against a shape config can
+    no longer produce.
+    """
+    settings = dict(location='s3://pos/orders', start_at='2026-09-10T09:00:00Z',
         folder_timezone='UTC', compression='auto', safety_delay_seconds=120,
         max_object_bytes=33554432, max_outer_bytes=134217728, max_payload_bytes=16777216,
-        order_id_path='order.id'), **overrides))
+        envelope_fields=dict(ENVELOPE_FIELDS), payload_fields=dict(PAYLOAD_FIELDS))
+    settings.update(overrides)
+    return parse_s3_config(settings)
 
 
 def packed(version=1):
@@ -42,7 +57,7 @@ def setup_source(records=None, **settings):
     obj = dict(Key='orders/2026/09/10/09/file.json.gz', ETag='"abc"', LastModified=instant('2026-09-10T09:20:00'), Size=len(body.getvalue()))
     client.get_paginator.return_value.paginate.return_value = [{'Contents': [obj]}]
     client.get_object.return_value = {'Body': body, 'ContentLength': len(body.getvalue())}
-    source = ParPosS3Source(config(**settings), lookback_minutes=15, s3_client=client,
+    source = S3JsonGzSource(config(**settings), lookback_minutes=15, s3_client=client,
                          now=lambda: instant('2026-09-10T09:32:00'))
     return source, client, body, obj
 
@@ -84,7 +99,7 @@ def test_producer_shape_keeps_the_fourteen_digit_order_id_exact():
                 'data_base64': base64.b64encode(gzip.compress(json.dumps(payload).encode())).decode()}
 
     source, _, _, _ = setup_source([envelope(98765432109876, 1), envelope(98765432109876, 2)],
-                                   order_id_path='id')
+                                   payload_fields={'order_id': 'id', 'order_version': 'version'})
     frame = list(source.extract(None, source.get_current_checkpoint()))[0]
 
     assert list(frame['order_id']) == ['98765432109876', '98765432109876']
@@ -173,26 +188,48 @@ def test_empty_or_future_window_does_not_list():
 
 def test_batch_bytes_limit(monkeypatch):
     source, _, _, _ = setup_source([packed(1), packed(2)])
-    monkeypatch.setattr('data_ingest.sources.par_pos_s3._BATCH_BYTES', 1)
+    monkeypatch.setattr('data_ingest.sources.s3_json_gz._BATCH_BYTES', 1)
     assert [len(f) for f in source.extract(None, source.get_current_checkpoint())] == [1, 1]
 
 
-def test_missing_order_path_and_metadata():
-    source, _, _, _ = setup_source(order_id_path='order.id.missing')
+def test_a_configured_path_that_no_record_has_lands_null_not_an_error():
+    # A projection that misses is NOT a failure: feeds legitimately omit
+    # optional fields, and payload_json still holds whatever was there.
+    source, _, _, _ = setup_source(payload_fields={'order_id': 'order.id.missing'})
     frame = list(source.extract(None, source.get_current_checkpoint()))[0]
     assert frame.order_id[0] is None
-    assert source.metadata() == {'bucket': 'pos', 'prefix': 'orders', 'folder_timezone': 'UTC'}
 
 
-def test_unconfigured_order_id():
-    source, _, _, _ = setup_source(order_id_path=None)
-    assert list(source.extract(None, source.get_current_checkpoint()))[0].order_id[0] is None
+def test_metadata_records_the_projection_for_lineage():
+    # The manifest carries the mapping, so a run can be read back and the
+    # column-to-path relationship recovered without the config file.
+    source, _, _, _ = setup_source()
+    assert source.metadata() == {
+        'bucket': 'pos', 'prefix': 'orders', 'folder_timezone': 'UTC',
+        'envelope_fields': ENVELOPE_FIELDS, 'payload_fields': PAYLOAD_FIELDS,
+    }
+
+
+def test_an_empty_projection_still_lands_core_and_json_columns():
+    # No configured fields at all: the feed is still fully preserved, because
+    # CloudEvents core plus envelope_json/payload_json are unconditional.
+    source, _, _, _ = setup_source(envelope_fields={}, payload_fields={})
+    frame = list(source.extract(None, source.get_current_checkpoint()))[0]
+    assert 'order_id' not in frame.columns and 'group_id' not in frame.columns
+    assert frame['event_id'][0] == 'event-1'
+    assert json.loads(frame['payload_json'][0])['order']['id'] == 'order-1'
+
+
+def test_columns_follow_config_order_so_the_schema_is_stable():
+    source, _, _, _ = setup_source(payload_fields={'b_col': 'version', 'a_col': 'businessDate'})
+    names = source.arrow_schema().names
+    assert names.index('b_col') < names.index('a_col')
 
 
 def test_list_failure_is_safe():
     source, client, _, _ = setup_source()
     client.get_paginator.return_value.paginate.side_effect = RuntimeError('secret')
-    with pytest.raises(ExtractionError, match='Failed to list POS') as caught:
+    with pytest.raises(ExtractionError, match='Failed to list objects') as caught:
         list(source.extract(None, source.get_current_checkpoint()))
     assert 'secret' not in str(caught.value)
 
@@ -220,7 +257,7 @@ def test_local_prefix_fall_back_is_not_listed_twice():
 def test_factory_uses_iam_client_and_table_settings(monkeypatch):
     client = Mock()
     factory = Mock(return_value=client)
-    monkeypatch.setattr('data_ingest.sources.par_pos_s3.boto3.client', factory)
+    monkeypatch.setattr('data_ingest.sources.s3_json_gz.boto3.client', factory)
     table = SimpleNamespace(s3=config(), checkpoint=SimpleNamespace(lookback_minutes=20))
     source = build_source({}, table, 17)
     assert source.fetch_size == 17
@@ -231,13 +268,13 @@ def test_factory_uses_iam_client_and_table_settings(monkeypatch):
 def test_invalid_fetch_size():
     from data_ingest.exceptions import ConfigurationError
     with pytest.raises(ConfigurationError):
-        ParPosS3Source(config(), fetch_size=0)
+        S3JsonGzSource(config(), fetch_size=0)
 
 
 def test_row_size_cap_has_actionable_safe_reason(monkeypatch):
     source, _, _, _ = setup_source()
-    monkeypatch.setattr('data_ingest.sources.par_pos_s3._MAX_ROW_BYTES', 1, raising=False)
-    with pytest.raises(ExtractionError, match='row exceeds'):
+    monkeypatch.setattr('data_ingest.sources.s3_json_gz._MAX_ROW_BYTES', 1, raising=False)
+    with pytest.raises(ExtractionError, match='Row exceeds'):
         list(source.extract(None, source.get_current_checkpoint()))
 
 
@@ -262,4 +299,4 @@ def test_half_hour_dst_change_includes_last_local_prefix():
 def test_constructor_rejects_invalid_integer_settings(setting, value):
     from data_ingest.exceptions import ConfigurationError
     with pytest.raises(ConfigurationError):
-        ParPosS3Source(config(), s3_client=Mock(), **{setting: value})
+        S3JsonGzSource(config(), s3_client=Mock(), **{setting: value})
