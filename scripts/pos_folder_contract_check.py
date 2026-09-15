@@ -9,11 +9,20 @@ discovery rule over that listing -- scheduled runs every --interval minutes,
 --lookback minutes of overlap, --safety seconds of cutoff -- and reports the
 objects a real schedule would never have found.
 
-    python scripts/pos_folder_contract_check.py s3://pos-events/orders --days 14
-    python scripts/pos_folder_contract_check.py s3://pos-events/orders \
+    python scripts/pos_folder_contract_check.py --uri s3://pos-events/orders --days 14
+    python scripts/pos_folder_contract_check.py --uri s3://pos-events/orders \
         --days 30 --tz America/Chicago --lookback 30
 
-Exit status is 1 if any object would be missed, so it can gate a schedule.
+Runs anywhere with s3:ListBucket and boto3 -- including as an AWS Glue Python
+Shell job, which is the easy way to run it against a bucket you cannot reach
+from a laptop. Under Glue, pass the same flags as job parameters, give the job
+the analytics library set (or --additional-python-modules tzdata, since
+zoneinfo has no built-in UTC), and read the verdict in CloudWatch. Unknown
+arguments are ignored, so Glue's own injected parameters are harmless.
+
+Prints "VERDICT:" either way. Add --fail-on-miss to exit 1 on a violation,
+for gating a schedule from CI; under Glue leave it off, so a run that finds a
+violation still reports SUCCEEDED rather than looking like a crash.
 """
 
 import argparse
@@ -91,14 +100,22 @@ def simulate(objects, start, interval, lookback, safety):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("uri", help="s3://bucket/prefix that ends right before yyyy/mm/dd/hh")
+    # --uri, not a positional: AWS Glue can only pass "--flag value" pairs.
+    ap.add_argument("--uri", required=True,
+                    help="s3://bucket/prefix that ends right before yyyy/mm/dd/hh")
     ap.add_argument("--days", type=int, default=14, help="how many days back to list (default 14)")
     ap.add_argument("--tz", default="UTC", help="folder_timezone (default UTC)")
     ap.add_argument("--interval", type=int, default=15, help="schedule minutes (default 15)")
     ap.add_argument("--lookback", type=int, default=15, help="lookback_minutes (default 15)")
     ap.add_argument("--safety", type=int, default=120, help="safety_delay_seconds (default 120)")
     ap.add_argument("--show", type=int, default=25, help="worst offenders to print (default 25)")
-    args = ap.parse_args()
+    ap.add_argument("--fail-on-miss", action="store_true",
+                    help="exit 1 if any object would be missed (off by default: under Glue a "
+                         "nonzero exit reads as a broken script, not as a finding)")
+    # parse_known_args(), not parse_args(): Glue injects --job-name,
+    # --scriptLocation, --continuous-log-logGroup and friends, and a strict
+    # parse exits 2 on them before the script ever runs.
+    args, _unknown = ap.parse_known_args()
 
     bucket, prefix = parse_uri(args.uri)
     tz = ZoneInfo(args.tz)
@@ -156,7 +173,15 @@ def main():
         need = int(worst.total_seconds() // 60) + args.interval + 1
         print(f"\nworst lateness {worst}; a lookback of ~{need}m would have caught everything listed. "
               f"Re-run with --lookback {need} to confirm.")
-    sys.exit(1 if missed else 0)
+        print("\nVERDICT: CONTRACT VIOLATED -- prefix-scan discovery would lose data")
+    else:
+        print("\nVERDICT: contract holds -- every object would have been found")
+
+    # --fail-on-miss is off by default so a Glue run reporting a violation
+    # still finishes SUCCEEDED; the verdict is in the log, and a FAILED run
+    # would look like the script broke rather than like an answer.
+    if missed and args.fail_on_miss:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

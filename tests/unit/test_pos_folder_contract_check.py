@@ -80,3 +80,28 @@ def test_parse_uri(uri, expected):
 def test_parse_uri_rejects_non_s3():
     with pytest.raises(SystemExit):
         checker.parse_uri("https://pos-events/orders")
+
+
+def test_glue_injected_arguments_do_not_kill_the_parser(monkeypatch, capsys):
+    """
+    Glue adds --job-name, --scriptLocation, --continuous-log-logGroup and more
+    to whatever parameters the job defines. argparse's strict parse_args exits
+    2 on those before the script runs, which is how this first failed.
+    """
+    monkeypatch.setattr(checker.sys, "argv", [
+        "check.py", "--uri", "s3://pos/orders", "--days", "3",
+        "--job-name", "pos-check", "--JOB_NAME", "pos-check",
+        "--scriptLocation", "s3://x/y.py",
+        "--continuous-log-logGroup", "/aws-glue/jobs",
+        "--job-bookmark-option", "job-bookmark-disable",
+    ])
+
+    # Fail at the S3 call, not at argument parsing: getting that far is the
+    # assertion. A parse failure would raise SystemExit(2) instead.
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("reached S3")
+
+    monkeypatch.setattr(checker.boto3, "client", boom)
+    with pytest.raises(RuntimeError, match="reached S3"):
+        checker.main()
+    assert "listing s3://pos/orders" in capsys.readouterr().out
