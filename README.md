@@ -590,7 +590,7 @@ off the envelope. The full `<guid>:<order_id>` string is still landed
 verbatim as `event_id`, so the two can be reconciled in Athena:
 
 ```sql
-SELECT count(*) FROM bronze_restaurant.restaurant_par_pos_s3_orders
+SELECT count(*) FROM bronze_par_pos.orders
 WHERE order_id IS NOT NULL AND split_part(event_id, ':', 2) <> order_id;
 ```
 
@@ -616,7 +616,7 @@ FROM (
            ORDER BY CAST(order_version AS DECIMAL(38, 0)) DESC,
                     _s3_last_modified DESC, _source_record_id DESC
          ) AS version_rank
-  FROM bronze_restaurant.restaurant_par_pos_s3_orders b
+  FROM bronze_par_pos.orders b
   WHERE historical_data_type = 'order'
     AND order_id IS NOT NULL AND order_version IS NOT NULL
 )

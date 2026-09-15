@@ -116,7 +116,10 @@ def test_s3_settings_must_be_a_mapping(value):
 def test_example_is_a_valid_bronze_enabled_config():
     path = Path(__file__).parents[2] / "config" / "par_pos_s3.example.yaml"
     config = parse_config(path.read_text())
-    assert config.bronze.database == "bronze_restaurant"
+    assert config.bronze.database == "bronze_par_pos"
+    # One database per source, so the source_key prefix would only be noise.
+    # Identity, applied once at CREATE TABLE: pinned so it cannot drift.
+    assert config.bronze.table_prefix == "none"
     assert config.tables[0].s3 is not None
     # The producer repeats the envelope's "guid:<order_id>" suffix as the
     # payload's own `id`. Mapping it at ingestion is not cosmetic: Bronze

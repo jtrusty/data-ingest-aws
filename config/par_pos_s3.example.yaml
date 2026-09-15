@@ -11,10 +11,14 @@ landing:
   checkpoint_table: ingestion-checkpoints
 
 bronze:
-  database: bronze_restaurant
+  database: bronze_par_pos
   location: s3://my-data-lake/bronze
   athena_output: s3://my-data-lake/athena-results/
   processed_runs_table: bronze-processed-runs
+  # One database per source, so nothing can collide and the source_key prefix
+  # would only be noise in every query. IDENTITY: applied once at CREATE TABLE
+  # and never afterwards -- changing it later strands the existing tables.
+  table_prefix: none
   # Defaults to month(_s3_last_modified); set before first Bronze run.
   # partition_by: ["month({checkpoint_column})"]
 
