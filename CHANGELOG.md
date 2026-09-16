@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.2](https://github.com/jtrusty/data-ingest-aws/compare/v1.3.1...v1.3.2) (2026-09-16)
+
+
+### Documentation
+
+* describe the s3_json adapter generically, not as a POS loader ([74faaba](https://github.com/jtrusty/data-ingest-aws/commit/74faaba334679f1ed19931663b9e22f7bc7cc93a))
+
 ## [1.3.1](https://github.com/jtrusty/data-ingest-aws/compare/v1.3.0...v1.3.1) (2026-09-16)
 
 
