@@ -820,7 +820,7 @@ query time, so unlike a landed column it can be corrected without re-landing.
 Infrastructure stays outside this repository. Configure the extraction job
 as Glue Python Shell 3.9, analytics library set, 1 DPU, using the wheel and
 `jobs/landing_load_s3_json.py`. Supply `--config-uri` and install
-`--additional-python-modules pyarrow==10.0.1,PyYAML==6.0.2,tzdata` (or
+`--additional-python-modules pyarrow==10.0.1,tzdata` (or
 equivalent approved wheels in S3). The Snowflake connector is not needed for
 this job. Add a **second Bronze job definition** for this source rather
 than reusing the Snowflake one: same script and wheel, different
@@ -1414,7 +1414,7 @@ automates that.
 
   Only `-c`-listed packages are pinned — `pytest`, `moto`, and `werkzeug`
   float on both legs, so each records its resolved versions in the log. moto
-  against Glue's botocore 1.24.21 is a pairing nobody upstream tests; if moto
+  against Glue's botocore 1.27.59 is a pairing nobody upstream tests; if moto
   drops support for it, pin moto in the `dev` extra rather than loosening
   `constraints-glue.txt`.
 
@@ -1549,18 +1549,39 @@ The `[pandas]` extra is **load-bearing**: Glue's analytics library-set does
 not ship pyarrow, and that extra is what supplies it (pinned by the
 connector to `>=10.0.1,<10.1.0`). Dropping `[pandas]` breaks Parquet writing.
 
-For the S3 POS source, `jobs/landing_load_s3_json.py`, same shape without the
-connector — pyarrow has to be named directly, since nothing else supplies it:
+For the S3 source, `jobs/landing_load_s3_json.py`, same shape without the
+connector:
 
 ```
 Python version         3.9
 Max capacity           1
 MaxConcurrentRuns      1
 --library-set          analytics
---additional-python-modules  pyarrow==10.0.1,PyYAML==6.0.2,tzdata
+--additional-python-modules  pyarrow==10.0.1,tzdata
 --extra-py-files       s3://<artifact-bucket>/python/data_ingest/<version>/data_ingest-<version>-py3-none-any.whl
 --config-uri           s3://<bucket>/ingestion-config/<source>_s3_json.yaml
 ```
+
+Two of those modules are deliberate and one that used to be listed is not:
+
+- **`pyarrow==10.0.1` replaces the image's own pyarrow 7.0.0**, and that is
+  not optional. With this job's import set and a live boto3 client in the
+  process, pyarrow 7.0.0 segfaults the interpreter at shutdown — exit 139,
+  reproduced 3/3 on the exact image stack — *after* the run's work is done.
+  Glue reads that as FAILED and retries, duplicating a landing run that
+  succeeded. 10.0.1 is clean on the same test. pip will warn that
+  `awswrangler requires pyarrow<7.1.0`; nothing here imports awswrangler,
+  and the warning is the expected price.
+- **`tzdata`** because `zoneinfo` has no built-in UTC and the image has no
+  tz database.
+- **Do not list `PyYAML`.** The image ships 5.4.1, which satisfies the wheel,
+  and forcing 6.x upgrades it out from under the image's own `awscli`.
+
+pip prints several other "dependency conflict" lines on every run
+(`aiobotocore`, `scipy`, `s3transfer`). Those are the image's preinstalled
+packages disagreeing with each other before this job installs anything;
+they are warnings, pip still installs, and they are not the cause of a
+failed run — the traceback after them is.
 
 **Bronze job** — `jobs/bronze_load.py`, **one script, but one job definition
 per source**:

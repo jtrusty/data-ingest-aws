@@ -59,7 +59,7 @@ jobs:
       # float even on the pinned leg. Printing the versions that actually
       # resolved means a failure caused by an upstream release is visible in
       # the log rather than needing a local repro. moto against Glue's
-      # botocore 1.24.21 is a pairing nobody upstream tests -- if moto drops
+      # botocore 1.27.59 is a pairing nobody upstream tests -- if moto drops
       # support for it, pin moto in the dev extra rather than loosening the
       # constraints file.
       - name: Record the resolved stack
@@ -133,6 +133,11 @@ jobs:
           from data_ingest.landing import LandingWriter
           from data_ingest.sources.snowflake import SnowflakeSource
           from data_ingest.sources.s3_json import S3JsonSource
+          # The shutdown crash needs a live boto3 client in the process, not
+          # just the imports -- pyarrow 7.0.0 passes an import-only check and
+          # then exits 139 with one. Create what run_job creates.
+          import boto3
+          boto3.client('s3'); boto3.client('dynamodb'); boto3.client('secretsmanager')
           "
             status=$?
             if [ $status -ne 0 ]; then
@@ -151,29 +156,37 @@ jobs:
       - name: Glue-runtime compatibility (no upgrades against preinstalled versions)
         run: |
           python -m venv /tmp/glue-sim
-          # Versions preinstalled by Glue Python Shell 3.9 (--library-set analytics).
-          /tmp/glue-sim/bin/pip install "boto3==1.21.21" "botocore==1.24.21" "pandas==1.4.2" "numpy==1.22.3"
-          # Installing our wheel on top must NOT try to replace them.
+          # Versions preinstalled by Glue Python Shell 3.9 (--library-set analytics),
+          # as read by `pip list` inside a job on that image. Keep in step with
+          # constraints-glue.txt.
+          /tmp/glue-sim/bin/pip install "boto3==1.24.59" "botocore==1.27.59" "s3transfer==0.6.2" \
+            "pandas==1.4.2" "numpy==1.23.4" "PyYAML==5.4.1" "pyarrow==7.0.0"
+          # Installing our wheel on top must NOT try to replace them -- with one
+          # deliberate exception, which must be replaced.
           /tmp/glue-sim/bin/pip install --dry-run --report /tmp/report.json "$(ls dist/*.whl)"
           python - <<'EOF'
           import json, sys
 
           # What Glue already has; the wheel must accept these as-is.
-          PREINSTALLED = {"boto3": "1.21.21", "botocore": "1.24.21", "pandas": "1.4.2", "numpy": "1.22.3"}
+          PREINSTALLED = {"boto3": "1.24.59", "botocore": "1.27.59", "s3transfer": "0.6.2",
+                          "pandas": "1.4.2", "numpy": "1.23.4", "pyyaml": "5.4.1"}
+          # What the wheel must replace: the image's pyarrow 7.0.0 segfaults the
+          # interpreter at shutdown once a boto3 client exists in the process.
+          MUST_REPLACE = {"pyarrow": "10.0.1"}
 
           report = json.load(open("/tmp/report.json"))
-          conflicts = []
-          for item in report.get("install", []):
-              meta = item["metadata"]
-              name, version = meta["name"].lower(), meta["version"]
-              if name in PREINSTALLED and version != PREINSTALLED[name]:
-                  conflicts.append(f"{name}: Glue has {PREINSTALLED[name]}, wheel wants {version}")
+          planned = {i["metadata"]["name"].lower(): i["metadata"]["version"] for i in report.get("install", [])}
+          conflicts = [f"{n}: Glue has {v}, wheel wants {planned[n]}"
+                       for n, v in PREINSTALLED.items() if n in planned and planned[n] != v]
+          missing = [f"{n}: image ships a version that crashes at exit; wheel must install {v}, plan has {planned.get(n)}"
+                     for n, v in MUST_REPLACE.items() if planned.get(n) != v]
 
-          if conflicts:
-              print("::error::Wheel would replace Glue-preinstalled package(s):")
+          if conflicts or missing:
               for c in conflicts:
-                  print(f"  - {c}")
-              print("See the RUNTIME CONTRACT comment in pyproject.toml.")
+                  print(f"::error::Wheel would replace Glue-preinstalled package: {c}")
+              for m in missing:
+                  print(f"::error::Wheel would NOT replace a package it must: {m}")
+              print("See the RUNTIME CONTRACT comment in pyproject.toml and constraints-glue.txt.")
               sys.exit(1)
-          print("No Glue-preinstalled package would be replaced.")
+          print("Preinstalled packages untouched; pyarrow replaced as required.")
           EOF

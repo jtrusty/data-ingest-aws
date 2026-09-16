@@ -19,8 +19,11 @@
 #      on Monday and fail on Thursday with no code change.
 #
 # The versions below are what Glue Python Shell 3.9 (--library-set analytics)
-# actually preinstalls, plus pyarrow from the connector's [pandas] extra.
-# This exact combination is verified to import cleanly.
+# actually preinstalls, as read from a job on that image, plus the one
+# package this project deliberately replaces. The combination is verified
+# to import AND to exit cleanly with live boto3 clients in the process --
+# the second half is the one that matters, and the one an import-only check
+# cannot see.
 #
 # HOW TO USE
 #
@@ -35,17 +38,27 @@
 # See "Known Glue constraints" in README.md.
 
 # --- Preinstalled by Glue Python Shell 3.9 (--library-set analytics) ---
-# Source of truth is the "Supported libraries for Python shell jobs" table in
-# the AWS Glue developer guide, NOT the 2022 launch announcement -- the blog
-# post lists a boto3/botocore pair (1.22.5 / 1.23.5) that is internally
-# inconsistent and cannot resolve.
-boto3==1.21.21
-botocore==1.24.21
-numpy==1.22.3
+# Source of truth: `pip list` run INSIDE a Python Shell job on 2026-09-16.
+# Not the developer-guide table and not the 2022 launch post -- both were
+# stale against the live image (the guide said boto3 1.21.21 / numpy 1.22.3).
+# Re-derive the same way when the image moves; do not hand-bump lines.
+boto3==1.24.59
+botocore==1.27.59
+s3transfer==0.6.2
+numpy==1.23.4
 pandas==1.4.2
+PyYAML==5.4.1
 
-# --- Supplied by snowflake-connector-python[pandas]==3.0.4 ---
-# Glue's analytics library-set does NOT ship pyarrow; the [pandas] extra is
-# what provides it. The connector requires >=10.0.1,<10.1.0.
+# --- Replaced at job start, deliberately ---
+# The image DOES ship pyarrow, at 7.0.0, and it must not be used: with the
+# landing job's import set and a real boto3 client in the process, pyarrow
+# 7.0.0 segfaults the interpreter at shutdown (exit 139, 3/3 runs, reproduced
+# on this exact stack). Work completes, Glue reads FAILED, and retries
+# duplicate the landing run. pyarrow 10.0.1 is clean on the same test. It is
+# installed via --additional-python-modules and also demanded by the wheel's
+# Requires-Dist; pip's "awswrangler requires pyarrow<7.1.0" warning is the
+# expected, harmless consequence -- nothing here imports awswrangler.
 pyarrow==10.0.1
+
+# --- Snowflake landing job only ---
 snowflake-connector-python==3.0.4
