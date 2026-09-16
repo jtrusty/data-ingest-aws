@@ -109,6 +109,15 @@ class DiscoveryConfig:
     # latency dominates a run and releases the GIL; decode does neither.
     # Memory in flight is bounded by prefetch * max_object_bytes.
     prefetch: int = 8
+    # The most ONE landing run may advance the checkpoint, in hours of
+    # source time. None is unbounded: a first run from a start_at months back
+    # is a single landing run with one commit at the very end, and a failure
+    # at hour nine restarts it from zero. With a cap, the job runs window
+    # after window -- each its own run_id, manifest and commit -- until it is
+    # caught up, so a failure costs one window and the next execution resumes
+    # from the last commit. Every window is also one Bronze merge, so size it
+    # in days, not hours: 24 is a reasonable start.
+    max_window_hours: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +141,13 @@ class DocumentConfig:
     max_object_bytes: int = 32 * 1024 * 1024
     max_outer_bytes: int = 128 * 1024 * 1024
     max_payload_bytes: int = 16 * 1024 * 1024
+    # How much decoded string data one Parquet part may hold. Together with
+    # defaults.fetch_size (rows) this sets part size, and part COUNT is what
+    # Bronze pays for: one MERGE per landing run has to open every part. The
+    # old fixed 16 MiB produced ~1 MiB parts and a six-figure part count on a
+    # backfill. 64 MiB needs a 1 DPU job; the 1/16 DPU size (1 GB) should
+    # stay at 16 MiB.
+    batch_bytes: int = 64 * 1024 * 1024
 
     @property
     def core_envelope_fields(self):
@@ -201,6 +217,8 @@ def parse_discovery(data):
     if type(settings.lookahead_hours) is not int or not 0 <= settings.lookahead_hours <= 24:
         raise ConfigurationError("discovery.lookahead_hours must be an integer from 0 to 24")
     _positive("discovery", "prefetch", settings.prefetch, 32)
+    if settings.max_window_hours is not None:
+        _positive("discovery", "max_window_hours", settings.max_window_hours, 24 * 366)
     return settings
 
 
@@ -254,7 +272,7 @@ def parse_document(data):
     _choice("document", "compression", settings.compression, _DOCUMENT_COMPRESSIONS)
     _choice("document", "records", settings.records, _FRAMINGS)
     _choice("document", "envelope", settings.envelope, _ENVELOPES)
-    for name in ("max_object_bytes", "max_outer_bytes", "max_payload_bytes"):
+    for name in ("max_object_bytes", "max_outer_bytes", "max_payload_bytes", "batch_bytes"):
         _positive("document", name, getattr(settings, name), 512 * 1024 * 1024)
     return settings
 

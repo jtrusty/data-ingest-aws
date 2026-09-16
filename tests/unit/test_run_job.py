@@ -143,7 +143,7 @@ class _RecordingSource(Source):
     def __init__(self, fetch_size):
         self.fetch_size = fetch_size
 
-    def get_current_checkpoint(self):
+    def get_current_checkpoint(self, previous_checkpoint=None):
         return WatermarkCheckpoint(column="UPDATED_AT", value=None)  # -> SKIPPED
 
     def extract(self, previous_checkpoint, current_checkpoint):
@@ -307,3 +307,107 @@ def test_checkpoint_conflict_is_reported_as_a_failed_table(tmp_path):
                 run_job(argv=["--config-uri", str(config_path)])
 
     assert exc_info.value.code == 1
+
+
+# --- capped windows drain within one execution ------------------------------
+
+class _WindowedSource(Source):
+    """
+    A source whose bound advances one step per run and that reports
+    "not caught up" until it reaches its target -- the shape s3_json takes
+    with max_window_hours set. Each run lands one row so the commits are
+    real and distinguishable.
+    """
+
+    def __init__(self, steps, fail_at=None):
+        self.steps, self.fail_at, self.runs = steps, fail_at, 0
+
+    def get_current_checkpoint(self, previous_checkpoint=None):
+        prev = int(previous_checkpoint.value) if previous_checkpoint and previous_checkpoint.value else 0
+        return WatermarkCheckpoint(column="STEP", value=str(min(prev + 1, self.steps)))
+
+    def is_caught_up(self, committed_checkpoint):
+        return int(committed_checkpoint.value) >= self.steps
+
+    def extract(self, previous_checkpoint, current_checkpoint):
+        self.runs += 1
+        if self.runs == self.fail_at:
+            raise RuntimeError("window blew up")
+        import pandas as pd
+        yield pd.DataFrame([{"STEP": int(current_checkpoint.value)}])
+
+    def metadata(self):
+        return {"database": "D", "schema": "S", "table": "T"}
+
+
+@contextmanager
+def windowed_source(steps, fail_at=None):
+    holder = {}
+
+    def factory(source_type, credentials, table_config, fetch_size):
+        holder["source"] = _WindowedSource(steps, fail_at)
+        return holder["source"]
+
+    with patch("data_ingest.pipeline.build_source", side_effect=factory):
+        yield holder
+
+
+def _committed_step(state_table="yaml-state-table"):
+    # Through the real store, so this reads whatever layout it writes.
+    from types import SimpleNamespace
+    from data_ingest.pipeline import state_key_for
+    from data_ingest.state import DynamoDBStateStore
+    store = DynamoDBStateStore(boto3.resource("dynamodb", region_name="us-east-1").Table(state_table))
+    rec = store.get(state_key_for("snowflake", "acme", SimpleNamespace(name="orders")))
+    return int(rec.checkpoint.value) if rec else None
+
+
+def test_run_job_loops_a_capped_source_until_caught_up(tmp_path):
+    config_path = tmp_path / "acme.yaml"
+    config_path.write_text(CONFIG_YAML + YAML_DEPLOYMENT_SETTINGS)
+
+    with aws_env() as s3, windowed_source(steps=4) as h:
+        results = run_job(argv=["--config-uri", str(config_path)])
+
+        assert h["source"].runs == 4                       # one per window, in ONE execution
+        assert [r.status for r in results] == ["SUCCESS"]  # one result per table, the last window's
+        assert _committed_step() == 4
+        # Four distinct landing runs, each with its own manifest.
+        manifests = [k["Key"] for k in s3.list_objects_v2(Bucket="yaml-landing-bucket")["Contents"]
+                     if k["Key"].endswith("_manifest.json")]
+        assert len(manifests) == 4
+
+
+def test_a_failed_window_keeps_earlier_commits_and_the_next_execution_resumes(tmp_path):
+    """
+    The point of windows: window 3 fails, windows 1-2 stay committed, and a
+    fresh execution starts at window 3 rather than from the beginning.
+    """
+    config_path = tmp_path / "acme.yaml"
+    config_path.write_text(CONFIG_YAML + YAML_DEPLOYMENT_SETTINGS)
+
+    with aws_env():
+        with windowed_source(steps=4, fail_at=3) as h:
+            # A failed table exits non-zero so Glue records the run as FAILED
+            # -- which is correct: window 3 did not land, and the operator
+            # should know. What must NOT happen is windows 1-2 being undone.
+            with pytest.raises(SystemExit):
+                run_job(argv=["--config-uri", str(config_path)])
+            assert h["source"].runs == 3
+            assert _committed_step() == 2                  # windows 1 and 2 survived
+
+        with windowed_source(steps=4) as h:
+            results = run_job(argv=["--config-uri", str(config_path)])
+            assert [r.status for r in results] == ["SUCCESS"]
+            assert h["source"].runs == 2                   # 3 and 4 only
+            assert _committed_step() == 4
+
+
+def test_an_uncapped_source_still_runs_exactly_once(tmp_path):
+    config_path = tmp_path / "acme.yaml"
+    config_path.write_text(CONFIG_YAML + YAML_DEPLOYMENT_SETTINGS)
+    with aws_env(), recording_source():
+        run_job(argv=["--config-uri", str(config_path)])
+    # _RecordingSource inherits the default is_caught_up -> True; SKIPPED
+    # short-circuits the loop as well. Either way: one call.
+    assert len(_RecordingSource.built) == 1

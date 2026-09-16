@@ -350,7 +350,7 @@ class SnowflakeSource(Source):
         self._codec = codec
         return codec
 
-    def get_current_checkpoint(self):
+    def get_current_checkpoint(self, previous_checkpoint=None):
         """
         Capture MAX(watermark_column) as the extraction's upper bound
         BEFORE any extraction happens. Doing this up front (rather than

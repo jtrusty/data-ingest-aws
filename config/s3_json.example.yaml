@@ -13,6 +13,12 @@ source:
     timezone: UTC                # Confirm with producer; e.g. America/Chicago.
     suffix: ".json.gz"
     safety_delay_seconds: 120    # upper bound is run start minus this
+    # The most one landing run may advance, in hours of SOURCE time. The job
+    # then runs window after window until caught up, committing each, so a
+    # backfill from a start_at months back survives a failure at hour nine.
+    # Every window is one Bronze merge, so size it in days: 24 is a good start.
+    # Omit for unbounded (one run covers everything since the checkpoint).
+    max_window_hours: 24
 
   # How one object is opened and split into records, and where the payload is.
   document:
@@ -33,6 +39,10 @@ source:
     # max_object_bytes: 33554432   # 32 MiB compressed S3 object
     # max_outer_bytes: 134217728   # 128 MiB decompressed outer JSON
     # max_payload_bytes: 16777216  # 16 MiB per decoded payload
+    # Decoded string data per Parquet part. Part COUNT is what Bronze pays
+    # for -- one MERGE opens every part of a run -- so this is not tiny.
+    # 64 MiB wants a 1 DPU job; on the 1/16 DPU size (1 GB) use 16777216.
+    # batch_bytes: 67108864
 
 # No connection/secret: this source uses the Glue job's IAM role.
 landing:
@@ -52,7 +62,7 @@ bronze:
   # partition_by: ["month({checkpoint_column})"]
 
 defaults:
-  fetch_size: 250
+  fetch_size: 5000     # rows per Parquet part; the adapter caps at 5000
   fail_fast: true
 
 # One S3 path holds one kind of JSON, so a path IS a table. Each entry is a

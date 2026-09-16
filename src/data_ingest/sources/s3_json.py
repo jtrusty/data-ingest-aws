@@ -30,12 +30,20 @@ import pyarrow as pa
 from data_ingest.checkpoints.watermark import WatermarkCheckpoint
 from data_ingest.config import split_s3_uri
 from data_ingest.exceptions import ConfigurationError, ExtractionError
+from data_ingest.logging import get_logger
 from data_ingest.sources.base import Source
 from data_ingest.sources.json_decode import _at_path, decode_records, dumps_json
 
+logger = get_logger(__name__)
+
 _WATERMARK = '_s3_last_modified'
-_BATCH_BYTES = 16 * 1024 * 1024
 _MAX_ROW_BYTES = 30 * 1024 * 1024
+# Rows per Parquet part. fetch_size is a per-source config value shared with
+# Snowflake, where 10k is right for a cursor fetch; here rows are whole JSON
+# documents, so this cap is what keeps a part inside its byte budget. Part
+# count is the cost that matters downstream, so this is deliberately not
+# tiny -- see DocumentConfig.batch_bytes.
+_MAX_FETCH_SIZE = 5_000
 # Landed for every feed: S3 provenance, then the two JSON columns that keep
 # the record whole whatever the configured projection happens to select.
 _LINEAGE_COLUMNS = ('_source_record_id', '_s3_bucket', '_s3_key', '_s3_etag')
@@ -109,7 +117,7 @@ class S3JsonSource(Source):
         self.config = s3_config
         self.bucket, self.prefix = split_s3_uri(s3_config.location)
         self.lookback_minutes = lookback_minutes
-        self.fetch_size = min(fetch_size, 250)
+        self.fetch_size = min(fetch_size, _MAX_FETCH_SIZE)
         self._client = s3_client if s3_client is not None else boto3.client('s3')
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._folder_timezone = ZoneInfo(s3_config.folder_timezone)
@@ -151,12 +159,31 @@ class S3JsonSource(Source):
     def arrow_schema(self):
         return self._schema
 
-    def get_current_checkpoint(self):
-        high = _utc(self._now()) - timedelta(seconds=self.config.safety_delay_seconds)
+    def _uncapped_high(self):
+        return _utc(self._now()) - timedelta(seconds=self.config.safety_delay_seconds)
+
+    def get_current_checkpoint(self, previous_checkpoint=None):
+        high = self._uncapped_high()
+        cap_hours = self._discovery.max_window_hours
+        if cap_hours is not None:
+            # Bound the run to a window past where the last one stopped. The
+            # pipeline commits THIS value after the manifest, so the cap has
+            # to live here, not in extract(): a run that fetched a smaller
+            # window than it declared would silently skip the remainder.
+            resume = (_utc(previous_checkpoint.value)
+                      if previous_checkpoint is not None and previous_checkpoint.value is not None
+                      else self._start)
+            high = min(high, resume + timedelta(hours=cap_hours))
         return WatermarkCheckpoint(
             column=_WATERMARK, value=high.strftime('%Y-%m-%d %H:%M:%S.%f'),
             lookback_minutes=self.lookback_minutes, value_type='TIMESTAMP',
         )
+
+    def is_caught_up(self, committed_checkpoint):
+        # More is available only if the cap, not the clock, bounded the run.
+        if self._discovery.max_window_hours is None or committed_checkpoint is None:
+            return True
+        return _utc(committed_checkpoint.value) >= self._uncapped_high()
 
     def _path(self, moment):
         """The configured prefix for one instant, in the folder timezone."""
@@ -202,17 +229,25 @@ class S3JsonSource(Source):
         """
         paginator = self._client.get_paginator('list_objects_v2')
         for prefix in self._prefixes(walk_from, high):
+            listed = matched = 0
             try:
                 for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
                     for item in page.get('Contents', []):
+                        listed += 1
                         if not item['Key'].endswith(self._discovery.suffix):
                             continue
                         modified = _utc(item['LastModified'])
                         if modified > high or modified < low or (modified == low and not inclusive):
                             continue
+                        matched += 1
                         yield item
             except Exception:
                 raise ExtractionError(f'Failed to list objects at s3://{self.bucket}/{prefix}') from None
+            # One line per folder walked: where the run is, and how much of
+            # the folder fell inside the window. On a backfill this is the
+            # progress indicator; on a steady-state run, the last few lines
+            # show the lookback and lookahead folders being (mostly) empty.
+            logger.info('Listed s3://%s/%s: %s objects, %s in window', self.bucket, prefix, listed, matched)
 
     def _read(self, item):
         try:
@@ -314,18 +349,24 @@ class S3JsonSource(Source):
             walk_from = self._start
         if high < low:
             return
+        logger.info('Window (%s, %s] from %s; folders walked from %s', low.isoformat(),
+                    high.isoformat(), 'start_at' if inclusive else 'previous checkpoint',
+                    walk_from.isoformat())
+        objects = rows = 0
         batch = []
         byte_count = 0
         items = self._objects(walk_from, low, high, inclusive)
         for item, compressed in self._prefetched(items):
+            objects += 1
             for row in self._rows(item, compressed):
+                rows += 1
                 row_bytes = _row_bytes(row)
                 if row_bytes > _MAX_ROW_BYTES:
                     raise ExtractionError(
                         f'Row exceeds {_MAX_ROW_BYTES} UTF-8 bytes '
                         f'({row_bytes} bytes) at s3://{self.bucket}/{item["Key"]}'
                     )
-                if batch and (len(batch) >= self.fetch_size or byte_count + row_bytes > _BATCH_BYTES):
+                if batch and (len(batch) >= self.fetch_size or byte_count + row_bytes > self._document.batch_bytes):
                     yield pd.DataFrame(batch, columns=self._schema.names)
                     batch = []
                     byte_count = 0
@@ -333,6 +374,7 @@ class S3JsonSource(Source):
                 byte_count += row_bytes
         if batch:
             yield pd.DataFrame(batch, columns=self._schema.names)
+        logger.info('Window complete: %s objects, %s rows', objects, rows)
 
 
 def build_source(credentials, table_config, fetch_size):

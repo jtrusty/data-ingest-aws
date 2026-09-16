@@ -60,6 +60,9 @@ class TableResult:
     row_count: Optional[int] = None
     file_count: Optional[int] = None
     error: Optional[str] = None
+    # The bound this run committed, so run_job can ask the source whether a
+    # capped window left more behind. None unless status is SUCCESS.
+    checkpoint: Optional[object] = None
 
 
 def state_key_for(source_type, source_system, table_config):
@@ -179,7 +182,7 @@ def run_table(source, state_store, landing_writer, source_type, source_system, t
     # Step 2: capture the high-water checkpoint BEFORE extracting, so that
     # records written to the source *during* this run are simply left for
     # the next run rather than causing a partially-extracted window.
-    current_checkpoint = source.get_current_checkpoint()
+    current_checkpoint = source.get_current_checkpoint(previous_checkpoint)
 
     if current_checkpoint.value is None:
         # Source object is empty (e.g. MAX(watermark_column) returned NULL).
@@ -301,6 +304,7 @@ def run_table(source, state_store, landing_writer, source_type, source_system, t
         run_id=run_id,
         row_count=landing_run.row_count,
         file_count=landing_run.file_count,
+        checkpoint=current_checkpoint,
     )
 
 
@@ -440,14 +444,30 @@ def run_job(argv=None, expected_source_type=None):
             # sources/registry.py) -- this module never imports a specific
             # source adapter directly.
             source = build_source(config.source_type, credentials, table_config, fetch_size)
-            result = run_table(
-                source=source,
-                state_store=state_store,
-                landing_writer=landing_writer,
-                source_type=config.source_type,
-                source_system=config.source_name,
-                table_config=table_config,
-            )
+            # A source that caps how far one run may advance (a backfill, or
+            # a backlog after an outage) is run again immediately until it
+            # reports nothing further is available. Each iteration is a
+            # complete landing run -- its own run_id, manifest and checkpoint
+            # commit -- so a failure at iteration N loses only window N, and
+            # the next execution resumes from the last commit rather than
+            # from the beginning. Sources without a cap run exactly once.
+            windows = 0
+            while True:
+                result = run_table(
+                    source=source,
+                    state_store=state_store,
+                    landing_writer=landing_writer,
+                    source_type=config.source_type,
+                    source_system=config.source_name,
+                    table_config=table_config,
+                )
+                windows += 1
+                if result.status != "SUCCESS" or source.is_caught_up(result.checkpoint):
+                    break
+                logger.info("[%s] window %s committed at %s; more available, continuing",
+                            table_config.name, windows, result.checkpoint.value)
+            if windows > 1:
+                logger.info("[%s] caught up after %s windows", table_config.name, windows)
             results.append(result)
         except CheckpointConflictError as exc:
             # Another concurrent execution already advanced this table's

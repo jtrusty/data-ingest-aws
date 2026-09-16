@@ -28,9 +28,9 @@ ENVELOPE_FIELDS = {'group_id': 'groupid', 'business_date': 'businessdate',
                    'historical_data_type': 'historicaldatatype'}
 
 
-_DISCOVERY_KEYS = {'timezone', 'path_format', 'suffix', 'safety_delay_seconds', 'prefetch', 'lookahead_hours'}
+_DISCOVERY_KEYS = {'timezone', 'path_format', 'suffix', 'safety_delay_seconds', 'prefetch', 'lookahead_hours', 'max_window_hours'}
 _DOCUMENT_KEYS = {'compression', 'records', 'envelope', 'preset',
-                  'max_object_bytes', 'max_outer_bytes', 'max_payload_bytes'}
+                  'max_object_bytes', 'max_outer_bytes', 'max_payload_bytes', 'batch_bytes'}
 
 
 def config(**settings):
@@ -223,9 +223,10 @@ def test_an_empty_window_lists_nothing():
     client.get_paginator.assert_not_called()
 
 
-def test_batch_bytes_limit(monkeypatch):
-    source, _, _, _ = setup_source([packed(1), packed(2)])
-    monkeypatch.setattr('data_ingest.sources.s3_json._BATCH_BYTES', 1)
+def test_batch_bytes_limit():
+    # batch_bytes is config now, not a module constant: part size is a
+    # sizing decision that goes with the job's DPU.
+    source, _, _, _ = setup_source([packed(1), packed(2)], batch_bytes=1)
     assert [len(f) for f in source.extract(None, source.get_current_checkpoint())] == [1, 1]
 
 
@@ -447,3 +448,110 @@ def test_records_preset_serializes_each_record_once():
         frame = list(source.extract(None, source.get_current_checkpoint()))[0]
     assert list(frame['envelope_json']) == list(frame['payload_json']) == ['{"id":1}', '{"id":2}']
     assert spy.call_count == 0          # the decoder did it; the row did not repeat it
+
+
+# --- max_window_hours -------------------------------------------------------
+
+def test_first_run_is_capped_relative_to_start_at():
+    source, _, _, _ = setup_source(max_window_hours=6)
+    source._now = lambda: instant('2026-09-12T00:00:00')     # far past start_at 09:00
+    assert source.get_current_checkpoint(None).value == '2026-09-10 15:00:00.000000'
+
+
+def test_incremental_run_is_capped_relative_to_previous_high():
+    source, _, _, _ = setup_source(max_window_hours=6)
+    source._now = lambda: instant('2026-09-12T00:00:00')
+    high = source.get_current_checkpoint(checkpoint('2026-09-10 15:00:00.000000'))
+    assert high.value == '2026-09-10 21:00:00.000000'
+
+
+def test_cap_never_pushes_the_bound_past_now():
+    # Caught up: previous high is recent, so the ordinary bound wins and a
+    # caught-up feed does not notice the cap at all.
+    source, _, _, _ = setup_source(max_window_hours=6)
+    high = source.get_current_checkpoint(checkpoint('2026-09-10 09:15:00.000000'))
+    assert high.value == '2026-09-10 09:30:00.000000'
+
+
+def test_is_caught_up_reports_whether_the_cap_bounded_the_run():
+    source, _, _, _ = setup_source(max_window_hours=6)
+    source._now = lambda: instant('2026-09-12T00:00:00')
+    assert source.is_caught_up(checkpoint('2026-09-10 15:00:00.000000')) is False
+    assert source.is_caught_up(checkpoint('2026-09-11 23:58:00.000000')) is True
+    uncapped, _, _, _ = setup_source()
+    assert uncapped.is_caught_up(checkpoint('2026-09-10 09:30:00.000000')) is True
+
+
+def test_no_cap_by_default():
+    source, _, _, _ = setup_source()
+    source._now = lambda: instant('2026-09-12T00:00:00')
+    assert source.get_current_checkpoint(None).value == '2026-09-11 23:58:00.000000'
+
+
+@pytest.mark.parametrize('value', [0, -1, 24 * 367, 1.5, True])
+def test_max_window_hours_bounds(value):
+    from data_ingest.exceptions import ConfigurationError
+    with pytest.raises(ConfigurationError, match='max_window_hours'):
+        config(max_window_hours=value)
+
+
+def test_fetch_size_cap_is_5000_not_250():
+    assert S3JsonSource(config(), fetch_size=100_000, s3_client=Mock()).fetch_size == 5_000
+    assert S3JsonSource(config(), fetch_size=250, s3_client=Mock()).fetch_size == 250
+
+
+def _three_days_of_hourly_objects(client, obj):
+    objects = {}
+    for day in (1, 2, 3):
+        for hour in range(24):
+            folder = f'orders/2026/09/{day:02d}/{hour:02d}/'
+            objects[folder] = [dict(obj, Key=folder + 'a.json.gz',
+                                    LastModified=instant(f'2026-09-{day:02d}T{hour:02d}:30:00'))]
+    client.get_paginator.return_value.paginate.side_effect = (
+        lambda **kw: [{'Contents': objects.get(kw['Prefix'], [])}])
+    client.get_object.side_effect = lambda **kw: {
+        'Body': io.BytesIO(gzip.compress(json.dumps([packed()]).encode()))}
+
+
+def test_a_backfill_drains_in_committed_windows_through_the_real_pipeline():
+    """
+    The property the cap exists for. Three days of history, a one-day cap:
+    each run_table call fetches ONLY its window and commits exactly that
+    bound; the next resumes from it; nothing between windows is skipped and
+    nothing is fetched twice; once caught up, runs are ordinary.
+
+    Through run_table rather than the source alone, because the hazard is
+    specifically the pipeline committing get_current_checkpoint()'s value:
+    a cap applied only in extract() passes every source-level test and
+    still loses data here.
+    """
+    from unittest.mock import MagicMock
+    from data_ingest.pipeline import run_table
+
+    source, client, _, obj = setup_source(max_window_hours=24, start_at='2026-09-01T00:00:00Z')
+    _three_days_of_hourly_objects(client, obj)
+    source._now = lambda: instant('2026-09-04T12:00:00')
+
+    committed, highs, landed = {}, [], []
+    store = MagicMock()
+    store.get.side_effect = lambda key: committed.get('rec')
+    def commit(**kw):
+        rec = MagicMock(); rec.checkpoint = kw['checkpoint']; rec.version = len(highs) + 1
+        committed['rec'] = rec; highs.append(kw['checkpoint'].value)
+    store.commit.side_effect = commit
+    writer = MagicMock(); run = writer.start.return_value
+    run.write_batch.side_effect = lambda df, declared_schema=None: landed.extend(df['_s3_key'])
+    run.row_count = 0; run.file_count = 0; run.landing_uri = 's3://l/x'
+    table = MagicMock(); table.name = 'orders'; table.primary_key = ['_source_record_id']
+    table.database = 'b'; table.schema = 's3'; table.table = 'orders'
+
+    for _ in range(5):
+        run_table(source, store, writer, 's3_json', 'par_pos', table)
+
+    assert highs == [
+        '2026-09-02 00:00:00.000000', '2026-09-03 00:00:00.000000',
+        '2026-09-04 00:00:00.000000', '2026-09-04 11:58:00.000000',
+        '2026-09-04 11:58:00.000000',
+    ]
+    assert len(landed) == 72 and len(set(landed)) == 72
+    assert source.is_caught_up(committed['rec'].checkpoint) is True

@@ -10,8 +10,28 @@ class Source(ABC):
     """
 
     @abstractmethod
-    def get_current_checkpoint(self):
-        """Return a Checkpoint representing the current upper extraction bound."""
+    def get_current_checkpoint(self, previous_checkpoint=None):
+        """
+        Return a Checkpoint representing the current upper extraction bound.
+
+        `previous_checkpoint` is the last committed one (None on a first run).
+        Most sources ignore it -- the bound is whatever the source holds now.
+        A source that must bound how much ONE run may cover uses it to cap
+        the bound relative to where the last run stopped, since the pipeline
+        commits this value verbatim after the manifest: a source that fetched
+        less than it declared would silently skip the difference.
+        """
+
+    def is_caught_up(self, committed_checkpoint):
+        """
+        After a run commits `committed_checkpoint`, is there nothing more the
+        source could have offered right now? True for every source whose
+        bound is simply "now"; a source that caps its window answers False
+        while the cap is what limited the last run, and the pipeline then
+        runs the table again immediately rather than waiting for the next
+        scheduled execution.
+        """
+        return True
 
     @abstractmethod
     def extract(self, previous_checkpoint, current_checkpoint):

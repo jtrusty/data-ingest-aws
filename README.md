@@ -853,22 +853,49 @@ access. Provision output, checkpoints, catalog, and Bronze run tracking as
 described below.
 
 Listing is paginated; objects are fetched `discovery.prefetch` at a time and
-decoded sequentially, in listing order. DataFrames contain
-at most 250 records and target 16 MiB of string data; a larger allowed record
-is emitted alone. Defaults cap compressed objects at 32 MiB, decompressed
-outer documents at 128 MiB, and each inner payload at 16 MiB. A 30 MiB total
-string-data row guard leaves room for lineage below Athena's hard 32 MB
-row limit; it fails before committing unreadable data.
+decoded sequentially, in listing order. Each Parquet part holds at most
+`defaults.fetch_size` rows (capped at 5,000) or `document.batch_bytes` of
+decoded string data (64 MiB by default), whichever fills first; a single
+larger allowed record is emitted alone. Defaults cap compressed objects at
+32 MiB, decompressed outer documents at 128 MiB, and each inner payload at
+16 MiB. A 30 MiB total string-data row guard leaves room for lineage below
+Athena's hard 32 MB row limit; it fails before committing unreadable data.
 [Athena limits](https://docs.aws.amazon.com/athena/latest/ug/other-notable-limitations.html).
 
-The measured rate on the live bucket is roughly 1,100 files/hour, so a
-15-minute interval contains ~280 new files; the window is exclusive at the
-previous checkpoint, so nothing already landed is fetched again. Thousands of files/hour do not
-accumulate in memory, but achievable throughput depends on actual file size,
-record size, S3 latency, and compression. Measure a representative backlog in
-Glue before assuming a 15-minute completion time; local tests do not
-benchmark AWS throughput. Expected data freshness includes the schedule
-interval, cutoff delay, extraction, and Bronze runtime.
+**Part size is a Bronze cost, not a landing one.** Bronze merges a landing
+run with one `MERGE INTO` that must open every part in it. The first
+backfill on this adapter ran with 250-row / 16 MiB parts and was on course
+for several hundred thousand ~1 MiB files in one run -- the pathological
+small-files case for Athena. The defaults above produce ~20× fewer. They
+assume a 1 DPU job; on the 1/16 DPU size (1 GB) set `batch_bytes` back to
+`16777216`.
+
+### Backfills and backlogs: `max_window_hours`
+
+Without a cap, one run covers everything between the checkpoint and now. For
+a first run whose `start_at` is months back, that is a single landing run
+lasting hours with one commit at the very end -- and a failure at hour nine
+restarts it from zero, because nothing was committed. The same shape applies
+to a backlog after an outage.
+
+`discovery.max_window_hours` bounds how far **one landing run** may advance,
+in hours of *source* time. The job then runs window after window within the
+same execution until it is caught up, and each window is a complete landing
+run: its own `run_id`, its own manifest, its own checkpoint commit. A failure
+costs one window, and the next execution resumes from the last commit. Runs
+that are already caught up are unaffected -- the ordinary "now" bound wins.
+
+Every window is also one Bronze merge, so size it in days rather than hours:
+`24` turns a seven-month backfill into ~200 committed runs of a day each.
+`1` would produce thousands of merges. The example config sets 24.
+
+Measured on the first feed: roughly 150k rows/day in winter rising to ~550k
+in spring, decoding at ~1,100 rows/s on 1/16 DPU -- the path is CPU-bound
+(gunzip, exact-Decimal JSON parse, base64, gunzip, parse, re-serialize), so
+`prefetch` is already doing all it can and a larger DPU does not help a
+Python Shell job. Steady state is ~8 files per 15-minute run. Measure a
+representative backlog in Glue before assuming a completion time; local tests
+do not benchmark AWS throughput.
 
 ### Watch for
 

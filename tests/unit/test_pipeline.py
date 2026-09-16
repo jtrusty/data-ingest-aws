@@ -45,7 +45,7 @@ class FakeSource(Source):
         # tests can assert on the actual bounds rather than inferring them.
         self.extract_calls = []
 
-    def get_current_checkpoint(self):
+    def get_current_checkpoint(self, previous_checkpoint=None):
         return WatermarkCheckpoint(
             column="UPDATED_AT",
             value=self.high_value,
