@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.1](https://github.com/jtrusty/data-ingest-aws/compare/v1.3.0...v1.3.1) (2026-09-16)
+
+
+### Bug Fixes
+
+* **glue:** re-derive the runtime pins from the live image; pyarrow 10.0.1 is load-bearing ([17bfe08](https://github.com/jtrusty/data-ingest-aws/commit/17bfe086ead1339f5a6bda93ffeb650676e31d54))
+
 ## [1.3.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.2.0...v1.3.0) (2026-09-16)
 
 
