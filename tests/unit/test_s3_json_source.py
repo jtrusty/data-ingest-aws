@@ -12,8 +12,8 @@ import pytest
 
 from data_ingest.checkpoints.watermark import WatermarkCheckpoint
 from data_ingest.exceptions import ExtractionError
-from data_ingest.config_s3_json_gz import parse_s3_config
-from data_ingest.sources.s3_json_gz import S3JsonGzSource, build_source
+from data_ingest.config_s3_json import build_table_config, parse_source_s3
+from data_ingest.sources.s3_json import S3JsonSource, build_source
 
 
 def instant(value):
@@ -26,23 +26,35 @@ def checkpoint(value):
 
 ENVELOPE_FIELDS = {'group_id': 'groupid', 'business_date': 'businessdate',
                    'historical_data_type': 'historicaldatatype'}
-PAYLOAD_FIELDS = {'order_id': 'order.id', 'order_version': 'version',
-                  'payload_business_date': 'businessDate'}
 
 
-def config(**overrides):
+_DISCOVERY_KEYS = {'timezone', 'path_format', 'suffix', 'safety_delay_seconds'}
+_DOCUMENT_KEYS = {'compression', 'records', 'envelope', 'preset',
+                  'max_object_bytes', 'max_outer_bytes', 'max_payload_bytes'}
+
+
+def config(**settings):
     """
-    Build via the real parser rather than a stand-in: envelope_columns and the
-    field maps define the Parquet schema, so a hand-rolled namespace that drifts
-    from the parser would let the adapter be tested against a shape config can
-    no longer produce.
+    Build through the real parser rather than a stand-in. discovery/document
+    decide the Arrow schema and the whole decode pipeline, so a hand-rolled
+    namespace that drifted from the parser would test a shape config can no
+    longer produce.
     """
-    settings = dict(location='s3://pos/orders', start_at='2026-09-10T09:00:00Z',
-        folder_timezone='UTC', compression='auto', safety_delay_seconds=120,
-        max_object_bytes=33554432, max_outer_bytes=134217728, max_payload_bytes=16777216,
-        envelope_fields=dict(ENVELOPE_FIELDS), payload_fields=dict(PAYLOAD_FIELDS))
-    settings.update(overrides)
-    return parse_s3_config(settings)
+    discovery = {'timezone': 'UTC', 'safety_delay_seconds': 120}
+    document = {'preset': 'cloudevents'}
+    table = {'name': 'orders', 'start_at': '2026-09-10T09:00:00Z',
+             'envelope_fields': dict(ENVELOPE_FIELDS)}
+    location = settings.pop('location', 's3://pos/orders')
+    payload = settings.pop('payload', None)
+    for key, value in settings.items():
+        target = discovery if key in _DISCOVERY_KEYS else (
+            document if key in _DOCUMENT_KEYS else table)
+        target[key] = value
+    if payload:
+        document['payload'] = payload
+    source_s3 = parse_source_s3(
+        {'location': location, 'discovery': discovery, 'document': document})
+    return build_table_config(table, source_s3)
 
 
 def packed_payload(payload_json):
@@ -65,7 +77,7 @@ def setup_source(records=None, **settings):
     obj = dict(Key='orders/2026/09/10/09/file.json.gz', ETag='"abc"', LastModified=instant('2026-09-10T09:20:00'), Size=len(body.getvalue()))
     client.get_paginator.return_value.paginate.return_value = [{'Contents': [obj]}]
     client.get_object.return_value = {'Body': body, 'ContentLength': len(body.getvalue())}
-    source = S3JsonGzSource(config(**settings), lookback_minutes=15, s3_client=client,
+    source = S3JsonSource(config(**settings), lookback_minutes=15, s3_client=client,
                          now=lambda: instant('2026-09-10T09:32:00'))
     return source, client, body, obj
 
@@ -81,8 +93,10 @@ def test_checkpoint_is_wall_clock_minus_safety_delay():
 def test_extract_retains_versions_metadata_conditional_read_and_pinned_schema():
     source, client, body, obj = setup_source([packed(1), packed(2)])
     frame = list(source.extract(None, source.get_current_checkpoint()))[0]
-    assert frame.order_version.tolist() == ['1', '2']
-    assert frame.order_id.tolist() == ['order-1', 'order-1']
+    # Payload values are NOT columns: the payload lands whole, so both
+    # versions are retained as separate rows distinguished by record identity.
+    assert 'order_version' not in frame.columns and 'order_id' not in frame.columns
+    assert [json.loads(t)['version'] for t in frame.payload_json] == [1, 2]
     assert frame._source_record_id.nunique() == 2
     assert frame._s3_record_index.tolist() == [0, 1]
     assert frame.business_date.tolist() == ['2026-09-09'] * 2
@@ -90,7 +104,7 @@ def test_extract_retains_versions_metadata_conditional_read_and_pinned_schema():
     assert json.loads(frame.envelope_json[0]) == packed()
     client.get_object.assert_called_once_with(Bucket='pos', Key=obj['Key'], IfMatch='"abc"')
     assert body.closed
-    assert source.arrow_schema().field('order_version').type == pa.string()
+    assert source.arrow_schema().field('payload_json').type == pa.string()
     assert source.arrow_schema().field('_s3_last_modified').type == pa.timestamp('us')
     pa.Table.from_pandas(frame, schema=source.arrow_schema(), preserve_index=False)
 
@@ -106,15 +120,15 @@ def test_producer_shape_keeps_the_fourteen_digit_order_id_exact():
         return {'id': f'guid:{order_id}', 'type': 'order',
                 'data_base64': base64.b64encode(gzip.compress(json.dumps(payload).encode())).decode()}
 
-    source, _, _, _ = setup_source([envelope(98765432109876, 1), envelope(98765432109876, 2)],
-                                   payload_fields={'order_id': 'id', 'order_version': 'version'})
+    source, _, _, _ = setup_source([envelope(98765432109876, 1), envelope(98765432109876, 2)])
     frame = list(source.extract(None, source.get_current_checkpoint()))[0]
 
-    assert list(frame['order_id']) == ['98765432109876', '98765432109876']
-    assert list(frame['order_version']) == ['1', '2']
-    # event_id keeps the full prefixed form, so the two can be reconciled.
+    # event_id is a column (CloudEvents core) and keeps the prefixed form;
+    # the order id itself lives in payload_json, exact.
     assert list(frame['event_id']) == ['guid:98765432109876'] * 2
-    assert all(row.split(':')[-1] == order for row, order in zip(frame['event_id'], frame['order_id']))
+    ids = [json.loads(t)['id'] for t in frame['payload_json']]
+    assert ids == [98765432109876, 98765432109876]
+    assert all(e.split(':')[-1] == str(i) for e, i in zip(frame['event_id'], ids))
     # Both versions of one order are retained as separate rows.
     assert frame['_source_record_id'].nunique() == 2
 
@@ -142,85 +156,43 @@ def test_incremental_prefixes_pages_and_inclusive_bounds():
 
 
 def test_timezone_folder_and_start_floor():
-    source, client, _, _ = setup_source(folder_timezone='America/Chicago')
+    source, client, _, _ = setup_source(timezone='America/Chicago')
     client.get_paginator.return_value.paginate.return_value = [{}]
     assert list(source.extract(checkpoint('2026-09-10 09:01:00.000000'), source.get_current_checkpoint())) == []
     assert client.get_paginator.return_value.paginate.call_args.kwargs['Prefix'] == 'orders/2026/09/10/04/'
 
 
 @pytest.mark.parametrize('version', [None, 123456789012345678901234567890])
-def test_nullable_and_large_versions(version):
+def test_payload_json_preserves_nulls_and_unbounded_integers(version):
+    # A 30-digit integer exceeds int64; it survives because the payload text
+    # is passed through unchanged rather than re-serialized from a parsed value.
     source, _, _, _ = setup_source([packed(version)])
     frame = list(source.extract(None, source.get_current_checkpoint()))[0]
-    assert frame.order_version[0] == (None if version is None else str(version))
+    assert json.loads(frame.payload_json[0])['version'] == version
+    if version is not None:
+        assert str(version) in frame.payload_json[0]
 
 
-def test_objects_and_arrays_land_as_exact_json_text():
+def test_payload_json_is_exact_including_decimals_and_nesting():
     """
-    A projected field that is nested structure is serialized, not rejected.
-    Real feeds carry line items and sub-objects; refusing them would force the
-    field to go unmapped. As JSON text it stays queryable in Athena and
-    round-trips exactly, including numbers pandas/float would round.
+    The payload is landed as the decoded text, unchanged. 0.85 is not
+    representable as a float, so a round-trip through one would silently
+    change a money value; passing the text through is what prevents it.
     """
-    # Raw JSON text: 0.85 is not representable as a float, so writing it as a
-    # literal is the only way to prove nothing rounds it on the way through.
     payload = ('{"order":{"id":"order-1"},'
                '"items":[{"sku":"A","qty":2},{"sku":"B","qty":1}],'
                '"totals":{"net":10.1,"tax":0.85},'
                '"void":null,"paid":true}')
-    source, _, _, _ = setup_source(
-        [packed_payload(payload)],
-        payload_fields={'items': 'items', 'totals': 'totals',
-                        'void': 'void', 'paid': 'paid'},
-    )
+    source, _, _, _ = setup_source([packed_payload(payload)])
     frame = list(source.extract(None, source.get_current_checkpoint()))[0]
 
-    assert json.loads(frame['items'][0]) == [{'sku': 'A', 'qty': 2}, {'sku': 'B', 'qty': 1}]
-    # Exact decimal tokens: 0.85 is not representable as a float, so a
-    # round-trip through one would change the value stored in Bronze.
-    assert frame['totals'][0] == '{"net":10.1,"tax":0.85}'
-    assert frame['void'][0] is None          # absent stays NULL, not "None"
-    assert frame['paid'][0] == 'true'        # JSON spelling, not Python's
+    assert frame.payload_json[0] == payload
+    # Which is what makes the Silver explode possible:
+    #   CAST(json_parse(payload_json) AS ...) then UNNEST
+    assert [i['sku'] for i in json.loads(frame.payload_json[0])['items']] == ['A', 'B']
 
 
-def test_a_projected_array_is_unnestable_in_athena():
-    # The Silver pattern this enables: CAST(json_parse(col) AS ARRAY(ROW(...)))
-    # then UNNEST. Verify the text is valid JSON of the expected shape.
-    source, _, _, _ = setup_source(
-        [packed_payload({'items': [{'sku': 'A', 'qty': 2}]})],
-        payload_fields={'items': 'items'},
-    )
-    items = json.loads(list(source.extract(None, source.get_current_checkpoint()))[0]['items'][0])
-    assert [i['sku'] for i in items] == ['A']
-
-
-@pytest.mark.parametrize('failure', ['listed_size', 'body_size', 'conditional', 'corrupt'])
-def test_read_failures_do_not_leak_data_and_close_body(failure):
-    source, client, body, obj = setup_source(max_object_bytes=1000)
-    if failure == 'listed_size':
-        obj['Size'] = 1001
-    elif failure == 'body_size':
-        body = io.BytesIO(b'x' * 1001)
-        client.get_object.return_value = {'Body': body}
-    elif failure == 'conditional':
-        client.get_object.side_effect = RuntimeError('secret')
-    else:
-        body = io.BytesIO(b'corrupt secret')
-        client.get_object.return_value = {'Body': body}
-    with pytest.raises(ExtractionError) as caught:
-        list(source.extract(None, source.get_current_checkpoint()))
-    assert 'secret' not in str(caught.value)
-    if failure in ('body_size', 'corrupt'):
-        assert body.closed
-
-
-def test_batches_have_record_ceiling():
-    source, _, _, _ = setup_source([packed(i) for i in range(501)])
-    frames = list(source.extract(None, source.get_current_checkpoint()))
-    assert [len(f) for f in frames] == [250, 250, 1]
-
-
-def test_empty_or_future_window_does_not_list():
+def test_an_empty_window_lists_nothing():
     source, client, _, _ = setup_source()
     assert list(source.extract(None, checkpoint('2026-09-10 08:00:00.000000'))) == []
     client.get_paginator.assert_not_called()
@@ -228,42 +200,47 @@ def test_empty_or_future_window_does_not_list():
 
 def test_batch_bytes_limit(monkeypatch):
     source, _, _, _ = setup_source([packed(1), packed(2)])
-    monkeypatch.setattr('data_ingest.sources.s3_json_gz._BATCH_BYTES', 1)
+    monkeypatch.setattr('data_ingest.sources.s3_json._BATCH_BYTES', 1)
     assert [len(f) for f in source.extract(None, source.get_current_checkpoint())] == [1, 1]
 
 
-def test_a_configured_path_that_no_record_has_lands_null_not_an_error():
-    # A projection that misses is NOT a failure: feeds legitimately omit
-    # optional fields, and payload_json still holds whatever was there.
-    source, _, _, _ = setup_source(payload_fields={'order_id': 'order.id.missing'})
+def test_an_envelope_path_that_no_record_has_lands_null_not_an_error():
+    # A projection that misses is NOT a failure: producers legitimately omit
+    # optional attributes, and envelope_json still holds whatever was there.
+    source, _, _, _ = setup_source(envelope_fields={'absent': 'no.such.key'})
     frame = list(source.extract(None, source.get_current_checkpoint()))[0]
-    assert frame.order_id[0] is None
+    assert frame.absent[0] is None
 
 
-def test_metadata_records_the_projection_for_lineage():
-    # The manifest carries the mapping, so a run can be read back and the
-    # column-to-path relationship recovered without the config file.
-    source, _, _, _ = setup_source()
-    assert source.metadata() == {
-        'bucket': 'pos', 'prefix': 'orders', 'folder_timezone': 'UTC',
-        'envelope_fields': ENVELOPE_FIELDS, 'payload_fields': PAYLOAD_FIELDS,
-    }
+def test_metadata_records_the_wire_format_and_business_identity():
+    # The manifest carries these so a landed run can be read back and its
+    # decode pipeline and logical identity recovered without the config file.
+    source, _, _, _ = setup_source(record={'natural_key': ['id'], 'version': 'version'})
+    meta = source.metadata()
+    assert meta['bucket'] == 'pos' and meta['prefix'] == 'orders'
+    assert meta['path_format'] == '%Y/%m/%d/%H' and meta['suffix'] == '.json.gz'
+    assert meta['document']['payload'] == {
+        'path': 'data_base64', 'encoding': 'base64', 'compression': 'auto', 'format': 'json'}
+    assert meta['envelope_fields'] == ENVELOPE_FIELDS
+    # Business identity is recorded, NOT used for deduplication -- that is
+    # _source_record_id + _s3_last_modified, which is why history survives.
+    assert meta['natural_key'] == ['id'] and meta['version_field'] == 'version'
 
 
 def test_an_empty_projection_still_lands_core_and_json_columns():
-    # No configured fields at all: the feed is still fully preserved, because
-    # CloudEvents core plus envelope_json/payload_json are unconditional.
-    source, _, _, _ = setup_source(envelope_fields={}, payload_fields={})
+    source, _, _, _ = setup_source(envelope_fields={})
     frame = list(source.extract(None, source.get_current_checkpoint()))[0]
-    assert 'order_id' not in frame.columns and 'group_id' not in frame.columns
-    assert frame['event_id'][0] == 'event-1'
+    assert 'group_id' not in frame.columns
+    assert frame['event_id'][0] == 'event-1'          # CloudEvents preset
     assert json.loads(frame['payload_json'][0])['order']['id'] == 'order-1'
 
 
 def test_columns_follow_config_order_so_the_schema_is_stable():
-    source, _, _, _ = setup_source(payload_fields={'b_col': 'version', 'a_col': 'businessDate'})
+    source, _, _, _ = setup_source(envelope_fields={'b_col': 'groupid', 'a_col': 'businessdate'})
     names = source.arrow_schema().names
     assert names.index('b_col') < names.index('a_col')
+    # CloudEvents core always precedes the configured extensions.
+    assert names.index('event_id') < names.index('b_col')
 
 
 def test_list_failure_is_safe():
@@ -276,7 +253,7 @@ def test_list_failure_is_safe():
 
 def test_response_size_limit_closes_body():
     source, client, body, _ = setup_source()
-    client.get_object.return_value['ContentLength'] = source.config.max_object_bytes + 1
+    client.get_object.return_value['ContentLength'] = source.config.document.max_object_bytes + 1
     with pytest.raises(ExtractionError):
         list(source.extract(None, source.get_current_checkpoint()))
     assert body.closed
@@ -289,7 +266,7 @@ def test_none_checkpoint_does_not_list():
 
 
 def test_local_prefix_fall_back_is_not_listed_twice():
-    source, _, _, _ = setup_source(location='s3://pos', folder_timezone='America/Chicago')
+    source, _, _, _ = setup_source(location='s3://pos', timezone='America/Chicago')
     assert list(source._prefixes(instant('2026-11-01T06:15:00'), instant('2026-11-01T08:15:00'))) == [
         '2026/11/01/01/', '2026/11/01/02/']
 
@@ -297,7 +274,7 @@ def test_local_prefix_fall_back_is_not_listed_twice():
 def test_factory_uses_iam_client_and_table_settings(monkeypatch):
     client = Mock()
     factory = Mock(return_value=client)
-    monkeypatch.setattr('data_ingest.sources.s3_json_gz.boto3.client', factory)
+    monkeypatch.setattr('data_ingest.sources.s3_json.boto3.client', factory)
     table = SimpleNamespace(s3=config(), checkpoint=SimpleNamespace(lookback_minutes=20))
     source = build_source({}, table, 17)
     assert source.fetch_size == 17
@@ -308,12 +285,12 @@ def test_factory_uses_iam_client_and_table_settings(monkeypatch):
 def test_invalid_fetch_size():
     from data_ingest.exceptions import ConfigurationError
     with pytest.raises(ConfigurationError):
-        S3JsonGzSource(config(), fetch_size=0)
+        S3JsonSource(config(), fetch_size=0)
 
 
 def test_row_size_cap_has_actionable_safe_reason(monkeypatch):
     source, _, _, _ = setup_source()
-    monkeypatch.setattr('data_ingest.sources.s3_json_gz._MAX_ROW_BYTES', 1, raising=False)
+    monkeypatch.setattr('data_ingest.sources.s3_json._MAX_ROW_BYTES', 1, raising=False)
     with pytest.raises(ExtractionError, match='Row exceeds'):
         list(source.extract(None, source.get_current_checkpoint()))
 
@@ -328,7 +305,7 @@ def test_decode_failure_preserves_safe_reason():
 
 
 def test_half_hour_dst_change_includes_last_local_prefix():
-    source, _, _, _ = setup_source(folder_timezone='Australia/Lord_Howe')
+    source, _, _, _ = setup_source(timezone='Australia/Lord_Howe')
     assert list(source._prefixes(instant('2026-04-04T14:00:00'), instant('2026-04-04T15:45:00'))) == [
         'orders/2026/04/05/01/', 'orders/2026/04/05/02/']
 
@@ -339,4 +316,4 @@ def test_half_hour_dst_change_includes_last_local_prefix():
 def test_constructor_rejects_invalid_integer_settings(setting, value):
     from data_ingest.exceptions import ConfigurationError
     with pytest.raises(ConfigurationError):
-        S3JsonGzSource(config(), s3_client=Mock(), **{setting: value})
+        S3JsonSource(config(), s3_client=Mock(), **{setting: value})

@@ -15,7 +15,7 @@ from typing import List, Optional
 import yaml
 
 from data_ingest.checkpoints import _TYPE_REGISTRY
-from data_ingest.config_s3_json_gz import S3JsonGzConfig, parse_s3_config
+from data_ingest.config_s3_json import S3JsonConfig, build_table_config, parse_source_s3
 from data_ingest.exceptions import ConfigurationError
 
 
@@ -52,7 +52,7 @@ class TableConfig:
 
     primary_key: List[str]
     checkpoint: CheckpointConfig
-    s3: Optional[S3JsonGzConfig] = None
+    s3: Optional[S3JsonConfig] = None
 
     @property
     def source_object(self):
@@ -527,23 +527,27 @@ def _parse_bronze(data):
     )
 
 
-def _parse_s3_table(data, default_location=None):
+def _parse_s3_table(data, source_s3):
     if not isinstance(data.get("name"), str) or not data["name"]:
-        raise ConfigurationError("s3_json_gz tables require a nonempty name")
-    # location lives on `source` like database/schema do: one bucket and
-    # prefix root per source, stated once. A table may still override it,
-    # which is what lets one source carry feeds under sibling prefixes.
-    settings = parse_s3_config(data.get("s3"), default_location=default_location)
+        raise ConfigurationError("s3_json tables require a nonempty name")
+    settings = build_table_config(data, source_s3)
     checkpoint = _parse_checkpoint({**data, "checkpoint": data.get("checkpoint", {
         "type": "watermark", "column": "_s3_last_modified", "lookback_minutes": 15,
     })})
+    # primary_key and the checkpoint are the PHYSICAL replay identity, not the
+    # business one -- record.natural_key carries that. Pinning them is what
+    # lets Bronze retain every published version of a record; letting a config
+    # dedupe on the business key instead would silently discard history.
     primary_key = data.get("primary_key", ["_source_record_id"])
     if primary_key != ["_source_record_id"]:
-        raise ConfigurationError("s3_json_gz primary_key must be [_source_record_id] for replay safety")
+        raise ConfigurationError(
+            "s3_json primary_key must be [_source_record_id] for replay safety; "
+            "declare the business identity under record.natural_key instead"
+        )
     if checkpoint.type != "watermark" or checkpoint.column != "_s3_last_modified":
-        raise ConfigurationError("s3_json_gz checkpoint must watermark _s3_last_modified")
+        raise ConfigurationError("s3_json checkpoint must watermark _s3_last_modified")
     if checkpoint.lookback_minutes < 1:
-        raise ConfigurationError("s3_json_gz requires positive lookback_minutes for boundary arrivals")
+        raise ConfigurationError("s3_json requires positive lookback_minutes for boundary arrivals")
     bucket, prefix = split_s3_uri(settings.location)
     return TableConfig(
         name=data["name"], database=bucket, schema="s3", table=prefix or data["name"],
@@ -552,9 +556,9 @@ def _parse_s3_table(data, default_location=None):
 
 
 def _parse_table(data, default_database=None, default_schema=None, source_type=None,
-                 default_location=None):
-    if source_type == "s3_json_gz":
-        return _parse_s3_table(data, default_location)
+                 source_s3=None):
+    if source_type == "s3_json":
+        return _parse_s3_table(data, source_s3)
     # database and schema fall back to the source-level defaults, so a config
     # whose tables all live in one schema states it once instead of per table.
     # `name` deliberately has no such shortcut and is never derived from
@@ -598,9 +602,9 @@ def parse_config(raw_text):
 
     source = data["source"]
     connection = data.get("connection") or {}
-    if source.get("type") == "s3_json_gz":
+    if source.get("type") == "s3_json":
         if connection.get("secret_id"):
-            raise ConfigurationError("s3_json_gz uses the Glue IAM role; omit connection.secret_id")
+            raise ConfigurationError("s3_json uses the Glue IAM role; omit connection.secret_id")
     elif not connection.get("secret_id"):
         raise ConfigurationError("Configuration must define connection.secret_id")
 
@@ -614,7 +618,8 @@ def parse_config(raw_text):
     )
     _collect_unknown_keys(
         "source", source,
-        ({"name", "type", "location"} if source.get("type") == "s3_json_gz"
+        ({"name", "type", "location", "discovery", "document"}
+         if source.get("type") == "s3_json"
          else {"name", "type", "database", "schema"}),
         problems,
     )
@@ -637,7 +642,8 @@ def parse_config(raw_text):
         label = f"tables[{table_entry.get('name', '?')}]"
         _collect_unknown_keys(
             label, table_entry,
-            ({"name", "s3", "primary_key", "checkpoint"} if source.get("type") == "s3_json_gz"
+            ({"name", "location", "start_at", "envelope_fields", "record",
+              "primary_key", "checkpoint"} if source.get("type") == "s3_json"
              else {"name", "database", "schema", "table", "primary_key", "checkpoint"}),
             problems,
         )
@@ -647,9 +653,13 @@ def parse_config(raw_text):
         )
     _raise_if_problems(problems)
 
+    # Parsed once: discovery and document describe the feed's wire format,
+    # which every table under this source shares.
+    source_s3 = parse_source_s3(source) if source.get("type") == "s3_json" else None
+
     tables = [
         _parse_table(t, source.get("database"), source.get("schema"), source.get("type"),
-                     source.get("location"))
+                     source_s3)
         for t in data.get("tables", [])
     ]
     if not tables:

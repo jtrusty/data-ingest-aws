@@ -1,10 +1,14 @@
-"""Bounded extraction of immutable, hourly partitioned gzipped-JSON S3 events.
+"""Bounded extraction of immutable, time-partitioned JSON documents in S3.
 
-Reads CloudEvents-shaped records whose payload is a compressed, base64-encoded
-JSON document. Which fields beyond the CloudEvents core become columns is
-configuration (`envelope_fields` / `payload_fields`), so the adapter carries no
-vocabulary from any one producer; `envelope_json` and `payload_json` retain
-everything the projection does not select.
+The wire format is declared, not assumed: prefix layout and file suffix come
+from `discovery`, and how a file is opened, framed, and where its payload
+lives come from `document`. So the adapter carries no vocabulary from any one
+producer -- CloudEvents is one preset among others, not a built-in assumption.
+
+Envelope attributes become columns via `envelope_fields`. The payload is
+landed whole as `payload_json` and the outer record as `envelope_json`, so
+promoting payload fields to their own columns stays a Silver decision that
+never requires re-landing.
 
 Folder hours must correspond to object upload time. The configured lookback
 replays recent files; bronze deduplicates source-record identities, retaining
@@ -25,7 +29,7 @@ from data_ingest.checkpoints.watermark import WatermarkCheckpoint
 from data_ingest.config import split_s3_uri
 from data_ingest.exceptions import ConfigurationError, ExtractionError
 from data_ingest.sources.base import Source
-from data_ingest.sources.json_gz_decode import decode_records, dumps_json
+from data_ingest.sources.json_decode import decode_records, dumps_json
 
 _WATERMARK = '_s3_last_modified'
 _BATCH_BYTES = 16 * 1024 * 1024
@@ -33,6 +37,12 @@ _MAX_ROW_BYTES = 30 * 1024 * 1024
 # Landed for every feed: S3 provenance, then the two JSON columns that keep
 # the record whole whatever the configured projection happens to select.
 _LINEAGE_COLUMNS = ('_source_record_id', '_s3_bucket', '_s3_key', '_s3_etag')
+# The payload is landed whole, as one column. Promoting individual payload
+# fields to columns is deliberately a Silver concern: the landing writer pins
+# one Parquet schema per run from its first batch, so a key that first appears
+# midway through a run would not fit it, the run would be flagged schema_drift,
+# and Bronze refuses a drifted run outright. Keeping payload_json complete
+# means that decision can be revisited without ever re-landing.
 _JSON_COLUMNS = ('envelope_json', 'payload_json')
 
 
@@ -79,7 +89,7 @@ def _at_path(payload, path):
     return current
 
 
-class S3JsonGzSource(Source):
+class S3JsonSource(Source):
     """S3-backed Source using IAM credentials and wall-clock checkpoints."""
 
     def __init__(self, s3_config, lookback_minutes=15, fetch_size=10_000,
@@ -96,14 +106,14 @@ class S3JsonGzSource(Source):
         self._folder_timezone = ZoneInfo(s3_config.folder_timezone)
         self._start = _utc(s3_config.start_at)
         self._envelope_columns = tuple(s3_config.envelope_columns)
-        self._payload_columns = tuple(s3_config.payload_fields.items())
-        # Built per table rather than as a module constant: which projected
-        # columns exist is now configuration. Order is fixed by the config so
-        # the Parquet schema is stable from run to run.
+        self._document = s3_config.document
+        self._discovery = s3_config.discovery
+        # Built per table rather than as a module constant: which envelope
+        # columns exist is configuration. Order is fixed by the config so the
+        # Parquet schema is stable from run to run.
         names = (
             *_LINEAGE_COLUMNS,
             *(column for column, _ in self._envelope_columns),
-            *(column for column, _ in self._payload_columns),
             *_JSON_COLUMNS,
         )
         self._schema = pa.schema(
@@ -112,10 +122,24 @@ class S3JsonGzSource(Source):
         )
 
     def metadata(self):
-        return {'bucket': self.bucket, 'prefix': self.prefix,
-                'folder_timezone': self.config.folder_timezone,
-                'envelope_fields': dict(self.config.envelope_fields),
-                'payload_fields': dict(self.config.payload_fields)}
+        # Recorded in the manifest so a landed run can be read back and its
+        # wire format and business identity recovered without the config file.
+        payload = self._document.payload
+        return {
+            'bucket': self.bucket, 'prefix': self.prefix,
+            'folder_timezone': self._discovery.timezone,
+            'path_format': self._discovery.path_format,
+            'suffix': self._discovery.suffix,
+            'document': {'compression': self._document.compression,
+                         'records': self._document.records,
+                         'envelope': self._document.envelope,
+                         'payload': {'path': payload.path, 'encoding': payload.encoding,
+                                     'compression': payload.compression,
+                                     'format': payload.format}},
+            'envelope_fields': dict(self.config.envelope_fields),
+            'natural_key': list(self.config.record.natural_key),
+            'version_field': self.config.record.version,
+        }
 
     def arrow_schema(self):
         return self._schema
@@ -127,6 +151,11 @@ class S3JsonGzSource(Source):
             lookback_minutes=self.lookback_minutes, value_type='TIMESTAMP',
         )
 
+    def _path(self, moment):
+        """The configured prefix for one instant, in the folder timezone."""
+        rendered = moment.astimezone(self._folder_timezone).strftime(self._discovery.path_format)
+        return rendered if rendered.endswith('/') else rendered + '/'
+
     def _prefixes(self, low, high):
         # Round in local time, then step on the UTC timeline. This handles
         # fractional UTC offsets and skips nonexistent daylight-saving hours.
@@ -134,7 +163,7 @@ class S3JsonGzSource(Source):
         cursor = hour.astimezone(timezone.utc)
         previous = None
         while cursor <= high:
-            suffix = cursor.astimezone(self._folder_timezone).strftime('%Y/%m/%d/%H/')
+            suffix = self._path(cursor)
             prefix = f'{self.prefix}/{suffix}' if self.prefix else suffix
             # Fall-back repeats a local hour; list its prefix only once.
             if prefix != previous:
@@ -143,7 +172,7 @@ class S3JsonGzSource(Source):
             cursor += timedelta(hours=1)
         # A fractional-hour DST shift can leave the final local hour between
         # UTC steps (for example Lord Howe's thirty-minute fall-back).
-        suffix = high.astimezone(self._folder_timezone).strftime('%Y/%m/%d/%H/')
+        suffix = self._path(high)
         endpoint = f'{self.prefix}/{suffix}' if self.prefix else suffix
         if endpoint != previous:
             yield endpoint
@@ -154,13 +183,14 @@ class S3JsonGzSource(Source):
             try:
                 for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
                     for item in page.get('Contents', []):
-                        if item['Key'].endswith('.json.gz') and low <= _utc(item['LastModified']) <= high:
+                        if item['Key'].endswith(self._discovery.suffix) \
+                                and low <= _utc(item['LastModified']) <= high:
                             yield item
             except Exception:
                 raise ExtractionError(f'Failed to list objects at s3://{self.bucket}/{prefix}') from None
 
     def _read(self, item):
-        limit = self.config.max_object_bytes
+        limit = self._document.max_object_bytes
         if item.get('Size', 0) > limit:
             raise ExtractionError('S3 object exceeds max_object_bytes')
         response = self._client.get_object(Bucket=self.bucket, Key=item['Key'], IfMatch=item['ETag'])
@@ -185,17 +215,13 @@ class S3JsonGzSource(Source):
             _WATERMARK: _utc(item['LastModified']).replace(tzinfo=None),
             **{column: _value(_at_path(envelope, path), path)
                for column, path in self._envelope_columns},
-            **{column: _value(_at_path(payload, path), path)
-               for column, path in self._payload_columns},
             'envelope_json': dumps_json(envelope), 'payload_json': payload_json,
         }
 
     def _rows(self, item):
         try:
             compressed = self._read(item)
-            records = decode_records(compressed, max_outer_bytes=self.config.max_outer_bytes,
-                                     max_payload_bytes=self.config.max_payload_bytes,
-                                     compression=self.config.compression)
+            records = decode_records(compressed, document=self._document)
             for ordinal, (envelope, payload, payload_json) in enumerate(records):
                 yield self._row(item, ordinal, envelope, payload, payload_json)
         except ExtractionError as exc:
@@ -238,5 +264,5 @@ class S3JsonGzSource(Source):
 
 def build_source(credentials, table_config, fetch_size):
     """Registry factory: boto3 obtains credentials from the Glue IAM role."""
-    return S3JsonGzSource(table_config.s3, lookback_minutes=table_config.checkpoint.lookback_minutes,
+    return S3JsonSource(table_config.s3, lookback_minutes=table_config.checkpoint.lookback_minutes,
                        fetch_size=fetch_size)

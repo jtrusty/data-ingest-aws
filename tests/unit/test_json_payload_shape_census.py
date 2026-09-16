@@ -16,8 +16,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-SCRIPT = Path(__file__).parents[2] / "scripts" / "json_gz_payload_shape_census.py"
-spec = importlib.util.spec_from_file_location("json_gz_payload_shape_census", SCRIPT)
+SCRIPT = Path(__file__).parents[2] / "scripts" / "json_payload_shape_census.py"
+spec = importlib.util.spec_from_file_location("json_payload_shape_census", SCRIPT)
 census = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(census)
 
@@ -88,14 +88,14 @@ def _envelope(payload, oid="12345678901234"):
 def test_a_feed_the_adapter_handles_is_reported_as_such(capsys):
     out = _run([_envelope({"id": 12345678901234, "version": 1})], capsys)
     assert "adapter as written handles this feed: YES" in out
-    assert "s3.payload_fields.order_id: id" in out
+    assert "record.natural_key: [id]" in out
 
 
 def test_nested_order_is_reported_as_the_path_to_configure(capsys):
-    # The dangerous shape: a payload_fields order_id of 'id' would land NULL here and silver
-    # would drop the row, with nothing failing anywhere.
+    # Nested identity: natural_key must name the real path, or Silver's
+    # dedup partitions on nothing.
     out = _run([_envelope({"order": {"id": 12345678901234, "version": 1}})], capsys)
-    assert "s3.payload_fields.order_id: order.id" in out
+    assert "record.natural_key: [order.id]" in out
     assert "{'order': ...}" in out
 
 
@@ -141,44 +141,31 @@ def test_glue_injected_arguments_are_ignored(capsys):
     assert "adapter as written handles this feed" in out
 
 
-def test_emit_config_camel_cases_down_and_flags_partial_keys(capsys):
-    out = _run([_envelope({"businessDate": "2026-09-10", "lineItems": [{"sku": "A"}]}),
-                _envelope({"businessDate": "2026-09-10"})],
+def test_emit_config_matches_the_par_wire_format(capsys):
+    out = _run([_envelope({"id": 1, "version": 2})], capsys, argv_extra=("--emit-config",))
+    assert "preset: cloudevents" in out
+    assert "path: data_base64" in out and "encoding: base64" in out
+    assert "natural_key: [id]" in out and "version: version" in out
+
+
+def test_emit_config_detects_an_inline_data_payload(capsys):
+    # CloudEvents allows `data` as the alternative to `data_base64`; the
+    # generated block has to name the one the feed actually uses.
+    out = _run([{"id": "guid:1", "data": {"id": 1}}], capsys, argv_extra=("--emit-config",))
+    assert "preset: cloudevents_plain" in out
+    assert "path: data" in out and "encoding: none" in out
+
+
+def test_emit_config_warns_when_the_carrier_is_not_uniform(capsys):
+    # One config picks one carrier, so a feed that mixes them cannot be
+    # described by any single document: block -- say so rather than pick.
+    out = _run([_envelope({"id": 1}), {"id": "guid:2", "data": {"id": 2}}],
                capsys, argv_extra=("--emit-config",))
-    assert "business_date: businessDate" in out
-    # Present on only half the records: called out, because a key that comes
-    # and goes is exactly the one worth a second look before it is mapped.
-    assert "line_items: lineItems" in out and "on 50.0% of records" in out
+    assert "WARNING: payload carrier varies" in out
 
 
-def test_emit_config_can_drop_rare_keys(capsys):
-    out = _run([_envelope({"always": 1, "rare": 2}), _envelope({"always": 1})],
-               capsys, argv_extra=("--emit-config", "--min-presence", "0.9"))
-    assert "always: always" in out
-    assert "rare: rare" not in out
-    assert "1 key(s) below --min-presence omitted" in out
-
-
-def test_emit_config_sanitizes_column_names_for_athena(capsys):
-    # Athena lowercases identifiers and Iceberg then matches case-sensitively,
-    # so the generated block must never propose a name config would reject.
-    out = _run([_envelope({"Weird-Key.Name": 1})], capsys, argv_extra=("--emit-config",))
-    assert "weird_key_name: Weird-Key.Name" in out
-
-
-@pytest.mark.parametrize("key", [
-    "businessDate", "lineItems", "Weird-Key.Name", "UPPER", "with spaces",
-    "123numeric", "trailing__", "orderID",
-])
-def test_generated_column_names_are_accepted_by_the_config_layer(key):
-    """
-    The generated block exists to be pasted unedited, so every name it
-    proposes must survive the same validation a hand-written one does.
-    """
-    from data_ingest.config_s3_json_gz import parse_s3_config
-
-    settings = parse_s3_config({
-        "location": "s3://b/p", "start_at": "2026-09-01T00:00:00Z",
-        "payload_fields": {census.to_column(key): key},
-    })
-    assert list(settings.payload_fields) == [census.to_column(key)]
+def test_emit_config_warns_on_mixed_payload_compression(capsys):
+    plain = {"id": "guid:2",
+             "data_base64": base64.b64encode(json.dumps({"id": 2}).encode()).decode()}
+    out = _run([_envelope({"id": 1}), plain], capsys, argv_extra=("--emit-config",))
+    assert "WARNING: payloads are not uniformly compressed" in out

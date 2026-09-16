@@ -12,10 +12,9 @@ variations are actually present, so the adapter can be relaxed exactly as far
 as the data requires and no further.
 
 The last section is the important one: it reports where `id` and `version`
-really live, which is what `s3.payload_fields` must be set to. Getting that
-wrong does not fail -- it lands NULL and silver silently drops the row.
+really live, which is what `record.natural_key` should name.
 
-    python scripts/json_gz_payload_shape_census.py --uri s3://pos-events/orders --sample 50
+    python scripts/json_payload_shape_census.py --uri s3://pos-events/orders --sample 50
 
 Needs s3:ListBucket and s3:GetObject. Downloads --sample objects, writes
 nothing, and prints no payload values -- only key names, types and counts.
@@ -113,36 +112,63 @@ def to_column(key):
     return column if column[:1].isalpha() or column[:1] == "_" else f"f_{column}"
 
 
-def emit_config(payload_keys, records, min_presence):
+def emit_config(envelope_field, codec, decoded_type, wrapper, id_found, version_found, records):
     """
-    Print a payload_fields: block covering the keys actually observed.
+    Print the document: and record: blocks this feed implies.
 
-    Generated rather than inferred at runtime on purpose. The landing writer
-    pins one Parquet schema per run from the first batch, so a key that first
-    appears midway through a run would not fit it -- the run gets flagged
-    schema_drift, and Bronze refuses to load a drifted run at all. An explicit
-    block keeps the schema stable, keeps the diff reviewable, and lets Bronze's
-    additive evolution add columns deliberately when you extend it later.
-
-    Nested values are still projected: they land as exact JSON text, queryable
-    with json_extract_scalar or CAST(json_parse(...) AS ARRAY(ROW(...))).
+    The payload itself is landed whole as payload_json, so there is no column
+    projection to generate. What config actually has to match is the WIRE
+    FORMAT -- where the payload lives, how it is encoded and compressed, how
+    records are framed -- and that is exactly what the sample just measured.
     """
-    print("\n--- generated payload_fields (paste under the table's s3:) ---")
-    print("      payload_fields:")
-    skipped = 0
-    for key, seen in sorted(payload_keys.items()):
-        presence = seen / max(records, 1)
-        if presence < min_presence:
-            skipped += 1
-            continue
-        column = to_column(key)
-        note = "" if presence > 0.999 else f"   # on {100 * presence:.1f}% of records"
-        print(f"        {column}: {key}{note}")
-    if skipped:
-        print(f"      # {skipped} key(s) below --min-presence omitted; "
-              f"they remain in payload_json")
-    print("      # Review before use: column names are derived from the source keys,")
-    print("      # and they are IDENTITY once Bronze has created the table.")
+    def top(counter):
+        return counter.most_common(1)[0][0] if counter else None
+
+    carrier, codec_seen, framing = top(envelope_field), top(codec), top(decoded_type)
+    inline = carrier == "data (inline dict)"
+    path = "data" if inline else "data_base64"
+    encoding = "none" if inline else "base64"
+    compression = {"gzip": "gzip", "zlib": "zlib", "NONE (plain json)": "none"}.get(
+        codec_seen, "none" if inline else "auto")
+
+    preset = ("cloudevents_plain" if inline and compression == "none"
+              else "cloudevents" if not inline and compression in ("gzip", "zlib", "auto")
+              else None)
+
+    print("\n--- generated config (paste under source:) ---")
+    print("  document:")
+    if preset:
+        print(f"    preset: {preset}")
+    print("    compression: gzip          # the OUTER file")
+    print("    records: auto")
+    print("    payload:")
+    print(f"      path: {path}")
+    print(f"      encoding: {encoding}")
+    print(f"      compression: {compression}")
+    print("      format: json")
+    if len(codec) > 1:
+        print(f"    # WARNING: payloads are not uniformly compressed {dict(codec)} --")
+        print("    # 'auto' covers gzip and zlib, but not a mix that includes plain JSON.")
+    if len(envelope_field) > 1:
+        print(f"    # WARNING: payload carrier varies {dict(envelope_field)} -- CloudEvents")
+        print("    # allows either data or data_base64, but one config picks one.")
+    if framing and framing != "dict":
+        print(f"    # WARNING: decoded payload is {framing}, not an object; the adapter")
+        print("    # requires a JSON object per record.")
+
+    print("\n  # under the table:")
+    print("    record:")
+    if id_found:
+        best, seen = id_found.most_common(1)[0]
+        note = "" if seen >= records else f"   # on {100 * seen / max(records, 1):.1f}% of records"
+        print(f"      natural_key: [{best}]{note}")
+    else:
+        print("      # no identity found at any probed path; inspect payload keys above")
+    if version_found:
+        print(f"      version: {version_found.most_common(1)[0][0]}")
+    print("      # Declarative: recorded as lineage for Silver, not used to")
+    print("      # deduplicate. Bronze dedupes on _source_record_id so it keeps")
+    print("      # every published version.")
 
 
 def main():
@@ -152,9 +178,7 @@ def main():
     ap.add_argument("--hours-back", type=int, default=6, help="spread the sample over the last N hours (default 6)")
     ap.add_argument("--show-keys", type=int, default=30, help="top-level payload keys to list (default 30)")
     ap.add_argument("--emit-config", action="store_true",
-                    help="print a payload_fields: block covering every key seen, ready to paste")
-    ap.add_argument("--min-presence", type=float, default=0.0,
-                    help="with --emit-config, skip keys present on fewer than this fraction of records")
+                    help="print the document:/record: blocks this feed implies, ready to paste")
     args, _unknown = ap.parse_known_args()
 
     bucket, prefix = parse_uri(args.uri)
@@ -260,12 +284,13 @@ def main():
     show("version found at:", version_found, records)
 
     if args.emit_config:
-        emit_config(payload_keys, records, args.min_presence)
+        emit_config(envelope_field, codec, decoded_type, wrapper,
+                    id_found, version_found, records)
 
     print("\n--- what this means for the config ---")
     if id_found:
         best = id_found.most_common(1)[0]
-        print(f"  s3.payload_fields.order_id: {best[0]}"
+        print(f"  record.natural_key: [{best[0]}]"
               f"   (present on {100 * best[1] / max(records, 1):.1f}% of records)")
         if len(id_found) > 1:
             print(f"  WARNING: id appears at more than one path {sorted(id_found)} -- "

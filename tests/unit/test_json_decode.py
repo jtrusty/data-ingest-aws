@@ -7,7 +7,24 @@ from decimal import Decimal
 import pytest
 
 from data_ingest.exceptions import ExtractionError
-from data_ingest.sources.json_gz_decode import decode_records, dumps_json
+from data_ingest.config_s3_json import parse_document
+from data_ingest.sources.json_decode import decode_records, dumps_json
+
+
+def document(max_outer_bytes=100_000, max_payload_bytes=1_000, **overrides):
+    """The CloudEvents wire format, which is what most of these tests use."""
+    payload = {"path": "data_base64", "encoding": "base64",
+               "compression": overrides.pop("compression", "auto"), "format": "json"}
+    payload.update(overrides.pop("payload", {}))
+    return parse_document({
+        "compression": overrides.pop("document_compression", "gzip"),
+        "records": overrides.pop("records", "auto"),
+        "envelope": "cloudevents",
+        "payload": payload,
+        "max_outer_bytes": max_outer_bytes,
+        "max_payload_bytes": max_payload_bytes,
+        **overrides,
+    })
 
 
 def envelope(payload=b'{"version": 2}', compressor=gzip.compress):
@@ -15,8 +32,7 @@ def envelope(payload=b'{"version": 2}', compressor=gzip.compress):
 
 
 def decode(raw, **kwargs):
-    return list(decode_records(gzip.compress(raw), max_outer_bytes=100_000,
-                               max_payload_bytes=1_000, **kwargs))
+    return list(decode_records(gzip.compress(raw), document=document(**kwargs)))
 
 
 @pytest.mark.parametrize("framing", ["object", "array", "jsonl"])
@@ -77,18 +93,20 @@ def test_explicit_compression(compression):
 
 def test_decompression_limits_and_exact_boundary():
     raw = json.dumps(envelope()).encode()
-    assert list(decode_records(gzip.compress(raw), max_outer_bytes=len(raw), max_payload_bytes=14))
+    assert list(decode_records(gzip.compress(raw),
+                               document=document(max_outer_bytes=len(raw), max_payload_bytes=14)))
     for outer_limit, inner_limit in [(len(raw) - 1, 14), (len(raw), 13)]:
         with pytest.raises(ExtractionError, match="limit"):
-            list(decode_records(gzip.compress(raw), max_outer_bytes=outer_limit,
-                                max_payload_bytes=inner_limit))
+            list(decode_records(gzip.compress(raw), document=document(
+                max_outer_bytes=outer_limit, max_payload_bytes=inner_limit)))
 
 
 @pytest.mark.parametrize("change", [lambda b: b[:-1], lambda b: b + b'junk',
                                     lambda b: b + gzip.compress(b'{}')])
 def test_rejects_truncated_or_trailing_outer_stream(change):
     with pytest.raises(ExtractionError):
-        list(decode_records(change(gzip.compress(b'[]')), max_outer_bytes=100, max_payload_bytes=100))
+        list(decode_records(change(gzip.compress(b'[]')),
+                            document=document(max_outer_bytes=100, max_payload_bytes=100)))
 
 
 @pytest.mark.parametrize("compressor", [gzip.compress, zlib.compress])
@@ -102,8 +120,10 @@ def test_rejects_truncated_or_trailing_inner_stream(compressor, change):
 @pytest.mark.parametrize("outer,inner,compression", [(0, 1, "auto"), (1, -1, "auto"),
                                                        (1, 1, "raw"), (True, 1, "auto")])
 def test_rejects_invalid_configuration(outer, inner, compression):
-    with pytest.raises(ValueError):
-        list(decode_records(b'', max_outer_bytes=outer, max_payload_bytes=inner, compression=compression))
+    # Limits and stage names are validated where config is parsed now, not on
+    # every decode call, so the whole run fails before any object is read.
+    with pytest.raises(Exception):
+        document(max_outer_bytes=outer, max_payload_bytes=inner, compression=compression)
 
 
 def test_invalid_unicode_is_safe():
@@ -132,7 +152,7 @@ def test_line_wrapped_base64_is_accepted(encoder):
     outer = gzip.compress(json.dumps(envelope).encode())
 
     (_env, decoded, text), = decode_records(
-        outer, max_outer_bytes=1 << 20, max_payload_bytes=1 << 20
+        outer, document=document(max_outer_bytes=1 << 20, max_payload_bytes=1 << 20)
     )
     assert decoded["id"] == 12345678901234
     assert text == payload.decode()
@@ -143,5 +163,6 @@ def test_corrupt_base64_still_raises_rather_than_decoding_short():
     # payload; validate=True must still reject it after whitespace stripping.
     envelope = {"data_base64": "!!!" + base64.b64encode(gzip.compress(b"{}")).decode()}
     outer = gzip.compress(json.dumps(envelope).encode())
-    with pytest.raises(ExtractionError, match="Invalid data_base64 encoding"):
-        list(decode_records(outer, max_outer_bytes=1 << 20, max_payload_bytes=1 << 20))
+    with pytest.raises(ExtractionError, match="Invalid base64 at data_base64"):
+        list(decode_records(outer, document=document(
+            max_outer_bytes=1 << 20, max_payload_bytes=1 << 20)))

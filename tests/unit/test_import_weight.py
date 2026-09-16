@@ -50,9 +50,9 @@ def test_bronze_entry_point_via_the_package_stays_light():
     assert _loaded_heavy_modules("from data_ingest import run_bronze_job") == []
 
 
-def test_bronze_stays_light_while_parsing_a_s3_json_gz_config():
+def test_bronze_stays_light_while_parsing_a_s3_json_config():
     """
-    Bronze parses whatever config it is handed, and the s3_json_gz branch pulls in
+    Bronze parses whatever config it is handed, and the s3_json branch pulls in
     config_s3 -> zoneinfo. That must not drag the data stack in behind it, or
     the 0.0625 DPU sizing stops being viable for POS sources specifically.
     """
@@ -60,7 +60,7 @@ def test_bronze_stays_light_while_parsing_a_s3_json_gz_config():
         """
         from data_ingest.bronze.job import run_bronze_job
         from data_ingest.config import parse_config
-        parse_config(open('config/s3_json_gz.example.yaml').read())
+        parse_config(open('config/s3_json.example.yaml').read())
         """
     ) == []
 

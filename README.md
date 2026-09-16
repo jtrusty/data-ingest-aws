@@ -51,8 +51,8 @@ src/data_ingest/
     base.py         Source interface (get_current_checkpoint / extract / metadata)
     registry.py     source.type -> adapter module; add a source with one line here
     snowflake.py    Snowflake adapter (fetchmany batching; lossless watermark codecs)
-    s3_json_gz.py       hourly S3 POS events, modification-time checkpoint + overlap
-    json_gz_decode.py   bounded gzip/base64 decoding with exact JSON preservation
+    s3_json.py       hourly S3 POS events, modification-time checkpoint + overlap
+    json_decode.py   bounded gzip/base64 decoding with exact JSON preservation
   checkpoints/
     base.py         Checkpoint interface
     watermark.py    single-column watermark checkpoint (+ optional lookback_minutes)
@@ -74,9 +74,9 @@ jobs/                      thin Glue entry points, named <layer>_load[_<source>]
   bronze_load.py             landing -> bronze. No source suffix: landing is
                              the normalization boundary, so one script serves
                              every source.
-  landing_load_s3_json_gz.py     hourly S3 POS JSON -> landing, using the job IAM role
+  landing_load_s3_json.py     hourly S3 POS JSON -> landing, using the job IAM role
 config/snowflake.example.yaml  example config; real ones are gitignored
-config/s3_json_gz.example.yaml     POS source template, including bootstrap date
+config/s3_json.example.yaml     POS source template, including bootstrap date
 constraints-glue.txt       frozen dependency set matching the Glue runtime
 tests/unit/                pytest suite (moto-mocked AWS)
 tests/conftest.py          pins AWS region/credentials so tests don't inherit
@@ -415,12 +415,12 @@ names) and are uploaded to S3, where the job reads them via `--config-uri`.
 Adding table #13 is a YAML change only — no Python, no new DynamoDB setup
 (the first run for a new table creates its own state record).
 
-## Gzipped JSON events in S3  (`s3_json_gz`)
+## Gzipped JSON events in S3  (`s3_json`)
 
 Same two jobs as any other source; only the extraction end changes:
 
 ```
-S3 POS bucket  --jobs/landing_load_s3_json_gz.py-->  Landing  --jobs/bronze_load.py-->  Bronze
+S3 POS bucket  --jobs/landing_load_s3_json.py-->  Landing  --jobs/bronze_load.py-->  Bronze
   (the source)                                  (Parquet + _manifest.json)
 ```
 
@@ -439,7 +439,7 @@ differs is a projection, declared per table:
 ```yaml
 source:
   name: par_pos
-  type: s3_json_gz
+  type: s3_json
   location: s3://pos-events/orders   # inherited by every table below
 
 tables:
@@ -491,7 +491,7 @@ where a wrong cast is fixed with a query rather than by re-landing.
 **Generate the projection rather than writing it by hand:**
 
 ```bash
-python scripts/json_gz_payload_shape_census.py --uri s3://<bucket>/<prefix> \
+python scripts/json_payload_shape_census.py --uri s3://<bucket>/<prefix> \
     --sample 50 --emit-config
 ```
 
@@ -520,31 +520,31 @@ only to new rows -- Bronze never revisits what it already inserted.
 
 ### Invoking it
 
-Nothing to write: `jobs/landing_load_s3_json_gz.py` already is the entry
+Nothing to write: `jobs/landing_load_s3_json.py` already is the entry
 point, and it is three lines.
 
 ```python
 from data_ingest import run_job
-from data_ingest.sources.s3_json_gz import S3JsonGzSource  # noqa: F401 -- fail fast
+from data_ingest.sources.s3_json import S3JsonSource  # noqa: F401 -- fail fast
 
-run_job(expected_source_type="s3_json_gz")
+run_job(expected_source_type="s3_json")
 ```
 
 `expected_source_type` is a **registered adapter type, not a file
 extension** -- `"json.gz"` or `"csv"` are not valid values. The string
-`s3_json_gz` has to agree in exactly three places, and the job asserts it at
+`s3_json` has to agree in exactly three places, and the job asserts it at
 startup so a config pointed at the wrong script fails immediately instead of
 quietly matching zero tables:
 
 | Where | What |
 |---|---|
-| `sources/registry.py` | `"s3_json_gz": "data_ingest.sources.s3_json_gz"` |
-| the config's `source.type` | `type: s3_json_gz` |
-| the job script | `run_job(expected_source_type="s3_json_gz")` |
+| `sources/registry.py` | `"s3_json": "data_ingest.sources.s3_json"` |
+| the config's `source.type` | `type: s3_json` |
+| the job script | `run_job(expected_source_type="s3_json")` |
 
 It also fixes identity: `source_key` is `<source.name>_<source.type>`, so
-`name: par_pos` here lands under `landing/par_pos_s3_json_gz/…` and
-keys DynamoDB on `par_pos_s3_json_gz`. Changing the type after a run has
+`name: par_pos` here lands under `landing/par_pos_s3_json/…` and
+keys DynamoDB on `par_pos_s3_json`. Changing the type after a run has
 committed re-partitions landing and orphans the checkpoint -- see
 [Identity](#identity).
 
@@ -554,8 +554,8 @@ is a *different adapter* -- one new module plus one line in the registry (see
 [Adding a future source adapter](#adding-a-future-source-adapter)) -- not a
 format flag on this one. This adapter always requires the POS envelope.
 
-Use [config/s3_json_gz.example.yaml](config/s3_json_gz.example.yaml) with
-`jobs/landing_load_s3_json_gz.py`, then pass **that same file** to
+Use [config/s3_json.example.yaml](config/s3_json.example.yaml) with
+`jobs/landing_load_s3_json.py`, then pass **that same file** to
 `jobs/bronze_load.py` -- this source's own config, not the Snowflake one.
 Each source gets its own config file and its own pair of Glue job
 definitions; the sharing is only between one source's two jobs. No Snowflake
@@ -726,7 +726,7 @@ downstream.
 
 Infrastructure stays outside this repository. Configure the extraction job
 as Glue Python Shell 3.9, analytics library set, 1 DPU, using the wheel and
-`jobs/landing_load_s3_json_gz.py`. Supply `--config-uri` and install
+`jobs/landing_load_s3_json.py`. Supply `--config-uri` and install
 `--additional-python-modules pyarrow==10.0.1,PyYAML==6.0.2,tzdata` (or
 equivalent approved wheels in S3). The Snowflake connector is not needed for
 this job. Add a **second Bronze job definition** for this source rather
@@ -1453,7 +1453,7 @@ The `[pandas]` extra is **load-bearing**: Glue's analytics library-set does
 not ship pyarrow, and that extra is what supplies it (pinned by the
 connector to `>=10.0.1,<10.1.0`). Dropping `[pandas]` breaks Parquet writing.
 
-For the S3 POS source, `jobs/landing_load_s3_json_gz.py`, same shape without the
+For the S3 POS source, `jobs/landing_load_s3_json.py`, same shape without the
 connector — pyarrow has to be named directly, since nothing else supplies it:
 
 ```
@@ -1463,7 +1463,7 @@ MaxConcurrentRuns      1
 --library-set          analytics
 --additional-python-modules  pyarrow==10.0.1,PyYAML==6.0.2,tzdata
 --extra-py-files       s3://<artifact-bucket>/python/data_ingest/<version>/data_ingest-<version>-py3-none-any.whl
---config-uri           s3://<bucket>/ingestion-config/<source>_s3_json_gz.yaml
+--config-uri           s3://<bucket>/ingestion-config/<source>_s3_json.yaml
 ```
 
 **Bronze job** — `jobs/bronze_load.py`, **one script, but one job definition
@@ -1508,10 +1508,10 @@ file, because the `bronze:` section lives beside the `landing:` section.
 
 | | Snowflake source | POS source |
 |---|---|---|
-| Config | `olo_snowflake.yaml` | `par_pos_s3_json_gz.yaml` |
-| Landing job | `landing_load_snowflake.py`, 1 DPU | `landing_load_s3_json_gz.py`, 1 DPU |
+| Config | `olo_snowflake.yaml` | `par_pos_s3_json.yaml` |
+| Landing job | `landing_load_snowflake.py`, 1 DPU | `landing_load_s3_json.py`, 1 DPU |
 | Bronze job | `bronze_load.py`, 0.0625 DPU | `bronze_load.py`, 0.0625 DPU |
-| `source_key` | `olo_snowflake` | `par_pos_s3_json_gz` |
+| `source_key` | `olo_snowflake` | `par_pos_s3_json` |
 
 Four Glue job definitions, two scripts for landing, one script for Bronze,
 one wheel, two config files.

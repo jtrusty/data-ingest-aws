@@ -21,7 +21,7 @@ from data_ingest.bronze.state import NullProcessedRunStore
 from data_ingest.config import parse_config
 from data_ingest.exceptions import ExtractionError, ManifestCommitError
 from data_ingest.pipeline import run_job, run_table, state_key_for
-from data_ingest.sources.s3_json_gz import S3JsonGzSource
+from data_ingest.sources.s3_json import S3JsonSource
 from data_ingest.state import DynamoDBStateStore
 
 # Import after landing initializes pandas, matching the runtime import order.
@@ -48,16 +48,20 @@ def env():
         )
         now = datetime.now(timezone.utc)
         config_text = yaml.safe_dump({
-            "source": {"name": "par_pos", "type": "s3_json_gz"},
+            "source": {
+                "name": "par_pos", "type": "s3_json",
+                "location": f"s3://{RAW_BUCKET}/orders",
+                "document": {"preset": "cloudevents"},
+            },
             "landing": {"location": f"s3://{LANDING_BUCKET}/landing",
                         "checkpoint_table": STATE_TABLE},
-            "tables": [{"name": "orders", "s3": {
-                "location": f"s3://{RAW_BUCKET}/orders",
+            "tables": [{
+                "name": "orders",
                 "start_at": (now - timedelta(hours=1)).isoformat(),
-                "payload_fields": {"order_id": "order.id", "order_version": "version"},
-                    "envelope_fields": {"business_date": "businessdate"},
-            }}],
-        })
+                "envelope_fields": {"business_date": "businessdate"},
+                "record": {"natural_key": ["order.id"], "version": "version"},
+            }],
+        }, sort_keys=False)
         yield {
             "s3": s3, "store": DynamoDBStateStore(table),
             "writer": LandingWriter(s3, LANDING_BUCKET, "landing"),
@@ -88,17 +92,17 @@ def put_orders(env, versions=(1, 2), filename="0001.json.gz"):
 
 def source(env, now, fetch_size=1):
     table = env["config"].tables[0]
-    return S3JsonGzSource(table.s3, lookback_minutes=table.checkpoint.lookback_minutes,
+    return S3JsonSource(table.s3, lookback_minutes=table.checkpoint.lookback_minutes,
                        fetch_size=fetch_size, s3_client=env["s3"], now=lambda: now)
 
 
 def run(env, now):
     return run_table(source(env, now), env["store"], env["writer"],
-                     "s3_json_gz", "par_pos", env["config"].tables[0])
+                     "s3_json", "par_pos", env["config"].tables[0])
 
 
 def state(env):
-    key = state_key_for("s3_json_gz", "par_pos", env["config"].tables[0])
+    key = state_key_for("s3_json", "par_pos", env["config"].tables[0])
     return env["store"].get(key)
 
 
@@ -130,15 +134,17 @@ def test_versions_and_complete_payload_survive_parquet_and_replay(env):
     assert first.status == "SUCCESS"
     assert first.row_count == 2 and first.file_count == 2
     assert [row["payload_json"] for row in landed] == payloads
-    assert [row["order_version"] for row in landed] == ["1", "2"]
-    assert {row["order_id"] for row in landed} == {"order-42"}
+    # Payload values are not columns: both versions of one order survive as
+    # separate rows, and the values are read back out of payload_json.
+    assert [json.loads(row["payload_json"])["version"] for row in landed] == [1, 2]
+    assert {json.loads(row["payload_json"])["order"]["id"] for row in landed} == {"order-42"}
     assert len({row["_source_record_id"] for row in landed}) == 2
     for ordinal, row in enumerate(landed):
         assert row["_s3_key"] == key and row["_s3_bucket"] == RAW_BUCKET
         assert row["_s3_record_index"] == ordinal
         assert row["_s3_last_modified"] == modified.replace(tzinfo=None)
         assert row["_ingest_run_id"] == first.run_id
-        assert row["_source_system"] == "par_pos_s3_json_gz"
+        assert row["_source_system"] == "par_pos_s3_json"
         envelope = json.loads(row["envelope_json"])
         assert gzip.decompress(base64.b64decode(envelope["data_base64"])).decode() == payloads[ordinal]
         assert json.loads(row["payload_json"], parse_float=Decimal)["amount"] == Decimal(
@@ -212,10 +218,10 @@ def test_run_job_uses_iam_source_without_secrets_manager(env, tmp_path):
     _, _, modified = put_orders(env)
     path = tmp_path / "pos.yaml"
     path.write_text(env["yaml"])
-    with patch("data_ingest.sources.s3_json_gz.datetime", wraps=datetime) as clock, \
+    with patch("data_ingest.sources.s3_json.datetime", wraps=datetime) as clock, \
          patch("data_ingest.pipeline.get_secret", side_effect=AssertionError("unexpected secret")) as secret:
         clock.now.return_value = modified + timedelta(seconds=121)
-        result = run_job(["--config-uri", str(path)], expected_source_type="s3_json_gz")[0]
+        result = run_job(["--config-uri", str(path)], expected_source_type="s3_json")[0]
     secret.assert_not_called()
     assert result.status == "SUCCESS" and result.row_count == 2
     assert state(env).version == 1
@@ -244,7 +250,7 @@ def test_real_bronze_loader_uses_source_identity_in_recorded_sql(env):
             catalog.add_client_error("get_table", service_error_code="EntityNotFoundException")
         result = load_table_runs(
             athena=athena, s3_client=env["s3"], processed_runs=NullProcessedRunStore(),
-            bucket=LANDING_BUCKET, landing_prefix="landing", source_key="par_pos_s3_json_gz",
+            bucket=LANDING_BUCKET, landing_prefix="landing", source_key="par_pos_s3_json",
             table_config=env["config"].tables[0], bronze_location=f"s3://{LANDING_BUCKET}/bronze",
             partition_by=("month({checkpoint_column})",), glue_client=glue, database="bronze_test",
         )
