@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.3.2...v1.4.0) (2026-09-16)
+
+
+### Features
+
+* **s3_json:** windowed backfills, larger Parquet parts, per-folder progress ([43a766c](https://github.com/jtrusty/data-ingest-aws/commit/43a766c915ea2b2a6243c1ebcc493667fad597b0))
+
 ## [1.3.2](https://github.com/jtrusty/data-ingest-aws/compare/v1.3.1...v1.3.2) (2026-09-16)
 
 
