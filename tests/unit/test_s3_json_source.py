@@ -28,7 +28,7 @@ ENVELOPE_FIELDS = {'group_id': 'groupid', 'business_date': 'businessdate',
                    'historical_data_type': 'historicaldatatype'}
 
 
-_DISCOVERY_KEYS = {'timezone', 'path_format', 'suffix', 'safety_delay_seconds'}
+_DISCOVERY_KEYS = {'timezone', 'path_format', 'suffix', 'safety_delay_seconds', 'prefetch', 'lookahead_hours'}
 _DOCUMENT_KEYS = {'compression', 'records', 'envelope', 'preset',
                   'max_object_bytes', 'max_outer_bytes', 'max_payload_bytes'}
 
@@ -75,7 +75,11 @@ def setup_source(records=None, **settings):
     client = Mock()
     body = io.BytesIO(gzip.compress(json.dumps(records or [packed()]).encode()))
     obj = dict(Key='orders/2026/09/10/09/file.json.gz', ETag='"abc"', LastModified=instant('2026-09-10T09:20:00'), Size=len(body.getvalue()))
-    client.get_paginator.return_value.paginate.return_value = [{'Contents': [obj]}]
+    # Respect Prefix the way S3 does: a key lives under exactly one prefix.
+    # Returning the page for every prefix would hand the same object out once
+    # per folder walked, which S3 never does.
+    client.get_paginator.return_value.paginate.side_effect = (
+        lambda **kw: [{'Contents': [obj]}] if obj['Key'].startswith(kw['Prefix']) else [{}])
     client.get_object.return_value = {'Body': body, 'ContentLength': len(body.getvalue())}
     source = S3JsonSource(config(**settings), lookback_minutes=15, s3_client=client,
                          now=lambda: instant('2026-09-10T09:32:00'))
@@ -142,24 +146,46 @@ def test_stable_identity_on_replay_and_distinct_object():
     assert first != list(c.extract(None, c.get_current_checkpoint()))[0]._source_record_id[0]
 
 
-def test_incremental_prefixes_pages_and_inclusive_bounds():
+def test_incremental_window_is_exclusive_at_previous_high_inclusive_at_high():
+    """
+    Objects at or before the previous high were inside the previous run's
+    window and, with S3's list-after-put consistency, were listed then.
+    Fetching them again only produces rows Bronze deduplicates away. The
+    folder walk still reaches back by the lookback so a late arrival into a
+    closed hour is listed -- but such an arrival has LastModified AFTER the
+    previous high by definition, so it passes the window on its own merits.
+    """
     source, client, _, obj = setup_source()
-    objects = [dict(obj, Key='orders/2026/09/10/09/' + str(i) + '.json.gz', LastModified=instant(t))
-               for i, t in enumerate(['2026-09-10T09:14:59', '2026-09-10T09:15:00', '2026-09-10T10:00:00', '2026-09-10T10:00:01'])]
-    client.get_paginator.return_value.paginate.side_effect = [
-        [{'Contents': objects[:2]}, {'Contents': [dict(obj, Key='ignored.txt')]}], [{'Contents': objects[2:]}]]
+    at = lambda t, key: dict(obj, Key=key, LastModified=instant(t))
+    objects = {
+        'orders/2026/09/10/09/': [at('2026-09-10T09:29:59', 'orders/2026/09/10/09/a.json.gz'),  # before prev high
+                                  at('2026-09-10T09:30:00', 'orders/2026/09/10/09/b.json.gz'),  # == prev high: landed last run
+                                  at('2026-09-10T09:45:00', 'orders/2026/09/10/09/c.json.gz'),  # late into a closed hour
+                                  dict(obj, Key='orders/2026/09/10/09/ignored.txt')],
+        'orders/2026/09/10/10/': [at('2026-09-10T10:00:00', 'orders/2026/09/10/10/d.json.gz'),  # == high: inclusive
+                                  at('2026-09-10T10:00:01', 'orders/2026/09/10/10/e.json.gz')], # after high
+    }
+    client.get_paginator.return_value.paginate.side_effect = (
+        lambda **kw: [{'Contents': objects.get(kw['Prefix'], [])}])
     client.get_object.side_effect = lambda **kw: {'Body': io.BytesIO(gzip.compress(json.dumps(packed()).encode()))}
     frames = list(source.extract(checkpoint('2026-09-10 09:30:00.000000'), checkpoint('2026-09-10 10:00:00.000000')))
-    assert sum(len(f) for f in frames) == 2
+    landed = [k for f in frames for k in f['_s3_key']]
+    assert landed == ['orders/2026/09/10/09/c.json.gz', 'orders/2026/09/10/10/d.json.gz']
+    # Walk: floor(09:30 - 15m) = 09, through high = 10, plus one hour of lookahead.
     assert [c.kwargs['Prefix'] for c in client.get_paginator.return_value.paginate.call_args_list] == [
-        'orders/2026/09/10/09/', 'orders/2026/09/10/10/']
+        'orders/2026/09/10/09/', 'orders/2026/09/10/10/', 'orders/2026/09/10/11/']
 
 
 def test_timezone_folder_and_start_floor():
     source, client, _, _ = setup_source(timezone='America/Chicago')
+    client.get_paginator.return_value.paginate.side_effect = None
     client.get_paginator.return_value.paginate.return_value = [{}]
     assert list(source.extract(checkpoint('2026-09-10 09:01:00.000000'), source.get_current_checkpoint())) == []
-    assert client.get_paginator.return_value.paginate.call_args.kwargs['Prefix'] == 'orders/2026/09/10/04/'
+    prefixes = [c.kwargs['Prefix'] for c in client.get_paginator.return_value.paginate.call_args_list]
+    # 09:01 UTC minus the 15m lookback is 08:46, but the walk never starts
+    # before start_at (09:00 UTC = 04:00 Chicago): the floor is the FLOOR.
+    # Then through high (09:30 UTC, still 04) plus one hour of lookahead.
+    assert prefixes == ['orders/2026/09/10/04/', 'orders/2026/09/10/05/']
 
 
 @pytest.mark.parametrize('version', [None, 123456789012345678901234567890])
@@ -266,8 +292,10 @@ def test_none_checkpoint_does_not_list():
 
 def test_local_prefix_fall_back_is_not_listed_twice():
     source, _, _, _ = setup_source(location='s3://pos', timezone='America/Chicago')
+    # 06:15 UTC = 01:15 CDT; 08:15 UTC = 02:15 CST after the 07:00 UTC fall-back
+    # (the repeated 01:00 local hour is listed once); plus one hour of lookahead.
     assert list(source._prefixes(instant('2026-11-01T06:15:00'), instant('2026-11-01T08:15:00'))) == [
-        '2026/11/01/01/', '2026/11/01/02/']
+        '2026/11/01/01/', '2026/11/01/02/', '2026/11/01/03/']
 
 
 def test_factory_uses_iam_client_and_table_settings(monkeypatch):
@@ -306,7 +334,7 @@ def test_decode_failure_preserves_safe_reason():
 def test_half_hour_dst_change_includes_last_local_prefix():
     source, _, _, _ = setup_source(timezone='Australia/Lord_Howe')
     assert list(source._prefixes(instant('2026-04-04T14:00:00'), instant('2026-04-04T15:45:00'))) == [
-        'orders/2026/04/05/01/', 'orders/2026/04/05/02/']
+        'orders/2026/04/05/01/', 'orders/2026/04/05/02/', 'orders/2026/04/05/03/']
 
 
 @pytest.mark.parametrize('setting,value', [('fetch_size', True), ('fetch_size', 1.5),
@@ -316,3 +344,76 @@ def test_constructor_rejects_invalid_integer_settings(setting, value):
     from data_ingest.exceptions import ConfigurationError
     with pytest.raises(ConfigurationError):
         S3JsonSource(config(), s3_client=Mock(), **{setting: value})
+
+
+def test_prefetch_preserves_listing_order_and_bounds_in_flight_reads(monkeypatch):
+    """
+    Reads run ahead on a pool; decode stays sequential. Rows must come out in
+    listing order regardless of which GET finishes first, and no more than
+    `prefetch` bodies may be in flight, or a backfill's memory grows with the
+    listing rather than with the depth.
+    """
+    import threading
+    source, client, _, obj = setup_source(prefetch=3)
+    keys = [f'orders/2026/09/10/09/{i:02d}.json.gz' for i in range(10)]
+    client.get_paginator.return_value.paginate.side_effect = (
+        lambda **kw: [{'Contents': [dict(obj, Key=k) for k in keys]}] if kw['Prefix'].endswith('/09/') else [{}])
+    in_flight, peak, lock = [0], [0], threading.Lock()
+
+    def slow_get(**kw):
+        with lock:
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+        # Later keys finish FIRST, so ordering cannot come from completion order.
+        import time
+        time.sleep(0.01 * (10 - int(kw['Key'][-10:-8])))
+        with lock:
+            in_flight[0] -= 1
+        return {'Body': io.BytesIO(gzip.compress(json.dumps(packed()).encode()))}
+
+    client.get_object.side_effect = slow_get
+    frames = list(source.extract(None, source.get_current_checkpoint()))
+    assert [k for f in frames for k in f['_s3_key']] == keys
+    assert peak[0] <= 3
+
+
+def test_a_failed_read_is_reported_with_its_key_and_stops_the_run():
+    source, client, _, obj = setup_source()
+    keys = [f'orders/2026/09/10/09/{i}.json.gz' for i in range(4)]
+    client.get_paginator.return_value.paginate.side_effect = (
+        lambda **kw: [{'Contents': [dict(obj, Key=k) for k in keys]}] if kw['Prefix'].endswith('/09/') else [{}])
+
+    def get(**kw):
+        if kw['Key'].endswith('/2.json.gz'):
+            raise RuntimeError('response body with secret contents')
+        return {'Body': io.BytesIO(gzip.compress(json.dumps(packed()).encode()))}
+
+    client.get_object.side_effect = get
+    with pytest.raises(ExtractionError, match='2.json.gz') as caught:
+        list(source.extract(None, source.get_current_checkpoint()))
+    assert 'secret' not in str(caught.value)
+
+
+def test_row_bytes_counts_utf8_bytes_not_characters():
+    from data_ingest.sources.s3_json import _row_bytes
+    # 'é' is one character and two UTF-8 bytes; the Athena guard is in bytes.
+    assert _row_bytes({'a': 'abc', 'b': 'é', 'n': 5, 'z': None}) == 3 + 2
+    # ASCII takes the no-allocation path and must agree with a real encode.
+    text = '{"id":12345678901234,"items":[{"sku":"A"}]}'
+    assert _row_bytes({'payload_json': text}) == len(text.encode('utf-8'))
+
+
+@pytest.mark.parametrize('setting,value', [
+    ('prefetch', 0), ('prefetch', 33), ('prefetch', 2.5),
+    ('lookahead_hours', -1), ('lookahead_hours', 25), ('lookahead_hours', True),
+])
+def test_prefetch_and_lookahead_bounds(setting, value):
+    from data_ingest.exceptions import ConfigurationError
+    with pytest.raises(ConfigurationError, match=setting):
+        config(**{setting: value})
+
+
+def test_zero_lookahead_walks_only_to_high():
+    source, _, _, _ = setup_source(lookahead_hours=0)
+    assert list(source._prefixes(instant('2026-09-10T09:00:00'), instant('2026-09-10T09:30:00'))) == [
+        'orders/2026/09/10/09/']

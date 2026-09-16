@@ -90,6 +90,15 @@ class DiscoveryConfig:
     timezone: str = "UTC"
     suffix: str = ".json.gz"
     safety_delay_seconds: int = 120
+    # Folders walked AHEAD of the run's upper bound. A producer whose clock
+    # runs ahead of S3's names a folder for an hour that, by S3's clock, has
+    # not started; walking one hour past `high` catches those in the same run
+    # rather than depending on the next run's lookback reaching back to them.
+    lookahead_hours: int = 1
+    # Objects fetched concurrently while decoding stays sequential. S3 GET
+    # latency dominates a run and releases the GIL; decode does neither.
+    # Memory in flight is bounded by prefetch * max_object_bytes.
+    prefetch: int = 8
 
 
 @dataclass(frozen=True)
@@ -179,6 +188,9 @@ def parse_discovery(data):
         raise ConfigurationError("discovery.suffix must be a nonempty string")
     _validate_path_format(settings.path_format)
     _positive("discovery", "safety_delay_seconds", settings.safety_delay_seconds, 3600)
+    if type(settings.lookahead_hours) is not int or not 0 <= settings.lookahead_hours <= 24:
+        raise ConfigurationError("discovery.lookahead_hours must be an integer from 0 to 24")
+    _positive("discovery", "prefetch", settings.prefetch, 32)
     return settings
 
 

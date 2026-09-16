@@ -75,26 +75,34 @@ def list_objects(s3, bucket, prefix, first, last, tz, path_format, suffix):
         print("skipped:", dict(skipped))
 
 
-def simulate(objects, start, interval, lookback, safety):
+def simulate(objects, start, interval, lookback, safety, lookahead=timedelta(hours=1)):
     """
-    Replay the adapter: at each scheduled run, high = now - safety and
-    low = previous high - lookback; the hourly prefixes from floor(low) to
-    floor(high) are listed, and an object counts as found if its folder is in
-    that set and its LastModified falls in [low, high].
+    Replay the adapter's discovery rule.
+
+    Each run lists the hourly prefixes from floor(previous high - lookback)
+    through floor(high + lookahead). Its object window is (previous high,
+    high] -- exclusive at the previous high, because anything at or before it
+    was inside the previous run's window and, with S3's list-after-put
+    consistency, was listed then. The first run's window starts at `start`,
+    inclusive. An object is found when its folder is walked AND its
+    LastModified is in the window, in the same run.
     """
     found = set()
-    end = max(lm for _, _, lm in objects) + interval + safety
-    checkpoint = start
+    end = max(lm for _, _, lm in objects) + interval + safety + lookahead
+    checkpoint, first_run = start, True
     now = start + interval
     while now <= end:
         high = now - safety
-        low = max(start, checkpoint - lookback)
+        low = start if first_run else checkpoint
         if high >= low:
-            first_hour = low.replace(minute=0, second=0, microsecond=0)
+            first_hour = (low - (timedelta(0) if first_run else lookback)).replace(
+                minute=0, second=0, microsecond=0)
+            last_hour = high + lookahead
             for key, folder, lm in objects:
-                if key not in found and folder >= first_hour and folder <= high and low <= lm <= high:
+                in_window = (low <= lm <= high) if first_run else (low < lm <= high)
+                if key not in found and first_hour <= folder <= last_hour and in_window:
                     found.add(key)
-            checkpoint = high
+            checkpoint, first_run = high, False
         now += interval
     return found
 

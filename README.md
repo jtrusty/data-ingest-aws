@@ -625,19 +625,49 @@ clock, which is independent of the restaurant's business date.
 
 ### Discovery and replay
 
-The first run scans hourly prefixes from the required `s3.start_at` through
-the run's captured upper bound. Set this to the earliest upload to include.
-Later runs scan from the committed checkpoint minus `lookback_minutes`
-(15 by default). S3 `LastModified` filters files within those prefixes;
-only matching files are downloaded. Historical metadata is not listed on
-every incremental run. A backlog after an outage is scanned from the old
-checkpoint, so a missed schedule does not skip that interval.
+Each run has two bounds that are deliberately **not** the same thing:
 
-The upper bound is the job's start time minus `safety_delay_seconds` (120
-by default). Both time boundaries are inclusive; the overlap intentionally
-replays files, including those tied at S3 timestamp precision. Downloads
-use the listed ETag as an `IfMatch` condition to fail if an object changes
-between listing and reading.
+- **Which folders are listed.** From the committed checkpoint minus
+  `lookback_minutes` (15 by default), floored to the hour, through the run's
+  upper bound plus `lookahead_hours` (1 by default). The lookback keeps a
+  folder in the walk after its hour has closed, so a file written late into
+  it is still seen. The lookahead lists the *next* hour's folder too, so a
+  producer whose clock runs ahead of S3's -- naming a folder for an hour that
+  by S3's clock has not started -- is caught in the same run.
+- **Which objects are fetched.** `LastModified` strictly after the previous
+  checkpoint, up to and including the upper bound. The first run starts at
+  the required `start_at` instead, inclusive.
+
+The upper bound is the job's start time minus `safety_delay_seconds` (120 by
+default). Downloads use the listed ETag as an `IfMatch` condition to fail if
+an object changes between listing and reading.
+
+**Nothing is fetched twice.** An object at or before the previous checkpoint
+was inside the previous run's window, and with S3's list-after-put
+consistency plus the safety delay it was listed then -- so it is already
+landed, and fetching it again would only produce rows Bronze deduplicates
+away. A late arrival into a closed hour has `LastModified` *after* the
+previous checkpoint by definition, so it passes the window on its own merits;
+the lookback's job is only to keep its folder in the walk. This was checked
+by adversarial replay (270 cases: late arrivals, folder-ahead producers up to
+61 minutes, ties at second precision, missed schedules, crashes before
+commit, every phase offset) against a rule that re-fetched the whole overlap:
+the tighter window never found fewer objects, and found strictly more for
+folder-ahead producers. Bronze's dedup on `_source_record_id` remains the
+backstop either way.
+
+A backlog after an outage is walked from the old checkpoint, so a missed
+schedule does not skip that interval. Historical prefixes are not listed on
+every incremental run.
+
+Objects are **fetched concurrently and decoded sequentially**:
+`discovery.prefetch` (8 by default) reads run ahead on a thread pool while
+decode stays in order. S3 GET latency dominates a run and releases the GIL;
+gzip and JSON parsing do neither, so this is where parallelism actually pays
+-- roughly an eight-fold cut in wall-clock on I/O-bound runs, and the
+difference between a multi-week backfill taking minutes and taking an hour.
+Memory in flight is bounded at `prefetch × max_object_bytes` (256 MiB at the
+defaults), independent of listing size.
 
 **Contract: immutable files in upload-hour folders.** Arbitrarily late
 uploads into old folders, files moved between prefixes, and overwrites are
@@ -812,7 +842,8 @@ the role in its key policy. The POS landing role needs no Secrets Manager
 access. Provision output, checkpoints, catalog, and Bronze run tracking as
 described below.
 
-Listing is paginated and files are decoded sequentially. DataFrames contain
+Listing is paginated; objects are fetched `discovery.prefetch` at a time and
+decoded sequentially, in listing order. DataFrames contain
 at most 250 records and target 16 MiB of string data; a larger allowed record
 is emitted alone. Defaults cap compressed objects at 32 MiB, decompressed
 outer documents at 128 MiB, and each inner payload at 16 MiB. A 30 MiB total
@@ -821,8 +852,8 @@ row limit; it fails before committing unreadable data.
 [Athena limits](https://docs.aws.amazon.com/athena/latest/ug/other-notable-limitations.html).
 
 The measured rate on the live bucket is roughly 1,100 files/hour, so a
-15-minute interval contains ~280 new files and the default overlap replays
-roughly another 280 at steady state. Thousands of files/hour do not
+15-minute interval contains ~280 new files; the window is exclusive at the
+previous checkpoint, so nothing already landed is fetched again. Thousands of files/hour do not
 accumulate in memory, but achievable throughput depends on actual file size,
 record size, S3 latency, and compression. Measure a representative backlog in
 Glue before assuming a 15-minute completion time; local tests do not

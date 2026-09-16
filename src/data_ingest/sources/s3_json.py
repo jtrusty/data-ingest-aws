@@ -17,6 +17,8 @@ separate publications of the same record. No version comparison occurs here.
 
 import hashlib
 import json
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -78,6 +80,22 @@ def _value(value, _field):
     if isinstance(value, (str, int, float, Decimal)):
         return str(value)
     raise ExtractionError(f'Unsupported JSON value type {type(value).__name__}')
+
+
+def _row_bytes(row):
+    """
+    UTF-8 size of a row's string data, for the Athena row-size guard.
+
+    str.encode() would allocate a full copy of every payload just to measure
+    it. For ASCII text -- which all JSON from dumps_json is, and most payloads
+    are -- the character count IS the byte count, and isascii() is a scan with
+    no allocation. Only genuinely non-ASCII strings pay for the encode.
+    """
+    total = 0
+    for value in row.values():
+        if isinstance(value, str):
+            total += len(value) if value.isascii() else len(value.encode('utf-8'))
+    return total
 
 
 def _at_path(payload, path):
@@ -159,6 +177,9 @@ class S3JsonSource(Source):
         # fractional UTC offsets and skips nonexistent daylight-saving hours.
         hour = low.astimezone(self._folder_timezone).replace(minute=0, second=0, microsecond=0)
         cursor = hour.astimezone(timezone.utc)
+        # Walk past `high` so a folder named ahead of S3's clock is listed in
+        # the run whose LastModified window its objects fall in.
+        high = high + timedelta(hours=self._discovery.lookahead_hours)
         previous = None
         while cursor <= high:
             suffix = self._path(cursor)
@@ -175,19 +196,45 @@ class S3JsonSource(Source):
         if endpoint != previous:
             yield endpoint
 
-    def _objects(self, low, high):
+    def _objects(self, walk_from, low, high, inclusive):
+        """
+        Objects with LastModified in the run's window, from the folders the
+        walk covers.
+
+        The walk starts at `walk_from` (previous high minus the lookback) so a
+        folder can still be listed after its hour has closed. The OBJECT window
+        starts at `low` = the previous high, exclusive: anything at or before it
+        was inside the previous run's window, and with S3's list-after-put
+        consistency plus the safety delay, it was listed then. Re-fetching it
+        would only produce rows Bronze deduplicates away. The first run has no
+        previous high and includes its start instant.
+        """
         paginator = self._client.get_paginator('list_objects_v2')
-        for prefix in self._prefixes(low, high):
+        for prefix in self._prefixes(walk_from, high):
             try:
                 for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
                     for item in page.get('Contents', []):
-                        if item['Key'].endswith(self._discovery.suffix) \
-                                and low <= _utc(item['LastModified']) <= high:
-                            yield item
+                        if not item['Key'].endswith(self._discovery.suffix):
+                            continue
+                        modified = _utc(item['LastModified'])
+                        if modified > high or modified < low or (modified == low and not inclusive):
+                            continue
+                        yield item
             except Exception:
                 raise ExtractionError(f'Failed to list objects at s3://{self.bucket}/{prefix}') from None
 
     def _read(self, item):
+        try:
+            return self._read_object(item)
+        except ExtractionError as exc:
+            raise ExtractionError(
+                f'Failed to extract object s3://{self.bucket}/{item["Key"]}: {exc}'
+            ) from None
+        except Exception:
+            # No SDK detail: an error body can echo the request or the object.
+            raise ExtractionError(f'Failed to extract object s3://{self.bucket}/{item["Key"]}') from None
+
+    def _read_object(self, item):
         limit = self._document.max_object_bytes
         if item.get('Size', 0) > limit:
             raise ExtractionError('S3 object exceeds max_object_bytes')
@@ -216,9 +263,35 @@ class S3JsonSource(Source):
             'envelope_json': dumps_json(envelope), 'payload_json': payload_json,
         }
 
-    def _rows(self, item):
+    def _prefetched(self, items):
+        """
+        (item, compressed bytes) in listing order, with reads running ahead.
+
+        A sliding window rather than executor.map over the whole listing:
+        map would submit every GET at once and hold every body in memory. At
+        most `prefetch` bodies are in flight, so memory is bounded and a
+        backfill over weeks of prefixes does not balloon.
+        """
+        depth = self._discovery.prefetch
+        pending = deque()
+        with ThreadPoolExecutor(max_workers=depth) as pool:
+            try:
+                for item in items:
+                    pending.append((item, pool.submit(self._read, item)))
+                    if len(pending) >= depth:
+                        head, future = pending.popleft()
+                        yield head, future.result()
+                while pending:
+                    head, future = pending.popleft()
+                    yield head, future.result()
+            finally:
+                # A failure mid-run must not leave the pool finishing GETs
+                # whose bodies nothing will read.
+                for _, future in pending:
+                    future.cancel()
+
+    def _rows(self, item, compressed):
         try:
-            compressed = self._read(item)
             records = decode_records(compressed, document=self._document)
             for ordinal, (envelope, payload, payload_json) in enumerate(records):
                 yield self._row(item, ordinal, envelope, payload, payload_json)
@@ -235,16 +308,23 @@ class S3JsonSource(Source):
         if current_checkpoint.value is None:
             return
         high = _utc(current_checkpoint.value)
-        low = self._start
         if previous_checkpoint is not None and previous_checkpoint.value is not None:
-            low = max(low, _utc(previous_checkpoint.value) - timedelta(minutes=self.lookback_minutes))
+            # Incremental: objects strictly after the previous high; folders
+            # walked from `lookback` before it so late arrivals into a closed
+            # hour are still listed.
+            low, inclusive = _utc(previous_checkpoint.value), False
+            walk_from = max(self._start, low - timedelta(minutes=self.lookback_minutes))
+        else:
+            low, inclusive = self._start, True
+            walk_from = self._start
         if high < low:
             return
         batch = []
         byte_count = 0
-        for item in self._objects(low, high):
-            for row in self._rows(item):
-                row_bytes = sum(len(value.encode('utf-8')) for value in row.values() if isinstance(value, str))
+        items = self._objects(walk_from, low, high, inclusive)
+        for item, compressed in self._prefetched(items):
+            for row in self._rows(item, compressed):
+                row_bytes = _row_bytes(row)
                 if row_bytes > _MAX_ROW_BYTES:
                     raise ExtractionError(
                         f'Row exceeds {_MAX_ROW_BYTES} UTF-8 bytes '

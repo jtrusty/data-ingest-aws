@@ -154,28 +154,38 @@ def test_versions_and_complete_payload_survive_parquet_and_replay(env):
     assert committed["schema_drift"] is False
     assert state(env).checkpoint.value == committed["checkpoint"]["high"]
 
+    # The next run's window starts strictly after the previous high, so an
+    # object already landed is not fetched, decoded, or landed again -- no
+    # duplicate Parquet for Bronze to merge away. The run still commits: an
+    # empty window advances the checkpoint like any other.
     replay = run(env, now + timedelta(minutes=1))
-    assert [r["_source_record_id"] for r in rows(env, replay)] == [
-        r["_source_record_id"] for r in landed]
+    assert rows(env, replay) == []
+    assert replay.row_count == 0
     assert replay.run_id != first.run_id
     assert state(env).version == 2
     assert manifest(env, replay)["load_type"] == "incremental"
 
 
 def test_corrupt_object_after_landed_batch_cannot_commit(env):
-    _, _, modified = put_orders(env)
-    now = modified + timedelta(seconds=121)
-    run(env, now)
-    before_state = state(env)
-    before_manifests = keys(env, "_manifest.json")
-    before_parts = keys(env, ".parquet")
+    """
+    A good object lists before a corrupt one in the same window. Its rows are
+    batched and a Parquet part is written; then the corrupt object fails the
+    run. The part stays (landing never cleans up), no manifest is written, and
+    the checkpoint does not move -- so Bronze ignores the prefix and the next
+    run replays the whole window.
+    """
+    _, _, modified = put_orders(env)                       # 0001.json.gz
     corrupt_key = "orders/" + env["now"].strftime("%Y/%m/%d/%H/") + "zzzz.json.gz"
     env["s3"].put_object(Bucket=RAW_BUCKET, Key=corrupt_key, Body=b"corrupt-private-data")
+    before_state = state(env)
+    assert keys(env, ".parquet") == [] and keys(env, "_manifest.json") == []
+
     with pytest.raises(ExtractionError) as error:
-        run(env, now + timedelta(minutes=1))
+        run(env, modified + timedelta(seconds=121))
     assert "corrupt-private-data" not in str(error.value)
-    assert len(keys(env, ".parquet")) > len(before_parts)
-    assert keys(env, "_manifest.json") == before_manifests
+    assert corrupt_key in str(error.value)
+    assert len(keys(env, ".parquet")) > 0                  # the good batch landed
+    assert keys(env, "_manifest.json") == []               # but nothing committed
     assert state(env) == before_state
 
 
