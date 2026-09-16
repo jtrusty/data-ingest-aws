@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-What shapes does the PAR POS feed actually emit?
+What shapes does a JSON feed in S3 actually emit?
 
-The existing Lambda consumer defends against four variations the strict
-adapter does not accept: a plain `data` dict instead of `data_base64`, a
-payload that is not gzip, a decoded payload that is a list, and order fields
-nested under `order` or `data.order`. Defensive code does not prove those
-shapes occur -- production consumers accumulate branches for things that
-happened once in 2019, or never. This samples real objects and reports which
-variations are actually present, so the adapter can be relaxed exactly as far
-as the data requires and no further.
+A feed's wire format varies in ways no filename reveals: whether the payload
+rides in a base64 `data_base64` member or an inline `data` dict, whether it
+is gzip, zlib or plain, whether the decoded document is an object or a list,
+and where identity lives inside it. An existing consumer's defensive code is
+not evidence of which variations occur -- production consumers accumulate
+branches for things that happened once, or never. This samples real objects
+and reports which variations are actually present, so the `document:` block
+can be written from data rather than from assumption.
 
 The last section is the important one: it reports where `id` and `version`
 really live, which Silver needs to know to collapse versions.
 
-    python scripts/json_payload_shape_census.py --uri s3://pos-events/orders --sample 50
+    python scripts/json_payload_shape_census.py --uri s3://my-events/orders --sample 50
 
 Needs s3:ListBucket and s3:GetObject. Downloads --sample objects, writes
 nothing, and prints no payload values -- only key names, types and counts.
@@ -305,7 +305,7 @@ def main():
     else:
         print("  no order id found at any probed path; inspect the payload keys above")
     # "Can ONE document: block describe this feed?" -- which is what the
-    # presets above actually accept, not just the original PAR shape. A feed
+    # presets above actually accept, not just one producer's shape. A feed
     # needs one carrier, one compression family, and object payloads.
     carriers = {k for k in envelope_field if not k.startswith("  (") and not k.startswith("NEITHER")}
     codecs = set(codec) - {"n/a (inline)"}

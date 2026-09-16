@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Does the POS producer honour "folder hour == upload hour"?
+Does the producer honour "folder hour == upload hour"?
 
 Read-only: only list_objects_v2, never get_object. Lists every object under
 the hourly prefixes in a date range, compares each object's LastModified to
@@ -9,8 +9,8 @@ discovery rule over that listing -- scheduled runs every --interval minutes,
 --lookback minutes of overlap, --safety seconds of cutoff -- and reports the
 objects a real schedule would never have found.
 
-    python scripts/json_folder_contract_check.py --uri s3://pos-events/orders --days 14
-    python scripts/json_folder_contract_check.py --uri s3://pos-events/orders \
+    python scripts/json_folder_contract_check.py --uri s3://my-events/orders --days 14
+    python scripts/json_folder_contract_check.py --uri s3://my-events/orders \
         --days 30 --tz America/Chicago --lookback 30
 
 Runs anywhere with s3:ListBucket and boto3 -- including as an AWS Glue Python
