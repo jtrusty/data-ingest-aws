@@ -45,6 +45,12 @@ dependencies = [
     # `>=10.0` lets a resolver pick pyarrow 17 against numpy 1.26 -- a
     # combination that appears on no Glue image.
     "pyarrow>=10.0.1,<10.1.0",
+    # zoneinfo (3.9 stdlib) reads the SYSTEM tz database and has no built-in
+    # UTC -- ZoneInfo("UTC") raises ZoneInfoNotFoundError on an image without
+    # one, which would fail every s3_json_gz run in its constructor rather
+    # than on a specific record. tzdata is pure Python with no dependencies
+    # of its own, so pinning nothing here cannot disturb the Glue runtime.
+    "tzdata",
 ]
 
 [project.optional-dependencies]

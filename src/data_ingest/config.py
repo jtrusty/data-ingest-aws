@@ -15,6 +15,7 @@ from typing import List, Optional
 import yaml
 
 from data_ingest.checkpoints import _TYPE_REGISTRY
+from data_ingest.config_s3_json import S3JsonConfig, build_table_config, parse_source_s3
 from data_ingest.exceptions import ConfigurationError
 
 
@@ -51,11 +52,12 @@ class TableConfig:
 
     primary_key: List[str]
     checkpoint: CheckpointConfig
+    s3: Optional[S3JsonConfig] = None
 
     @property
     def source_object(self):
         """"DATABASE.SCHEMA.TABLE" -- lineage/logging only; never an identity key."""
-        return f"{self.database}.{self.schema}.{self.table}"
+        return self.s3.location if self.s3 else f"{self.database}.{self.schema}.{self.table}"
 
 
 @dataclass(frozen=True)
@@ -214,7 +216,7 @@ class ConnectionConfig:
     # Only a Secrets Manager pointer -- actual credentials never live in
     # this config (see "Secrets vs config" in README.md). Database/schema/table mappings are
     # config, not secrets, and live on TableConfig instead.
-    secret_id: str
+    secret_id: Optional[str] = None  # S3 adapters use the Glue job's IAM role.
 
 
 @dataclass(frozen=True)
@@ -525,7 +527,38 @@ def _parse_bronze(data):
     )
 
 
-def _parse_table(data, default_database=None, default_schema=None):
+def _parse_s3_table(data, source_s3):
+    if not isinstance(data.get("name"), str) or not data["name"]:
+        raise ConfigurationError("s3_json tables require a nonempty name")
+    settings = build_table_config(data, source_s3)
+    checkpoint = _parse_checkpoint({**data, "checkpoint": data.get("checkpoint", {
+        "type": "watermark", "column": "_s3_last_modified", "lookback_minutes": 15,
+    })})
+    # primary_key and the checkpoint are the PHYSICAL replay identity, not the
+    # business one -- Bronze does not know what a business record is. Pinning
+    # them is what lets it retain every published version; deduplicating on a
+    # business key here would silently discard history.
+    primary_key = data.get("primary_key", ["_source_record_id"])
+    if primary_key != ["_source_record_id"]:
+        raise ConfigurationError(
+            "s3_json primary_key must be [_source_record_id] for replay safety; "
+            "business identity is a Silver concern, resolved from payload_json"
+        )
+    if checkpoint.type != "watermark" or checkpoint.column != "_s3_last_modified":
+        raise ConfigurationError("s3_json checkpoint must watermark _s3_last_modified")
+    if checkpoint.lookback_minutes < 1:
+        raise ConfigurationError("s3_json requires positive lookback_minutes for boundary arrivals")
+    bucket, prefix = split_s3_uri(settings.location)
+    return TableConfig(
+        name=data["name"], database=bucket, schema="s3", table=prefix or data["name"],
+        primary_key=list(primary_key), checkpoint=checkpoint, s3=settings,
+    )
+
+
+def _parse_table(data, default_database=None, default_schema=None, source_type=None,
+                 source_s3=None):
+    if source_type == "s3_json":
+        return _parse_s3_table(data, source_s3)
     # database and schema fall back to the source-level defaults, so a config
     # whose tables all live in one schema states it once instead of per table.
     # `name` deliberately has no such shortcut and is never derived from
@@ -564,11 +597,16 @@ def parse_config(raw_text):
     except yaml.YAMLError as exc:
         raise ConfigurationError(f"Invalid YAML configuration: {exc}") from exc
 
-    if not data or "source" not in data or "connection" not in data:
-        raise ConfigurationError("Configuration must define 'source' and 'connection'")
+    if not data or "source" not in data:
+        raise ConfigurationError("Configuration must define 'source'")
 
     source = data["source"]
-    connection = data["connection"]
+    connection = data.get("connection") or {}
+    if source.get("type") == "s3_json":
+        if connection.get("secret_id"):
+            raise ConfigurationError("s3_json uses the Glue IAM role; omit connection.secret_id")
+    elif not connection.get("secret_id"):
+        raise ConfigurationError("Configuration must define connection.secret_id")
 
     # One pass over every section, so a config several keys out of date
     # reports all of them at once rather than one per upload.
@@ -578,7 +616,13 @@ def parse_config(raw_text):
         {"source", "connection", "landing", "bronze", "defaults", "tables"},
         problems,
     )
-    _collect_unknown_keys("source", source, {"name", "type", "database", "schema"}, problems)
+    _collect_unknown_keys(
+        "source", source,
+        ({"name", "type", "discovery", "document"}
+         if source.get("type") == "s3_json"
+         else {"name", "type", "database", "schema"}),
+        problems,
+    )
     _collect_unknown_keys("connection", connection, {"secret_id"}, problems)
     _collect_unknown_keys(
         "landing", data.get("landing") or {},
@@ -598,7 +642,9 @@ def parse_config(raw_text):
         label = f"tables[{table_entry.get('name', '?')}]"
         _collect_unknown_keys(
             label, table_entry,
-            {"name", "database", "schema", "table", "primary_key", "checkpoint"},
+            ({"name", "location", "start_at", "envelope_fields",
+              "primary_key", "checkpoint"} if source.get("type") == "s3_json"
+             else {"name", "database", "schema", "table", "primary_key", "checkpoint"}),
             problems,
         )
         _collect_unknown_keys(
@@ -607,8 +653,13 @@ def parse_config(raw_text):
         )
     _raise_if_problems(problems)
 
+    # Parsed once: discovery and document describe the feed's wire format,
+    # which every table under this source shares.
+    source_s3 = parse_source_s3(source) if source.get("type") == "s3_json" else None
+
     tables = [
-        _parse_table(t, source.get("database"), source.get("schema"))
+        _parse_table(t, source.get("database"), source.get("schema"), source.get("type"),
+                     source_s3)
         for t in data.get("tables", [])
     ]
     if not tables:
@@ -649,7 +700,7 @@ def parse_config(raw_text):
     return IngestionConfig(
         source_name=source["name"],
         source_type=source["type"],
-        connection=ConnectionConfig(secret_id=connection["secret_id"]),
+        connection=ConnectionConfig(secret_id=connection.get("secret_id")),
         tables=tables,
         landing=LandingConfig(
             location=landing_location,

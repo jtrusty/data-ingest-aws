@@ -25,6 +25,7 @@ from data_ingest.exceptions import ConfigurationError
 #   build_source(credentials, table_config, fetch_size) -> Source
 _SOURCE_MODULES = {
     "snowflake": "data_ingest.sources.snowflake",
+    "s3_json": "data_ingest.sources.s3_json",
 }
 
 

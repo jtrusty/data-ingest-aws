@@ -15,6 +15,15 @@ import pytest
 
 AWS_REGION = "us-east-1"
 
+# Pin region before test collection can import Arrow's native AWS client.
+# Setting it only in the fixture is too late for import-time initialization:
+# Arrow 10 can construct an EC2 metadata client without a region and crash in
+# its native CurlHandleContainer destructor at process exit. The fixture
+# still resets each test's AWS environment; these values stay in this pytest
+# process and are never applied to production jobs.
+os.environ["AWS_DEFAULT_REGION"] = AWS_REGION
+os.environ["AWS_REGION"] = AWS_REGION
+
 
 @pytest.fixture(autouse=True)
 def aws_test_environment(monkeypatch):

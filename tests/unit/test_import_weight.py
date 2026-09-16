@@ -50,6 +50,27 @@ def test_bronze_entry_point_via_the_package_stays_light():
     assert _loaded_heavy_modules("from data_ingest import run_bronze_job") == []
 
 
+def test_bronze_stays_light_while_parsing_a_s3_json_config():
+    """
+    Bronze parses whatever config it is handed, and the s3_json branch pulls in
+    config_s3 -> zoneinfo. That must not drag the data stack in behind it, or
+    the 0.0625 DPU sizing stops being viable for POS sources specifically.
+    """
+    # Absolute path: the child has no cwd= and release-please runs pytest
+    # from /tmp, where a repo-relative open() would fail -- silently, since
+    # the child's stderr is captured and never shown.
+    from pathlib import Path
+
+    example = Path(__file__).parents[2] / "config" / "s3_json.example.yaml"
+    assert _loaded_heavy_modules(
+        f"""
+        from data_ingest.bronze.job import run_bronze_job
+        from data_ingest.config import parse_config
+        parse_config(open({str(example)!r}).read())
+        """
+    ) == []
+
+
 def test_ingestion_job_does_load_the_data_stack():
     """
     The counterpart. Landing genuinely needs pandas and pyarrow -- it writes
