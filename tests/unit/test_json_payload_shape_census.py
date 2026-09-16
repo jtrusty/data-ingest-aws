@@ -88,14 +88,14 @@ def _envelope(payload, oid="12345678901234"):
 def test_a_feed_the_adapter_handles_is_reported_as_such(capsys):
     out = _run([_envelope({"id": 12345678901234, "version": 1})], capsys)
     assert "adapter as written handles this feed: YES" in out
-    assert "record.natural_key: [id]" in out
+    assert "Silver identity path: $.id" in out
 
 
 def test_nested_order_is_reported_as_the_path_to_configure(capsys):
-    # Nested identity: natural_key must name the real path, or Silver's
-    # dedup partitions on nothing.
+    # Nested identity: Silver must extract the real path, or its dedup
+    # partitions on nothing.
     out = _run([_envelope({"order": {"id": 12345678901234, "version": 1}})], capsys)
-    assert "record.natural_key: [order.id]" in out
+    assert "Silver identity path: $.order.id" in out
     assert "{'order': ...}" in out
 
 
@@ -145,7 +145,7 @@ def test_emit_config_matches_the_par_wire_format(capsys):
     out = _run([_envelope({"id": 1, "version": 2})], capsys, argv_extra=("--emit-config",))
     assert "preset: cloudevents" in out
     assert "path: data_base64" in out and "encoding: base64" in out
-    assert "natural_key: [id]" in out and "version: version" in out
+    assert "$.id" in out and "$.version" in out
 
 
 def test_emit_config_detects_an_inline_data_payload(capsys):

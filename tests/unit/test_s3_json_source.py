@@ -212,19 +212,18 @@ def test_an_envelope_path_that_no_record_has_lands_null_not_an_error():
     assert frame.absent[0] is None
 
 
-def test_metadata_records_the_wire_format_and_business_identity():
-    # The manifest carries these so a landed run can be read back and its
-    # decode pipeline and logical identity recovered without the config file.
-    source, _, _, _ = setup_source(record={'natural_key': ['id'], 'version': 'version'})
+def test_metadata_records_the_wire_format():
+    # The manifest carries this so a landed run can be read back and its
+    # decode pipeline recovered without the config file.
+    source, _, _, _ = setup_source()
     meta = source.metadata()
     assert meta['bucket'] == 'pos' and meta['prefix'] == 'orders'
     assert meta['path_format'] == '%Y/%m/%d/%H' and meta['suffix'] == '.json.gz'
     assert meta['document']['payload'] == {
         'path': 'data_base64', 'encoding': 'base64', 'compression': 'auto', 'format': 'json'}
     assert meta['envelope_fields'] == ENVELOPE_FIELDS
-    # Business identity is recorded, NOT used for deduplication -- that is
-    # _source_record_id + _s3_last_modified, which is why history survives.
-    assert meta['natural_key'] == ['id'] and meta['version_field'] == 'version'
+    # No business identity here: Bronze does not know what an order is.
+    assert 'natural_key' not in meta and 'version_field' not in meta
 
 
 def test_an_empty_projection_still_lands_core_and_json_columns():

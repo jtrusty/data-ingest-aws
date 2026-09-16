@@ -123,7 +123,7 @@ class S3JsonSource(Source):
 
     def metadata(self):
         # Recorded in the manifest so a landed run can be read back and its
-        # wire format and business identity recovered without the config file.
+        # wire format recovered without the config file.
         payload = self._document.payload
         return {
             'bucket': self.bucket, 'prefix': self.prefix,
@@ -137,8 +137,6 @@ class S3JsonSource(Source):
                                      'compression': payload.compression,
                                      'format': payload.format}},
             'envelope_fields': dict(self.config.envelope_fields),
-            'natural_key': list(self.config.record.natural_key),
-            'version_field': self.config.record.version,
         }
 
     def arrow_schema(self):

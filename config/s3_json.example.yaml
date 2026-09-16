@@ -69,13 +69,9 @@ tables:
       business_date: businessdate
       historical_data_type: historicaldatatype
 
-    # What the payload MEANS, as opposed to how it is stored. Declarative:
-    # recorded in the manifest as lineage, not enforced during ingestion.
-    # Bronze deduplicates on the physical identity below so it retains every
-    # published version; this is the logical identity Silver collapses on.
-    record:
-      natural_key: [id]     # PAR repeats the envelope's "guid:<order_id>" here
-      version: version
+    # Nothing here says what the payload MEANS. Which field identifies an
+    # order and which one versions it is Silver's decision, read out of
+    # payload_json at query time -- so it can change without re-landing.
 
     # The PHYSICAL replay identity. Fixed, and config rejects changing it.
     primary_key: [_source_record_id]

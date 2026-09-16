@@ -59,7 +59,6 @@ def env():
                 "name": "orders",
                 "start_at": (now - timedelta(hours=1)).isoformat(),
                 "envelope_fields": {"business_date": "businessdate"},
-                "record": {"natural_key": ["order.id"], "version": "version"},
             }],
         }, sort_keys=False)
         yield {

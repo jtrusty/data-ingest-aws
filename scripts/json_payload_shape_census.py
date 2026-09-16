@@ -12,7 +12,7 @@ variations are actually present, so the adapter can be relaxed exactly as far
 as the data requires and no further.
 
 The last section is the important one: it reports where `id` and `version`
-really live, which is what `record.natural_key` should name.
+really live, which Silver needs to know to collapse versions.
 
     python scripts/json_payload_shape_census.py --uri s3://pos-events/orders --sample 50
 
@@ -156,19 +156,15 @@ def emit_config(envelope_field, codec, decoded_type, wrapper, id_found, version_
         print(f"    # WARNING: decoded payload is {framing}, not an object; the adapter")
         print("    # requires a JSON object per record.")
 
-    print("\n  # under the table:")
-    print("    record:")
+    print("\n  # For Silver (NOT ingestion config -- Bronze does not know what a record is):")
     if id_found:
         best, seen = id_found.most_common(1)[0]
         note = "" if seen >= records else f"   # on {100 * seen / max(records, 1):.1f}% of records"
-        print(f"      natural_key: [{best}]{note}")
+        print(f"  #   identity:  json_extract_scalar(payload_json, '$.{best}'){note}")
     else:
-        print("      # no identity found at any probed path; inspect payload keys above")
+        print("  #   no identity found at any probed path; inspect payload keys above")
     if version_found:
-        print(f"      version: {version_found.most_common(1)[0][0]}")
-    print("      # Declarative: recorded as lineage for Silver, not used to")
-    print("      # deduplicate. Bronze dedupes on _source_record_id so it keeps")
-    print("      # every published version.")
+        print(f"  #   version:   json_extract_scalar(payload_json, '$.{version_found.most_common(1)[0][0]}')")
 
 
 def main():
@@ -290,7 +286,7 @@ def main():
     print("\n--- what this means for the config ---")
     if id_found:
         best = id_found.most_common(1)[0]
-        print(f"  record.natural_key: [{best[0]}]"
+        print(f"  Silver identity path: $.{best[0]}"
               f"   (present on {100 * best[1] / max(records, 1):.1f}% of records)")
         if len(id_found) > 1:
             print(f"  WARNING: id appears at more than one path {sorted(id_found)} -- "

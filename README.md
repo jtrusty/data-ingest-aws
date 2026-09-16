@@ -463,10 +463,13 @@ tables:
     start_at: "2026-09-01T00:00:00Z"
     envelope_fields:                 # producer extensions -> columns
       group_id: groupid
-    record:                          # what the payload MEANS
-      natural_key: [id]
-      version: version
 ```
+
+Notice what is **not** there: nothing says which payload field identifies an
+order or which one versions it. Bronze's contract ends at "I received this
+event and decoded its JSON faithfully." What the payload *means* is Silver's,
+resolved from `payload_json` at query time — so it can change without
+re-landing anything, and it lives in exactly one place.
 
 A different feed is then a config change rather than a new adapter — JSONL
 with an uncompressed `payload` member, or a plain array of business objects
@@ -532,22 +535,24 @@ without re-landing anything.
 
 ### Physical identity vs business identity
 
-Two different questions, deliberately answered by different columns:
+Two different questions, deliberately answered in different layers:
 
 | | Answers | Where |
 |---|---|---|
-| `_source_record_id` + `_s3_last_modified` | Have I already ingested this published record? | `primary_key` + checkpoint, **pinned** |
-| `record.natural_key` + `record.version` | What entity and revision does it describe? | declared, recorded as lineage |
+| `_source_record_id` + `_s3_last_modified` | Have I already ingested this published record? | Bronze — `primary_key` + checkpoint, **pinned** |
+| the order's `id` + `version` inside `payload_json` | What entity and revision does it describe? | Silver — extracted at query time |
 
 Bronze deduplicates on the **physical** identity, which is what lets it retain
 every published version of an order. Deduplicating on the business key instead
 would collapse those versions and destroy the history Bronze exists for — so
 `primary_key` is pinned to `[_source_record_id]` and config refuses to change
-it, naming `record.natural_key` as where the business key belongs.
+it.
 
-`record` is declarative. It is recorded in the manifest as lineage so a landed
-run can be read back and its logical identity recovered; nothing in ingestion
-enforces it. Collapsing to current state is Silver's job.
+There is no ingestion-side setting for the business key on purpose. Bronze
+does not know what an order is, and a `natural_key:` here would be a second
+home for a fact Silver already has to own — two homes drift. Collapsing to
+current state is Silver's job, and the census below tells you which path to
+extract.
 
 ### Checking a feed against the config
 
@@ -556,9 +561,10 @@ python scripts/json_payload_shape_census.py --uri s3://<bucket>/<prefix> \
     --sample 50 --emit-config
 ```
 
-Samples real objects and prints the `document:` and `record:` blocks the feed
-implies — which carrier it uses, how payloads are actually compressed, how
-records are framed, and where identity and version really live. It warns when
+Samples real objects and prints the `document:` block the feed implies — which
+carrier it uses, how payloads are actually compressed, how records are framed —
+and, separately, where identity and version live in the payload, as the
+`json_extract_scalar` paths Silver will need. It warns when
 a feed **mixes** carriers or compressions, because one config cannot describe
 a feed that does both.
 
@@ -716,8 +722,8 @@ retained. Order identity is deliberately not part of that match key.
 This producer's parent `id` is not a bare GUID: it is `<guid>:<order_id>`,
 where `order_id` is the 14-digit order number, and the decoded payload
 repeats that number in its own `id`. The example config therefore sets
-`record.natural_key: [id]`, naming the payload copy rather than a prefix
-parsed off the envelope. The full `<guid>:<order_id>` string is still landed
+Silver reads `json_extract_scalar(payload_json, '$.id')` rather than parsing a
+prefix off the envelope. The full `<guid>:<order_id>` string is still landed
 verbatim as `event_id`, so the two can be reconciled in Athena:
 
 ```sql
@@ -758,10 +764,8 @@ FROM (
 WHERE version_rank = 1;
 ```
 
-The paths come straight from `record.natural_key` and `record.version`, which
-is what those settings are for -- they are recorded in the manifest precisely
-so a Silver view can be written (or generated) from the config rather than
-rediscovered.
+The `$.id` and `$.version` paths are Silver's to own. The census script
+reports them from a real sample so they are measured rather than guessed.
 
 This is a query template, not a deployed Silver view. Include restaurant or
 tenant in the partition key if IDs are locally scoped. Confirm integer-only

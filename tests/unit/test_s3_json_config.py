@@ -49,11 +49,11 @@ def test_name_identifies_the_producer_and_type_selects_the_adapter():
 
 def test_replay_identity_is_pinned_and_cannot_be_traded_for_business_identity():
     # Deduplicating on the business key would collapse an order's versions and
-    # destroy the history Bronze exists to keep. The error says where the
-    # business key actually goes.
+    # destroy the history Bronze exists to keep. The error says where that
+    # decision actually lives.
     data = deepcopy(CONFIG)
     data["tables"][0]["primary_key"] = ["order_id"]
-    with pytest.raises(ConfigurationError, match="record.natural_key"):
+    with pytest.raises(ConfigurationError, match="Silver"):
         parse(data)
 
 
@@ -178,26 +178,12 @@ def test_invalid_envelope_fields_rejected(fields):
         table(envelope_fields=fields)
 
 
-def test_record_declares_business_identity_separately():
-    record = table(record={"natural_key": ["id"], "version": "version"}).s3.record
-    assert record.natural_key == ("id",)
-    assert record.version == "version"
-
-
-def test_record_defaults_to_undeclared():
-    assert table().s3.record.natural_key == ()
-    assert table().s3.record.version is None
-
-
-@pytest.mark.parametrize("record", [
-    {"natural_key": "id"},        # a bare string, not a list
-    {"natural_key": [""]},
-    {"version": ""},
-    {"unknown": 1},
-])
-def test_invalid_record_rejected(record):
-    with pytest.raises(ConfigurationError):
-        table(record=record)
+def test_business_identity_is_not_ingestion_config():
+    # What identifies an order and what versions it is Silver's decision,
+    # resolved from payload_json. A key for it here would be a second home for
+    # the same fact, and two homes drift.
+    with pytest.raises(ConfigurationError, match="record"):
+        table(record={"natural_key": ["id"], "version": "version"})
 
 
 # --- location and wiring --------------------------------------------------
@@ -274,4 +260,3 @@ def test_example_is_a_valid_bronze_enabled_config():
         "group_id": "groupid", "business_date": "businessdate",
         "historical_data_type": "historicaldatatype",
     }
-    assert settings.record.natural_key == ("id",)

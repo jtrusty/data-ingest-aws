@@ -535,14 +535,14 @@ def _parse_s3_table(data, source_s3):
         "type": "watermark", "column": "_s3_last_modified", "lookback_minutes": 15,
     })})
     # primary_key and the checkpoint are the PHYSICAL replay identity, not the
-    # business one -- record.natural_key carries that. Pinning them is what
-    # lets Bronze retain every published version of a record; letting a config
-    # dedupe on the business key instead would silently discard history.
+    # business one -- Bronze does not know what a business record is. Pinning
+    # them is what lets it retain every published version; deduplicating on a
+    # business key here would silently discard history.
     primary_key = data.get("primary_key", ["_source_record_id"])
     if primary_key != ["_source_record_id"]:
         raise ConfigurationError(
             "s3_json primary_key must be [_source_record_id] for replay safety; "
-            "declare the business identity under record.natural_key instead"
+            "business identity is a Silver concern, resolved from payload_json"
         )
     if checkpoint.type != "watermark" or checkpoint.column != "_s3_last_modified":
         raise ConfigurationError("s3_json checkpoint must watermark _s3_last_modified")
@@ -642,7 +642,7 @@ def parse_config(raw_text):
         label = f"tables[{table_entry.get('name', '?')}]"
         _collect_unknown_keys(
             label, table_entry,
-            ({"name", "location", "start_at", "envelope_fields", "record",
+            ({"name", "location", "start_at", "envelope_fields",
               "primary_key", "checkpoint"} if source.get("type") == "s3_json"
              else {"name", "database", "schema", "table", "primary_key", "checkpoint"}),
             problems,

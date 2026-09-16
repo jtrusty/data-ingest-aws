@@ -10,7 +10,11 @@ producer and therefore belongs in configuration:
     discovery   how files are found
     document    how a file is opened and records identified
     payload     where the payload is and how it decodes
-    record      what the payload means (business identity), declaratively
+
+What the payload MEANS -- which field identifies a business record, which
+one versions it -- is deliberately NOT here. Bronze's contract ends at "I
+received this event and decoded its JSON faithfully"; interpretation is
+Silver's, where it can change without re-landing anything.
 
 What is NOT configurable is the safety: bounded decompression, validated
 base64, exact Decimal preservation, and full retention of both the envelope
@@ -21,7 +25,7 @@ import re
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from types import MappingProxyType
-from typing import Mapping, Optional, Tuple
+from typing import Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from data_ingest.exceptions import ConfigurationError
@@ -116,22 +120,6 @@ class DocumentConfig:
 
 
 @dataclass(frozen=True)
-class RecordConfig:
-    """
-    What the payload means, as opposed to how it is stored.
-
-    Declarative only. The framework deduplicates on the PHYSICAL identity
-    (_source_record_id + _s3_last_modified) so Bronze retains every published
-    version; this records the LOGICAL identity, which is what Silver collapses
-    on. Conflating the two is how history gets lost, so they stay separate --
-    these values are recorded in the manifest as lineage, not enforced here.
-    """
-
-    natural_key: Tuple[str, ...] = ()
-    version: Optional[str] = None
-
-
-@dataclass(frozen=True)
 class S3JsonConfig:
     """One table's full view: source-level wiring plus its own settings."""
 
@@ -140,7 +128,6 @@ class S3JsonConfig:
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     document: DocumentConfig = field(default_factory=DocumentConfig)
     envelope_fields: Mapping[str, str] = field(default_factory=dict)
-    record: RecordConfig = field(default_factory=RecordConfig)
 
     @property
     def envelope_columns(self):
@@ -250,19 +237,6 @@ def parse_document(data):
     return settings
 
 
-def parse_record(data):
-    data = _known("record", data or {}, RecordConfig)
-    natural_key = data.get("natural_key") or ()
-    if isinstance(natural_key, str) or not all(isinstance(k, str) for k in natural_key):
-        raise ConfigurationError("record.natural_key must be a list of field paths")
-    for key in natural_key:
-        _dotted("record.natural_key entry", key)
-    version = data.get("version")
-    if version is not None:
-        _dotted("record.version", version)
-    return RecordConfig(natural_key=tuple(natural_key), version=version)
-
-
 def parse_envelope_fields(data):
     """Validate a column -> dotted-path mapping, preserving YAML order."""
     raw = data or {}
@@ -326,5 +300,4 @@ def build_table_config(table, source_s3):
         discovery=source_s3["discovery"],
         document=source_s3["document"],
         envelope_fields=parse_envelope_fields(table.get("envelope_fields")),
-        record=parse_record(table.get("record")),
     )
