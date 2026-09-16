@@ -618,7 +618,7 @@ def parse_config(raw_text):
     )
     _collect_unknown_keys(
         "source", source,
-        ({"name", "type", "location", "discovery", "document"}
+        ({"name", "type", "discovery", "document"}
          if source.get("type") == "s3_json"
          else {"name", "type", "database", "schema"}),
         problems,

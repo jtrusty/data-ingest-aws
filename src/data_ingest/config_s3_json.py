@@ -297,10 +297,15 @@ def _validate_start(value):
 
 
 def parse_source_s3(source):
-    """Source-level wiring shared by every table: location, discovery, document."""
+    """
+    Source-level wiring shared by every table: discovery and document.
+
+    Location is NOT here. One S3 path holds one kind of JSON, so a path is a
+    table -- `tables:` is the list of paths a producer publishes, each with
+    its own location, start date, and checkpoint. What a source shares is
+    how those files are found and decoded.
+    """
     return {
-        "location": parse_location(source.get("location"), "source.location")
-        if source.get("location") else None,
         "discovery": parse_discovery(source.get("discovery")),
         "document": parse_document(source.get("document")),
     }
@@ -308,13 +313,14 @@ def parse_source_s3(source):
 
 def build_table_config(table, source_s3):
     """Combine source-level wiring with one table's own settings."""
-    location = table.get("location")
-    location = parse_location(location, "location") if location else source_s3["location"]
-    if not location:
-        raise ConfigurationError("source.location is required for s3_json")
+    if not table.get("location"):
+        raise ConfigurationError(
+            f"tables[{table.get('name', '?')}].location is required: one S3 path is one table"
+        )
+    location = parse_location(table["location"], f"tables[{table.get('name', '?')}].location")
     start_at = table.get("start_at")
     if not start_at:
-        raise ConfigurationError("start_at is required")
+        raise ConfigurationError(f"tables[{table.get('name', '?')}].start_at is required")
     _validate_start(start_at)
     return S3JsonConfig(
         location=location,

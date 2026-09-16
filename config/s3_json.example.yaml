@@ -4,7 +4,6 @@
 source:
   name: par_pos          # the producer      -> source_key par_pos_s3_json
   type: s3_json          # the adapter
-  location: s3://pos-events/orders   # ends immediately BEFORE the path_format
 
   # How files are found. ".json.gz" names a compression, not a format, so the
   # layout is configuration rather than a property of the adapter.
@@ -56,8 +55,12 @@ defaults:
   fetch_size: 250
   fail_fast: true
 
+# One S3 path holds one kind of JSON, so a path IS a table. Each entry is a
+# path the producer publishes, with its own start date and its own checkpoint;
+# a second feed (timecards, refunds) is a second entry, not a second source.
 tables:
   - name: orders
+    location: s3://pos-events/orders   # ends immediately BEFORE the path_format
     # Inclusive first-load boundary in upload time. Quote to keep a string.
     # Set to the earliest upload to ingest; existing checkpoints take precedence.
     start_at: "2026-09-01T00:00:00Z"

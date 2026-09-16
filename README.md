@@ -441,7 +441,6 @@ small allowlist:
 source:
   name: par_pos                      # the producer
   type: s3_json                      # the adapter
-  location: s3://pos-events/orders   # inherited by every table
 
   discovery:                         # how files are found
     path_format: "%Y/%m/%d/%H"
@@ -460,10 +459,20 @@ source:
 
 tables:
   - name: orders
+    location: s3://pos-events/orders # one path is one table
     start_at: "2026-09-01T00:00:00Z"
     envelope_fields:                 # producer extensions -> columns
       group_id: groupid
 ```
+
+**A path is a table.** One S3 path holds one kind of JSON, so `tables:` is
+the list of paths a producer publishes, each with its own `location`, start
+date, and checkpoint. A second feed -- timecards, refunds -- is a second
+entry under the same source, not a second source: same `source_key`, same
+config file, same pair of Glue jobs, landing at `.../par_pos_s3_json/orders/`
+and `.../par_pos_s3_json/timecards/`, Bronze at `bronze_par_pos.orders` and
+`bronze_par_pos.timecards`. What the source level holds is what those paths
+share: how files are found and how they decode.
 
 Notice what is **not** there: nothing says which payload field identifies an
 order or which one versions it. Bronze's contract ends at "I received this

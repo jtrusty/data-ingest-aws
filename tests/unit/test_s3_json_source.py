@@ -44,7 +44,7 @@ def config(**settings):
     document = {'preset': 'cloudevents'}
     table = {'name': 'orders', 'start_at': '2026-09-10T09:00:00Z',
              'envelope_fields': dict(ENVELOPE_FIELDS)}
-    location = settings.pop('location', 's3://pos/orders')
+    table['location'] = settings.pop('location', 's3://pos/orders')
     payload = settings.pop('payload', None)
     for key, value in settings.items():
         target = discovery if key in _DISCOVERY_KEYS else (
@@ -52,8 +52,7 @@ def config(**settings):
         target[key] = value
     if payload:
         document['payload'] = payload
-    source_s3 = parse_source_s3(
-        {'location': location, 'discovery': discovery, 'document': document})
+    source_s3 = parse_source_s3({'discovery': discovery, 'document': document})
     return build_table_config(table, source_s3)
 
 

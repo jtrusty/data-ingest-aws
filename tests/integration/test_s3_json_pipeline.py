@@ -50,13 +50,13 @@ def env():
         config_text = yaml.safe_dump({
             "source": {
                 "name": "par_pos", "type": "s3_json",
-                "location": f"s3://{RAW_BUCKET}/orders",
                 "document": {"preset": "cloudevents"},
             },
             "landing": {"location": f"s3://{LANDING_BUCKET}/landing",
                         "checkpoint_table": STATE_TABLE},
             "tables": [{
                 "name": "orders",
+                "location": f"s3://{RAW_BUCKET}/orders",
                 "start_at": (now - timedelta(hours=1)).isoformat(),
                 "envelope_fields": {"business_date": "businessdate"},
             }],

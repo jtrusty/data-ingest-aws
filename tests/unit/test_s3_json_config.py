@@ -12,10 +12,10 @@ CONFIG = {
     "source": {
         "name": "par_pos",
         "type": "s3_json",
-        "location": "s3://pos-events/orders/",
         "document": {"preset": "cloudevents"},
     },
-    "tables": [{"name": "orders", "start_at": "2026-09-01T00:00:00Z"}],
+    "tables": [{"name": "orders", "location": "s3://pos-events/orders/",
+                "start_at": "2026-09-01T00:00:00Z"}],
 }
 
 
@@ -188,31 +188,38 @@ def test_business_identity_is_not_ingestion_config():
 
 # --- location and wiring --------------------------------------------------
 
-def test_location_is_inherited_from_the_source():
-    assert table().s3.location == "s3://pos-events/orders"
-
-
-def test_a_table_may_override_the_source_location():
-    assert table(location="s3://pos-events/payments/").s3.location == "s3://pos-events/payments"
-
-
-def test_location_missing_everywhere_names_the_source_key():
+def test_each_table_is_one_path():
+    # One S3 path holds one kind of JSON, so a second feed is a second table
+    # under the same source, each with its own location and checkpoint.
     data = deepcopy(CONFIG)
-    del data["source"]["location"]
-    with pytest.raises(ConfigurationError, match="source.location is required"):
+    data["tables"].append({"name": "timecards", "location": "s3://pos-events/timecards",
+                           "start_at": "2026-09-10T00:00:00Z"})
+    config = parse(data)
+    assert [t.s3.location for t in config.tables] == [
+        "s3://pos-events/orders", "s3://pos-events/timecards"]
+    assert config.source_key == "par_pos_s3_json"       # one source, one key
+
+
+def test_location_is_required_per_table_not_inherited():
+    data = deepcopy(CONFIG)
+    del data["tables"][0]["location"]
+    with pytest.raises(ConfigurationError, match=r"tables\[orders\].location is required"):
+        parse(data)
+    data["source"]["location"] = "s3://pos-events/orders"   # not a source setting
+    with pytest.raises(ConfigurationError, match="location"):
         parse(data)
 
 
 @pytest.mark.parametrize("location", ["https://bucket/orders", "s3://", 12])
 def test_invalid_location_rejected(location):
     with pytest.raises(ConfigurationError, match="location"):
-        source(location=location)
+        table(location=location)
 
 
 def test_start_at_is_required_per_table():
     data = deepcopy(CONFIG)
     del data["tables"][0]["start_at"]
-    with pytest.raises(ConfigurationError, match="start_at"):
+    with pytest.raises(ConfigurationError, match=r"tables\[orders\].start_at is required"):
         parse(data)
 
 
