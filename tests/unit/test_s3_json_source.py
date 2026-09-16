@@ -346,35 +346,51 @@ def test_constructor_rejects_invalid_integer_settings(setting, value):
         S3JsonSource(config(), s3_client=Mock(), **{setting: value})
 
 
-def test_prefetch_preserves_listing_order_and_bounds_in_flight_reads(monkeypatch):
+def test_prefetch_preserves_listing_order_and_bounds_in_flight_reads():
     """
     Reads run ahead on a pool; decode stays sequential. Rows must come out in
     listing order regardless of which GET finishes first, and no more than
     `prefetch` bodies may be in flight, or a backfill's memory grows with the
     listing rather than with the depth.
+
+    Deterministic, not sleep-based: every GET blocks on a gate until the
+    test has seen `prefetch` of them arrive, which proves the depth is
+    reached, then releases them in REVERSE listing order, which proves the
+    output order does not come from completion order.
     """
     import threading
-    source, client, _, obj = setup_source(prefetch=3)
+    depth = 3
+    source, client, _, obj = setup_source(prefetch=depth)
     keys = [f'orders/2026/09/10/09/{i:02d}.json.gz' for i in range(10)]
     client.get_paginator.return_value.paginate.side_effect = (
         lambda **kw: [{'Contents': [dict(obj, Key=k) for k in keys]}] if kw['Prefix'].endswith('/09/') else [{}])
-    in_flight, peak, lock = [0], [0], threading.Lock()
 
-    def slow_get(**kw):
+    lock = threading.Lock()
+    arrived, gates, peak, in_flight = [], {}, [0], [0]
+
+    def get(**kw):
+        gate = threading.Event()
         with lock:
             in_flight[0] += 1
             peak[0] = max(peak[0], in_flight[0])
-        # Later keys finish FIRST, so ordering cannot come from completion order.
-        import time
-        time.sleep(0.01 * (10 - int(kw['Key'][-10:-8])))
+            arrived.append(kw['Key'])
+            gates[kw['Key']] = gate
+            # Once the pool is full -- or nothing more can arrive -- release
+            # the batch LAST-listed first.
+            if len(gates) == depth or len(arrived) == len(keys):
+                for key in sorted(gates, reverse=True):
+                    gates[key].set()
+        gate.wait(timeout=5)
         with lock:
             in_flight[0] -= 1
+            gates.pop(kw['Key'], None)
         return {'Body': io.BytesIO(gzip.compress(json.dumps(packed()).encode()))}
 
-    client.get_object.side_effect = slow_get
+    client.get_object.side_effect = get
     frames = list(source.extract(None, source.get_current_checkpoint()))
     assert [k for f in frames for k in f['_s3_key']] == keys
-    assert peak[0] <= 3
+    assert peak[0] == depth
+    assert len(arrived) == len(keys)
 
 
 def test_a_failed_read_is_reported_with_its_key_and_stops_the_run():
