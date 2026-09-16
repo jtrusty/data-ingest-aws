@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.2.0...v1.3.0) (2026-09-16)
+
+
+### Features
+
+* **s3_json:** declarative ingestion of time-partitioned JSON in S3 ([4f73b69](https://github.com/jtrusty/data-ingest-aws/commit/4f73b698c9f55077218a74c0f7728c2055a70314))
+
 ## [1.2.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.1.0...v1.2.0) (2026-08-25)
 
 
