@@ -31,7 +31,7 @@ from data_ingest.checkpoints.watermark import WatermarkCheckpoint
 from data_ingest.config import split_s3_uri
 from data_ingest.exceptions import ConfigurationError, ExtractionError
 from data_ingest.sources.base import Source
-from data_ingest.sources.json_decode import decode_records, dumps_json
+from data_ingest.sources.json_decode import _at_path, decode_records, dumps_json
 
 _WATERMARK = '_s3_last_modified'
 _BATCH_BYTES = 16 * 1024 * 1024
@@ -96,15 +96,6 @@ def _row_bytes(row):
         if isinstance(value, str):
             total += len(value) if value.isascii() else len(value.encode('utf-8'))
     return total
-
-
-def _at_path(payload, path):
-    current = payload
-    for part in path.split('.'):
-        if not isinstance(current, dict):
-            return None
-        current = current.get(part)
-    return current
 
 
 class S3JsonSource(Source):
@@ -260,7 +251,11 @@ class S3JsonSource(Source):
             _WATERMARK: _utc(item['LastModified']).replace(tzinfo=None),
             **{column: _value(_at_path(envelope, path), path)
                for column, path in self._envelope_columns},
-            'envelope_json': dumps_json(envelope), 'payload_json': payload_json,
+            # With no payload path the record IS the payload, and the decoder
+            # already serialized it once; dumps_json is a pure-Python walk, so
+            # don't pay for a byte-identical second copy.
+            'envelope_json': payload_json if envelope is payload else dumps_json(envelope),
+            'payload_json': payload_json,
         }
 
     def _prefetched(self, items):

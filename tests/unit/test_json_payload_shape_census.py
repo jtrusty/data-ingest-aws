@@ -87,7 +87,7 @@ def _envelope(payload, oid="12345678901234"):
 
 def test_a_feed_the_adapter_handles_is_reported_as_such(capsys):
     out = _run([_envelope({"id": 12345678901234, "version": 1})], capsys)
-    assert "adapter as written handles this feed: YES" in out
+    assert "one document: block can describe this feed: YES" in out
     assert "Silver identity path: $.id" in out
 
 
@@ -99,18 +99,21 @@ def test_nested_order_is_reported_as_the_path_to_configure(capsys):
     assert "{'order': ...}" in out
 
 
-def test_inline_data_dict_is_flagged_as_unsupported(capsys):
+def test_inline_data_dict_is_reported_and_describable(capsys):
+    # CloudEvents `data` is a first-class carrier (preset cloudevents_plain),
+    # so the verdict must say so -- it used to contradict its own emit block.
     out = _run([{"id": "guid:1", "data": {"id": 1, "version": 1}}], capsys)
     assert "data (inline dict)" in out
-    assert "adapter as written handles this feed: NO" in out
+    assert "one document: block can describe this feed: YES" in out
 
 
-def test_uncompressed_payload_is_flagged_as_unsupported(capsys):
+def test_uncompressed_base64_payload_is_describable_with_compression_none(capsys):
     envelope = {"id": "guid:1",
                 "data_base64": base64.b64encode(json.dumps({"id": 1}).encode()).decode()}
-    out = _run([envelope], capsys)
+    out = _run([envelope], capsys, argv_extra=("--emit-config",))
     assert "NONE (plain json)" in out
-    assert "adapter as written handles this feed: NO" in out
+    assert "compression: none" in out
+    assert "one document: block can describe this feed: YES" in out
 
 
 def test_conflicting_id_paths_raise_a_warning(capsys):
@@ -138,7 +141,7 @@ def test_a_broken_object_is_counted_not_fatal(capsys):
 def test_glue_injected_arguments_are_ignored(capsys):
     out = _run([_envelope({"id": 1})], capsys,
                argv_extra=("--job-name", "census", "--scriptLocation", "s3://x/y.py"))
-    assert "adapter as written handles this feed" in out
+    assert "one document: block can describe this feed" in out
 
 
 def test_emit_config_matches_the_par_wire_format(capsys):
@@ -169,3 +172,27 @@ def test_emit_config_warns_on_mixed_payload_compression(capsys):
              "data_base64": base64.b64encode(json.dumps({"id": 2}).encode()).decode()}
     out = _run([_envelope({"id": 1}), plain], capsys, argv_extra=("--emit-config",))
     assert "WARNING: payloads are not uniformly compressed" in out
+
+
+def test_an_inline_data_feed_is_describable_by_the_cloudevents_plain_preset(capsys):
+    # The verdict must agree with the block --emit-config prints: it used to
+    # say NO for a feed it had just written a valid preset for.
+    out = _run([{"id": "guid:1", "data": {"id": 1}}], capsys, argv_extra=("--emit-config",))
+    assert "preset: cloudevents_plain" in out
+    assert "one document: block can describe this feed: YES" in out
+
+
+def test_the_sample_walks_the_configured_layout_and_timezone(capsys):
+    from unittest.mock import Mock, patch
+    s3 = Mock()
+    s3.list_objects_v2.return_value = {"Contents": []}
+    with patch.object(census.sys, "argv", ["census", "--uri", "s3://pos/orders", "--sample", "2",
+                                           "--hours-back", "1", "--tz", "America/Chicago",
+                                           "--path-format", "year=%Y/month=%m/day=%d/hour=%H",
+                                           "--suffix", ".jsonl.gz"]), \
+         patch.object(census.boto3, "client", return_value=s3):
+        with pytest.raises(SystemExit) as stop:
+            census.main()
+    assert ".jsonl.gz" in str(stop.value)
+    probed = s3.list_objects_v2.call_args.kwargs["Prefix"]
+    assert probed.startswith("orders/year=") and "/hour=" in probed

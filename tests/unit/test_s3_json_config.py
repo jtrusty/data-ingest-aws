@@ -260,3 +260,21 @@ def test_example_is_a_valid_bronze_enabled_config():
         "group_id": "groupid", "business_date": "businessdate",
         "historical_data_type": "historicaldatatype",
     }
+
+
+def test_reserved_columns_include_everything_the_landing_writer_stamps():
+    """
+    The writer refuses a batch carrying one of its lineage columns, so a
+    config naming one would pass parsing and then fail on EVERY run. The
+    parser mirrors the list rather than importing it (landing.py pulls
+    pyarrow at import, and this module is on Bronze's light path); this pins
+    the mirror to the real thing.
+    """
+    from data_ingest.config_s3_json import _LANDING_LINEAGE_COLUMNS, _RESERVED_COLUMNS
+    from data_ingest.landing import LINEAGE_COLUMNS
+
+    assert set(_LANDING_LINEAGE_COLUMNS) == set(LINEAGE_COLUMNS)
+    assert set(LINEAGE_COLUMNS) <= _RESERVED_COLUMNS
+    for column in LINEAGE_COLUMNS:
+        with pytest.raises(ConfigurationError, match="reserved"):
+            table(envelope_fields={column: "groupid"})

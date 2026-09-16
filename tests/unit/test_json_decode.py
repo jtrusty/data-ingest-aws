@@ -166,3 +166,60 @@ def test_corrupt_base64_still_raises_rather_than_decoding_short():
     with pytest.raises(ExtractionError, match="Invalid base64 at data_base64"):
         list(decode_records(outer, document=document(
             max_outer_bytes=1 << 20, max_payload_bytes=1 << 20)))
+
+
+# --- review findings ---------------------------------------------------------
+
+@pytest.mark.parametrize("value", [5, -1, 1.5, True, 100_000_000_000_000])
+def test_a_scalar_at_an_unencoded_payload_path_is_refused_not_coerced(value):
+    """
+    bytes(5) is five NUL bytes, bytes(-1) is ValueError, and bytes(10**14)
+    is an attempted 100 TB allocation. None of those is a payload; the
+    adapter must refuse it as not-an-object before bytes() is ever reached.
+    """
+    outer = gzip.compress(json.dumps({"id": "e", "data": value}).encode())
+    doc = parse_document({"preset": "cloudevents_plain"})
+    with pytest.raises(ExtractionError, match="must be an object"):
+        list(decode_records(outer, document=doc))
+
+
+@pytest.mark.parametrize("value", [5, -1, 100_000_000_000_000, {"not": "bytes"}])
+def test_a_non_string_at_a_compressed_payload_path_is_refused_before_bytes(value):
+    # encoding none + compression gzip: the value must already be a string
+    # of compressed bytes. Anything else used to reach bytes(value).
+    outer = gzip.compress(json.dumps({"id": "e", "data": value}).encode())
+    doc = parse_document({"payload": {"path": "data", "encoding": "none", "compression": "gzip"}})
+    with pytest.raises(ExtractionError, match="Payload at data must be a string"):
+        list(decode_records(outer, document=doc))
+
+
+def test_an_inline_array_payload_is_rejected_exactly_like_an_encoded_one():
+    # payload_json's shape must depend on content, never on which wire
+    # encoding carried it -- Silver reads $.id and would get NULL from an
+    # array, with nothing failing anywhere.
+    inline = gzip.compress(json.dumps({"id": "e", "data": [{"id": 1}]}).encode())
+    with pytest.raises(ExtractionError, match="must be an object"):
+        list(decode_records(inline, document=parse_document({"preset": "cloudevents_plain"})))
+    encoded = gzip.compress(json.dumps(envelope(b'[{"id": 1}]')).encode())
+    with pytest.raises(ExtractionError, match="must be an object"):
+        list(decode_records(encoded, document=parse_document({"preset": "cloudevents"})))
+
+
+def test_an_inline_payload_is_held_to_the_size_limit_too():
+    big = {"id": "e", "data": {"blob": "x" * 200}}
+    outer = gzip.compress(json.dumps(big).encode())
+    doc = parse_document({"preset": "cloudevents_plain", "max_payload_bytes": 100})
+    with pytest.raises(ExtractionError, match="limit"):
+        list(decode_records(outer, document=doc))
+
+
+def test_jsonl_splits_only_on_newline():
+    # U+2028 is a legal unescaped character inside a JSON string, and
+    # json.dumps(ensure_ascii=False) emits it literally. str.splitlines()
+    # would cut the record in two.
+    line1 = json.dumps({"a": "x\u2028y"}, ensure_ascii=False)
+    line2 = json.dumps({"a": "z"})
+    outer = gzip.compress((line1 + "\r\n" + line2 + "\n").encode("utf-8"))
+    doc = parse_document({"preset": "records", "records": "jsonl"})
+    payloads = [p for _, p, _ in decode_records(outer, document=doc)]
+    assert payloads == [{"a": "x\u2028y"}, {"a": "z"}]

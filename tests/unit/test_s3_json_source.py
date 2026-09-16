@@ -417,3 +417,18 @@ def test_zero_lookahead_walks_only_to_high():
     source, _, _, _ = setup_source(lookahead_hours=0)
     assert list(source._prefixes(instant('2026-09-10T09:00:00'), instant('2026-09-10T09:30:00'))) == [
         'orders/2026/09/10/09/']
+
+
+def test_records_preset_serializes_each_record_once():
+    # With no payload path the record is the payload. The decoder already
+    # produced its text; dumps_json is a pure-Python walk, so the row must
+    # reuse it rather than build a byte-identical second copy.
+    from unittest.mock import patch
+    import data_ingest.sources.s3_json as module
+    source, client, _, _ = setup_source(preset='records')
+    client.get_object.return_value = {
+        'Body': io.BytesIO(gzip.compress(b'[{"id": 1}, {"id": 2}]')), 'ContentLength': 30}
+    with patch.object(module, 'dumps_json', wraps=module.dumps_json) as spy:
+        frame = list(source.extract(None, source.get_current_checkpoint()))[0]
+    assert list(frame['envelope_json']) == list(frame['payload_json']) == ['{"id":1}', '{"id":2}']
+    assert spy.call_count == 0          # the decoder did it; the row did not repeat it

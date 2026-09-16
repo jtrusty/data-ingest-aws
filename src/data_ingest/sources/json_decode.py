@@ -65,9 +65,11 @@ def _utf8(raw: bytes, label: str) -> str:
 
 
 def _jsonl(text: str):
-    # One complete object per nonempty line. A malformed multiline object
-    # still fails, because each line is parsed on its own.
-    lines = tuple(line for line in text.splitlines() if line.strip())
+    # One complete object per nonempty line. Split on '\n' only: JSONL is
+    # newline-delimited, and str.splitlines() would also break on U+2028,
+    # U+2029, NEL and friends, which are legal unescaped inside a JSON string.
+    # A malformed multiline object still fails, since each line parses alone.
+    lines = tuple(line for line in (raw.rstrip("\r") for raw in text.split("\n")) if line.strip())
     if not lines:
         raise ExtractionError("Empty outer JSON document")
     try:
@@ -141,11 +143,25 @@ def _payload(record, payload_config, limit):
 
     # CloudEvents allows `data` (already-parsed JSON) as the alternative to
     # `data_base64`, so an uncompressed, unencoded path may land here as a
-    # dict the outer parse already produced. Re-serializing it keeps
-    # payload_json exact, Decimals included.
+    # value the outer parse already produced. It gets the same checks as a
+    # decoded payload -- an object, within the size limit -- so payload_json's
+    # shape depends on the content, never on which wire encoding carried it.
     if payload_config.encoding == "none" and payload_config.compression == "none" \
-            and isinstance(raw, (dict, list)):
-        return raw, dumps_json(raw)
+            and not isinstance(raw, (str, bytes, bytearray)):
+        if not isinstance(raw, dict):
+            raise ExtractionError("Decoded payload JSON must be an object")
+        text = dumps_json(raw)
+        if len(text) > limit:
+            raise ExtractionError("payload decompressed size exceeds configured limit")
+        return raw, text
+
+    if not isinstance(raw, (str, bytes, bytearray)):
+        # bytes(5) is five NUL bytes and bytes(10**14) is an attempted 100 TB
+        # allocation; neither is a payload. Refuse before touching it.
+        raise ExtractionError(
+            f"Payload at {path} must be a string (or an object when unencoded), "
+            f"not {type(raw).__name__}"
+        )
 
     raw = _decode_encoding(raw, payload_config.encoding, path)
     if payload_config.compression != "none":

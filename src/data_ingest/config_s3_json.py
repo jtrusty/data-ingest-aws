@@ -72,12 +72,22 @@ _ENVELOPES = ("none", "cloudevents")
 _DISCOVERY_TYPES = ("time_partitioned",)
 
 _COLUMN = re.compile(r"[a-z_][a-z0-9_]*")
+# The landing writer stamps these on every row and refuses a batch that
+# already carries one. Mirrored here rather than imported: landing.py pulls
+# pandas and pyarrow at import, and this module is on the Bronze job's path,
+# which must stay light. A test pins the two lists to each other.
+_LANDING_LINEAGE_COLUMNS = (
+    "_ingest_run_id", "_ingested_at", "_source_system",
+    "_source_database", "_source_schema", "_source_table",
+)
 # Landed for every row; a configured column colliding with one of these would
-# be silently overwritten by the adapter.
+# be silently overwritten by the adapter, or rejected by the writer on every
+# run -- either way, refuse it at parse time.
 _RESERVED_COLUMNS = frozenset({
     "_source_record_id", "_s3_bucket", "_s3_key", "_s3_etag", "_s3_record_index",
     "_s3_last_modified", "envelope_json", "payload_json",
     *(column for column, _ in _CLOUDEVENTS_CORE),
+    *_LANDING_LINEAGE_COLUMNS,
 })
 
 

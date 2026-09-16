@@ -43,34 +43,58 @@ def parse_uri(uri):
 
 def hour_prefixes(prefix, path_format, tz, first, last):
     """
-    (prefix, folder_hour_utc) for every hour in the range.
+    (prefix, (first_utc, last_utc)) for every distinct prefix in the range.
 
     Listing hour by hour rather than parsing the hour back out of each key is
     what makes this work for ANY discovery.path_format: rendering forward is
-    well defined, inverting a strftime pattern is not. It costs one list call
-    per hour, which at a couple of weeks is a few hundred calls.
+    well defined, inverting a strftime pattern is not.
+
+    Steps on the UTC timeline and renders in the folder timezone, exactly as
+    the adapter does. A DST fall-back renders two UTC hours to one prefix;
+    that prefix is listed once but SPANS both instants, because the adapter
+    walks it whenever either UTC hour is in range. Keying it to the first
+    instant alone would report objects from the second hour as missed.
     """
-    hour = datetime(first.year, first.month, first.day, tzinfo=tz)
-    end = datetime(last.year, last.month, last.day, 23, tzinfo=tz)
-    while hour <= end:
-        rendered = hour.strftime(path_format)
+    cursor = datetime(first.year, first.month, first.day, tzinfo=tz).astimezone(timezone.utc)
+    end = datetime(last.year, last.month, last.day, 23, tzinfo=tz).astimezone(timezone.utc)
+    spans = {}
+    order = []
+    while cursor <= end:
+        rendered = cursor.astimezone(tz).strftime(path_format)
         if not rendered.endswith("/"):
             rendered += "/"
-        yield (f"{prefix}/{rendered}" if prefix else rendered), hour.astimezone(timezone.utc)
-        hour += timedelta(hours=1)
+        full = f"{prefix}/{rendered}" if prefix else rendered
+        if full not in spans:
+            spans[full] = [cursor, cursor]
+            order.append(full)
+        else:
+            spans[full][1] = cursor
+        cursor += timedelta(hours=1)
+    for full in order:
+        yield full, tuple(spans[full])
+
+
+def _span(folder):
+    """Accept a bare instant (tests, single hours) or a (first, last) span."""
+    return folder if isinstance(folder, tuple) else (folder, folder)
+
+
+def folder_end(folder):
+    """The instant this folder's hour(s) close: the last instant plus one."""
+    return _span(folder)[1] + timedelta(hours=1)
 
 
 def list_objects(s3, bucket, prefix, first, last, tz, path_format, suffix):
-    """(key, folder_hour_start_utc, last_modified_utc) for every matching object."""
+    """(key, folder_span_utc, last_modified_utc) for every matching object."""
     paginator = s3.get_paginator("list_objects_v2")
     skipped = Counter()
-    for hour_prefix, folder in hour_prefixes(prefix, path_format, tz, first, last):
+    for hour_prefix, span in hour_prefixes(prefix, path_format, tz, first, last):
         for page in paginator.paginate(Bucket=bucket, Prefix=hour_prefix):
             for item in page.get("Contents", []):
                 if not item["Key"].endswith(suffix):
                     skipped[f"not {suffix}"] += 1
                     continue
-                yield item["Key"], folder, item["LastModified"].astimezone(timezone.utc)
+                yield item["Key"], span, item["LastModified"].astimezone(timezone.utc)
     if skipped:
         print("skipped:", dict(skipped))
 
@@ -99,8 +123,10 @@ def simulate(objects, start, interval, lookback, safety, lookahead=timedelta(hou
                 minute=0, second=0, microsecond=0)
             last_hour = high + lookahead
             for key, folder, lm in objects:
+                span_first, span_last = _span(folder)
+                walked = span_first <= last_hour and span_last >= first_hour
                 in_window = (low <= lm <= high) if first_run else (low < lm <= high)
-                if key not in found and first_hour <= folder <= last_hour and in_window:
+                if key not in found and walked and in_window:
                     found.add(key)
             checkpoint, first_run = high, False
         now += interval
@@ -143,8 +169,8 @@ def main():
 
     # Lateness = how long after its folder hour ENDED the object was written.
     # <= 0 means it landed inside its own hour, which is the contract.
-    late = [(lm - (folder + timedelta(hours=1)), key, folder, lm) for key, folder, lm in objects]
-    early = sum(1 for lm_delta, _, folder, lm in late if lm < folder)
+    late = [(lm - folder_end(folder), key, folder, lm) for key, folder, lm in objects]
+    early = sum(1 for _, _, folder, lm in late if lm < _span(folder)[0])
     buckets = Counter()
     for delta, *_ in late:
         m = delta.total_seconds() / 60
@@ -157,7 +183,7 @@ def main():
             ">24h late"
         ] += 1
 
-    per_hour = Counter(folder for _, folder, _ in objects)
+    per_hour = Counter(_span(folder)[0] for _, folder, _ in objects)
     print(f"\n{len(objects)} objects across {len(per_hour)} folder-hours; "
           f"min/mean/max per hour = {min(per_hour.values())}/"
           f"{sum(per_hour.values()) // len(per_hour)}/{max(per_hour.values())}")
@@ -178,7 +204,7 @@ def main():
     print(f"  found  {len(found)}")
     print(f"  MISSED {len(missed)}")
     for delta, key, folder, lm in sorted(missed, reverse=True)[: args.show]:
-        print(f"    {delta}  folder={folder:%Y-%m-%d %H}  modified={lm:%Y-%m-%d %H:%M:%S}  {key}")
+        print(f"    {delta}  folder={_span(folder)[0]:%Y-%m-%d %H}  modified={lm:%Y-%m-%d %H:%M:%S}  {key}")
     if len(missed) > args.show:
         print(f"    ... and {len(missed) - args.show} more")
 

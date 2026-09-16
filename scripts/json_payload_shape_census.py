@@ -30,6 +30,7 @@ import sys
 import zlib
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import boto3
 
@@ -173,6 +174,10 @@ def main():
     ap.add_argument("--sample", type=int, default=50, help="objects to download (default 50)")
     ap.add_argument("--hours-back", type=int, default=6, help="spread the sample over the last N hours (default 6)")
     ap.add_argument("--show-keys", type=int, default=30, help="top-level payload keys to list (default 30)")
+    ap.add_argument("--tz", default="UTC", help="discovery.timezone (default UTC)")
+    ap.add_argument("--path-format", default="%Y/%m/%d/%H",
+                    help="discovery.path_format (default %%Y/%%m/%%d/%%H)")
+    ap.add_argument("--suffix", default=".json.gz", help="discovery.suffix (default .json.gz)")
     ap.add_argument("--emit-config", action="store_true",
                     help="print the document:/record: blocks this feed implies, ready to paste")
     args, _unknown = ap.parse_known_args()
@@ -182,17 +187,23 @@ def main():
 
     # Spread the sample across recent hours rather than taking the first N of
     # one prefix: one hour's files can all come from a single publisher run.
+    # Prefixes are rendered from the configured layout, in the configured
+    # timezone, so a feed with local-time folders or a non-default path_format
+    # is sampled from folders that actually exist.
+    tz = ZoneInfo(args.tz)
     now = datetime.now(timezone.utc)
     keys = []
+    per_hour = max(1, args.sample // args.hours_back)
     for back in range(args.hours_back):
-        hour = now - timedelta(hours=back)
-        p = f"{prefix}/{hour:%Y/%m/%d/%H}/" if prefix else f"{hour:%Y/%m/%d/%H}/"
-        per_hour = max(1, args.sample // args.hours_back)
+        rendered = (now - timedelta(hours=back)).astimezone(tz).strftime(args.path_format)
+        if not rendered.endswith("/"):
+            rendered += "/"
+        p = f"{prefix}/{rendered}" if prefix else rendered
         page = s3.list_objects_v2(Bucket=bucket, Prefix=p, MaxKeys=per_hour)
-        keys += [o["Key"] for o in page.get("Contents", []) if o["Key"].endswith(".json.gz")]
+        keys += [o["Key"] for o in page.get("Contents", []) if o["Key"].endswith(args.suffix)]
     keys = keys[: args.sample]
     if not keys:
-        sys.exit(f"no .json.gz objects in the last {args.hours_back}h under s3://{bucket}/{prefix}")
+        sys.exit(f"no {args.suffix} objects in the last {args.hours_back}h under s3://{bucket}/{prefix}")
     print(f"sampling {len(keys)} objects from s3://{bucket}/{prefix}\n")
 
     envelope_field = Counter()
@@ -293,9 +304,18 @@ def main():
                   f"a single dotted path cannot cover all of them")
     else:
         print("  no order id found at any probed path; inspect the payload keys above")
-    strict_ok = (envelope_field.get("data_base64", 0) == records
-                 and set(codec) <= {"gzip"} and set(decoded_type) <= {"dict"})
-    print(f"  adapter as written handles this feed: {'YES' if strict_ok else 'NO -- see divergences above'}")
+    # "Can ONE document: block describe this feed?" -- which is what the
+    # presets above actually accept, not just the original PAR shape. A feed
+    # needs one carrier, one compression family, and object payloads.
+    carriers = {k for k in envelope_field if not k.startswith("  (") and not k.startswith("NEITHER")}
+    codecs = set(codec) - {"n/a (inline)"}
+    one_codec = (codecs <= {"gzip", "zlib"}) or (codecs <= {"NONE (plain json)"}) or not codecs
+    describable = (
+        len(carriers) == 1 and "NEITHER" not in " ".join(envelope_field)
+        and one_codec and set(decoded_type) <= {"dict"}
+    )
+    print(f"  one document: block can describe this feed: "
+          f"{'YES' if describable else 'NO -- see divergences above'}")
 
 
 if __name__ == "__main__":

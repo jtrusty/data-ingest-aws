@@ -123,7 +123,7 @@ def test_hour_prefixes_render_any_configured_path_format():
     assert prefixes[0] == "orders/year=2026/month=09/day=10/hour=00/"
     assert prefixes[-1] == "orders/year=2026/month=09/day=10/hour=23/"
     # The folder hour is known from the prefix that produced it, not guessed.
-    assert rendered[5][1] == datetime(2026, 9, 10, 5, tzinfo=UTC)
+    assert rendered[5][1] == (datetime(2026, 9, 10, 5, tzinfo=UTC),) * 2
 
 
 def test_hour_prefixes_have_no_bucket_prefix_when_the_uri_has_none():
@@ -146,3 +146,32 @@ def test_listing_filters_on_the_configured_suffix():
     found = list(checker.list_objects(
         s3, "bucket", "orders", date(2026, 9, 10), date(2026, 9, 10), UTC, "%Y/%m/%d/%H", ".jsonl.gz"))
     assert [k for k, _, _ in found] == ["orders/2026/09/10/00/a.jsonl.gz"] * 24
+
+
+def test_hour_prefixes_step_in_utc_so_a_dst_fall_back_hour_is_not_skipped():
+    """
+    On 2026-11-01 America/Chicago repeats 01:00 local: 06:00Z and 07:00Z
+    both render as .../01/. Stepping a local clock by an hour never lands on
+    07:00Z, so objects written then would be reported MISSED although the
+    adapter -- which steps in UTC -- would ingest them.
+    """
+    from datetime import date
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/Chicago")
+    rendered = dict(checker.hour_prefixes("pos", "%Y/%m/%d/%H", tz, date(2026, 11, 1), date(2026, 11, 1)))
+    # The repeated local hour is one prefix spanning BOTH UTC instants.
+    assert rendered["pos/2026/11/01/01/"] == (
+        datetime(2026, 11, 1, 6, tzinfo=UTC), datetime(2026, 11, 1, 7, tzinfo=UTC))
+    assert rendered["pos/2026/11/01/02/"] == (
+        datetime(2026, 11, 1, 8, tzinfo=UTC), datetime(2026, 11, 1, 8, tzinfo=UTC))
+    # 25 UTC hours in that local day, 24 distinct prefixes.
+    assert len(rendered) == 24
+
+    # And the simulation agrees: objects across the whole repeated hour are found.
+    span = rendered["pos/2026/11/01/01/"]
+    objects = [(f"k{i}", span,
+                datetime(2026, 11, 1, 6, 0, tzinfo=UTC) + timedelta(minutes=10 * i)) for i in range(12)]
+    found = checker.simulate(objects, datetime(2026, 11, 1, 5, tzinfo=UTC),
+                             timedelta(minutes=15), timedelta(minutes=15), timedelta(seconds=120))
+    assert len(found) == 12
