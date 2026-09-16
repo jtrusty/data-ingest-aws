@@ -643,7 +643,7 @@ reconciliation or durable S3 event queue. Changing `start_at` alone does
 not rewind an existing checkpoint.
 
 **This contract was measured, not assumed.** Against the live PAR bucket,
-`scripts/pos_folder_contract_check.py` listed 377,558 objects and replayed
+`scripts/json_folder_contract_check.py` listed 377,558 objects and replayed
 the discovery rule over them at the shipped settings (15-minute schedule,
 15-minute lookback, 120-second safety delay):
 
@@ -837,9 +837,11 @@ gap in the checkpoint. So monitor the things that would show drift:
   compression.
 - **Row counts per business date** against what the POS is expected to emit.
   A sustained shortfall is the symptom of late arrivals being dropped.
-- **Re-run `scripts/pos_folder_contract_check.py` periodically**, and
+- **Re-run `scripts/json_folder_contract_check.py` periodically**, and
   whenever the producer changes anything. It is read-only, needs only
-  `s3:ListBucket`, and answers the question in one pass. If the `> 15m late`
+  `s3:ListBucket`, and answers the question in one pass. Pass the same
+  `--path-format`, `--suffix` and `--tz` the config declares, so it validates
+  the layout actually in use. If the `> 15m late`
   row stops being zero, widen `lookback_minutes` first; if lateness exceeds
   an hour, prefix scanning is no longer the right discovery model and the
   event-driven design becomes worth its complexity.
