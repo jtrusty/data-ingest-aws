@@ -429,94 +429,138 @@ The POS bucket is a **source**, not a landing area. Bronze finds work by
 cannot read that bucket directly. The landing job is what decodes,
 watermarks, and normalizes to Parquet.
 
-### What is generic and what is configured
+### The wire format is declared, not assumed
 
-The adapter carries no vocabulary from any one producer. Discovery, the
-watermark checkpoint, bounded gzip/base64 decoding, `Decimal` preservation,
-record identity, batching, and landing are the same for every feed. What
-differs is a projection, declared per table:
+`.json.gz` names a compression, not a format. After gunzip, nothing tells you
+whether the document is an object, an array or JSONL, whether records carry an
+envelope, where the payload lives, or how it is encoded. Those vary per
+producer, so they are configuration -- four concepts, each with a deliberately
+small allowlist:
 
 ```yaml
 source:
-  name: par_pos
-  type: s3_json
-  location: s3://pos-events/orders   # inherited by every table below
+  name: par_pos                      # the producer
+  type: s3_json                      # the adapter
+  location: s3://pos-events/orders   # inherited by every table
+
+  discovery:                         # how files are found
+    path_format: "%Y/%m/%d/%H"
+    timezone: UTC
+    suffix: ".json.gz"
+
+  document:                          # how a file is opened and framed
+    preset: cloudevents
+    compression: gzip                # the OUTER file
+    records: auto                    # object | array | jsonl | auto
+    payload:                         # where the payload is
+      path: data_base64              # null means the record IS the payload
+      encoding: base64               # none | base64
+      compression: auto              # none | gzip | zlib | auto
+      format: json
 
 tables:
   - name: orders
-    s3:
-      start_at: "2026-09-01T00:00:00Z"
-      envelope_fields:               # producer extensions past CloudEvents core
-        group_id: groupid
-      payload_fields:                # dotted paths into the decoded payload
-        order_id: id
-        order_version: version
+    start_at: "2026-09-01T00:00:00Z"
+    envelope_fields:                 # producer extensions -> columns
+      group_id: groupid
+    record:                          # what the payload MEANS
+      natural_key: [id]
+      version: version
 ```
 
-Three rules make this safe to get wrong:
+A different feed is then a config change rather than a new adapter — JSONL
+with an uncompressed `payload` member, or a plain array of business objects
+with no envelope at all (`preset: records`, where the outer record *is* the
+payload).
 
-- **A projection is never lossy.** `envelope_json` and `payload_json` always
-  retain the complete records, so a field nobody thought to map is still in
-  Bronze and can be extracted later in SQL.
-- **A path that matches nothing lands NULL rather than failing.** Feeds
-  legitimately omit optional fields, and one missing key should not stop a
-  15-minute run.
-- **Column names are validated**, and reserved ones are refused. Athena
-  lowercases identifiers and Iceberg then matches case-sensitively, so
-  `Order_Id` is rejected rather than silently becoming a second column.
+**Presets name wire formats that already have names.** `cloudevents` expands
+to the payload block above; `cloudevents_plain` uses the spec's `data`
+alternative to `data_base64`; `records` means no envelope. A preset only
+supplies defaults, so a feed that is CloudEvents apart from one detail keeps
+the shorthand and overrides the one key.
 
-Config order fixes column order, so the Parquet schema is stable across runs.
+**CloudEvents is a preset, not an assumption.** The core attributes
+(`event_type`, `event_id`, `event_time`, …) become columns only when the
+document declares them — a generic JSON reader has no business manufacturing
+`event_*` columns for a feed that is not CloudEvents.
 
-**Nested values are projected, not refused.** An object or array lands as
-exact JSON text in its column, so line items and sub-objects can be mapped
-like anything else and stay queryable:
+`path_format` is validated to resolve to a **distinct prefix per hour**. The
+walk steps hourly, so a format without an hour directive would list one prefix
+over and over and never list the hours in between. That is silent data loss,
+so it is refused at parse time rather than discovered later.
+
+### The payload lands whole
+
+There is one payload column, `payload_json`, holding the decoded document
+exactly as it arrived — full precision, nested structure intact. Envelope
+attributes become columns because they are what you filter and partition on;
+payload fields do not.
+
+```
+group_id, business_date, historical_data_type      <- envelope_fields
+event_id, event_time, ...                          <- preset: cloudevents
+envelope_json, payload_json                        <- retained whole
+_source_record_id, _s3_last_modified, ...          <- lineage
+```
+
+Promoting payload fields to their own columns is a **Silver** decision:
 
 ```sql
--- a scalar inside a projected object
-SELECT json_extract_scalar(totals, '$.net') FROM bronze_par_pos.orders;
+SELECT json_extract_scalar(payload_json, '$.id')  AS order_id,
+       json_extract_scalar(payload_json, '$.version') AS version
+FROM bronze_par_pos.orders;
 
--- explode a projected array in Silver
-SELECT o.order_id, i.sku, i.qty
+-- line items explode from the same column
+SELECT json_extract_scalar(o.payload_json, '$.id') AS order_id, i.sku, i.qty
 FROM bronze_par_pos.orders o
 CROSS JOIN UNNEST(
-  CAST(json_parse(o.line_items) AS ARRAY(ROW(sku VARCHAR, qty INTEGER)))
+  CAST(json_extract(o.payload_json, '$.items') AS ARRAY(ROW(sku VARCHAR, qty INTEGER)))
 ) AS i (sku, qty);
 ```
 
-Every column is a string, deliberately. Bronze **fails a load** when a
-column's type changes between runs, so a feed that sends `42` one day and
-`"42"` the next would stop ingestion outright. Typing belongs in Silver,
-where a wrong cast is fixed with a query rather than by re-landing.
+That is not just simpler config — it is the only shape that is safe here. The
+landing writer pins **one Parquet schema per run, from the first batch**. A
+payload key that first appears midway through a run would not fit it, the
+batch would land with its own schema, the run would be flagged `schema_drift`,
+and a drifted run is one of the things [Bronze
+refuses](#what-bronze-refuses) outright. Auto-exploding payload keys would let
+one optional field — a `voidReason` that only appears on voided orders — strand
+a whole run depending on which 250 records happened to come first.
 
-**Generate the projection rather than writing it by hand:**
+Because `payload_json` is complete, that decision can be revisited whenever
+without re-landing anything.
+
+### Physical identity vs business identity
+
+Two different questions, deliberately answered by different columns:
+
+| | Answers | Where |
+|---|---|---|
+| `_source_record_id` + `_s3_last_modified` | Have I already ingested this published record? | `primary_key` + checkpoint, **pinned** |
+| `record.natural_key` + `record.version` | What entity and revision does it describe? | declared, recorded as lineage |
+
+Bronze deduplicates on the **physical** identity, which is what lets it retain
+every published version of an order. Deduplicating on the business key instead
+would collapse those versions and destroy the history Bronze exists for — so
+`primary_key` is pinned to `[_source_record_id]` and config refuses to change
+it, naming `record.natural_key` as where the business key belongs.
+
+`record` is declarative. It is recorded in the manifest as lineage so a landed
+run can be read back and its logical identity recovered; nothing in ingestion
+enforces it. Collapsing to current state is Silver's job.
+
+### Checking a feed against the config
 
 ```bash
 python scripts/json_payload_shape_census.py --uri s3://<bucket>/<prefix> \
     --sample 50 --emit-config
 ```
 
-It samples real objects and prints a `payload_fields:` block covering every
-key it saw, with `camelCase` folded to `snake_case`, names sanitized to what
-the config layer accepts, and any key present on only some records flagged
-inline. `--min-presence 0.9` omits rare ones.
-
-### Why the projection is not inferred at run time
-
-Exploding whatever keys happen to be present would be less configuration, and
-it breaks on this pipeline's own guarantees. The landing writer pins one
-Parquet schema per run, from the first batch. A key that first appears midway
-through a run does not fit that schema, so the batch lands with its own schema
-and the run is flagged `schema_drift` -- and a drifted run is one of the things
-[Bronze refuses](#what-bronze-refuses) outright. One late-arriving key would
-strand a whole run.
-
-An explicit block avoids that, keeps the column set reviewable in a diff, and
-means new columns arrive through Bronze's additive schema evolution when you
-deliberately extend it. Nothing is lost in the meantime: an unmapped key is
-still in `payload_json`.
-
-**Set the projection before the first run.** Adding a mapping later applies
-only to new rows -- Bronze never revisits what it already inserted.
+Samples real objects and prints the `document:` and `record:` blocks the feed
+implies — which carrier it uses, how payloads are actually compressed, how
+records are framed, and where identity and version really live. It warns when
+a feed **mixes** carriers or compressions, because one config cannot describe
+a feed that does both.
 
 ### Invoking it
 
@@ -652,7 +696,6 @@ Bronze retains these fields:
 | `payload_json` | Full decoded JSON text, unchanged, including nested keys and arrays. |
 | `event_type`, `event_specversion`, `event_source`, `event_id`, `event_time`, `data_content_type` | CloudEvents core attributes, landed for every feed. |
 | configured `envelope_fields` | One string column per entry, for producer extensions past the CloudEvents core. For PAR: `group_id`, `business_date`, `historical_data_type`. |
-| configured `payload_fields` | One string column per entry, read by dotted path from the decoded payload. For PAR: `order_id`, `order_version`, `payload_business_date`. A path absent from a record lands NULL. |
 | `_s3_bucket`, `_s3_key`, `_s3_etag`, `_s3_record_index` | Source object and zero-based record position. |
 | `_source_record_id`, `_s3_last_modified` | Stable replay identity and UTC upload timestamp used by Bronze. |
 
@@ -673,17 +716,18 @@ retained. Order identity is deliberately not part of that match key.
 This producer's parent `id` is not a bare GUID: it is `<guid>:<order_id>`,
 where `order_id` is the 14-digit order number, and the decoded payload
 repeats that number in its own `id`. The example config therefore sets
-`payload_fields: {order_id: id}`, reading the payload copy rather than parsing a prefix
-off the envelope. The full `<guid>:<order_id>` string is still landed
+`record.natural_key: [id]`, naming the payload copy rather than a prefix
+parsed off the envelope. The full `<guid>:<order_id>` string is still landed
 verbatim as `event_id`, so the two can be reconciled in Athena:
 
 ```sql
 SELECT count(*) FROM bronze_par_pos.orders
-WHERE order_id IS NOT NULL AND split_part(event_id, ':', 2) <> order_id;
+WHERE json_extract_scalar(payload_json, '$.id') IS NOT NULL
+  AND split_part(event_id, ':', 2) <> json_extract_scalar(payload_json, '$.id');
 ```
 
 A nonzero count means the envelope and payload disagree about which order a
-record belongs to, and Silver's `PARTITION BY order_id` cannot be trusted
+record belongs to, and the Silver partition on that id cannot be trusted
 until it is explained. The adapter does not enforce the equality itself:
 failing a whole 15-minute run on one mismatched record would stall
 ingestion over something a query can surface without data loss.
@@ -699,17 +743,25 @@ For Silver, confirm the meaning of `version` and the scope of `order_id`.
 SELECT *
 FROM (
   SELECT b.*,
+         json_extract_scalar(payload_json, '$.id')      AS order_id,
+         json_extract_scalar(payload_json, '$.version') AS order_version,
          row_number() OVER (
-           PARTITION BY order_id
-           ORDER BY CAST(order_version AS DECIMAL(38, 0)) DESC,
+           PARTITION BY json_extract_scalar(payload_json, '$.id')
+           ORDER BY CAST(json_extract_scalar(payload_json, '$.version') AS DECIMAL(38, 0)) DESC,
                     _s3_last_modified DESC, _source_record_id DESC
          ) AS version_rank
   FROM bronze_par_pos.orders b
   WHERE historical_data_type = 'order'
-    AND order_id IS NOT NULL AND order_version IS NOT NULL
+    AND json_extract_scalar(payload_json, '$.id') IS NOT NULL
+    AND json_extract_scalar(payload_json, '$.version') IS NOT NULL
 )
 WHERE version_rank = 1;
 ```
+
+The paths come straight from `record.natural_key` and `record.version`, which
+is what those settings are for -- they are recorded in the manifest precisely
+so a Silver view can be written (or generated) from the config rather than
+rediscovered.
 
 This is a query template, not a deployed Silver view. Include restaurant or
 tenant in the partition key if IDs are locally scoped. Confirm integer-only
@@ -717,10 +769,8 @@ versions before using that cast (string sorting would put `"10"` before
 `"2"`). Tiebreakers make selection deterministic; they cannot establish
 business precedence between conflicting payloads with the same revision.
 Monitor missing identity/version values instead of treating this filtered
-query as a complete Silver load. `payload_fields.order_id` is set in the example config
-because changing the mapping later does not update Bronze rows already
-inserted -- the alternative is extracting the key from `payload_json`
-downstream.
+query as a complete Silver load. Identity is extracted from `payload_json` at
+query time, so unlike a landed column it can be corrected without re-landing.
 
 ### POS deployment and sizing
 
