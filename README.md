@@ -543,8 +543,8 @@ quietly matching zero tables:
 | the job script | `run_job(expected_source_type="s3_json_gz")` |
 
 It also fixes identity: `source_key` is `<source.name>_<source.type>`, so
-`name: restaurant` here lands under `landing/s3_json_gz_json_gz/…` and
-keys DynamoDB on `s3_json_gz_json_gz`. Changing the type after a run has
+`name: par_pos` here lands under `landing/par_pos_s3_json_gz/…` and
+keys DynamoDB on `par_pos_s3_json_gz`. Changing the type after a run has
 committed re-partitions landing and orphans the checkpoint -- see
 [Identity](#identity).
 
@@ -1508,10 +1508,10 @@ file, because the `bronze:` section lives beside the `landing:` section.
 
 | | Snowflake source | POS source |
 |---|---|---|
-| Config | `olo_snowflake.yaml` | `s3_json_gz_json_gz.yaml` |
+| Config | `olo_snowflake.yaml` | `par_pos_s3_json_gz.yaml` |
 | Landing job | `landing_load_snowflake.py`, 1 DPU | `landing_load_s3_json_gz.py`, 1 DPU |
 | Bronze job | `bronze_load.py`, 0.0625 DPU | `bronze_load.py`, 0.0625 DPU |
-| `source_key` | `olo_snowflake` | `s3_json_gz_json_gz` |
+| `source_key` | `olo_snowflake` | `par_pos_s3_json_gz` |
 
 Four Glue job definitions, two scripts for landing, one script for Bronze,
 one wheel, two config files.
