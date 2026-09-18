@@ -123,6 +123,13 @@ jobs:
       # `run_job` is asserted separately above; this step is only about the
       # process exit status.
       - name: Interpreter exits cleanly against the frozen Glue stack
+        # The check creates boto3 clients, which is what triggers the
+        # pyarrow-7 shutdown crash it exists to catch. A client needs a
+        # region and credentials to construct; none of these are used.
+        env:
+          AWS_DEFAULT_REGION: us-east-2
+          AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
+          AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         run: |
           python -m venv /tmp/glue-stack
           /tmp/glue-stack/bin/pip install -c constraints-glue.txt "$(ls dist/*.whl)[snowflake]"
