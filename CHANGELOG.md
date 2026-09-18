@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/jtrusty/data-ingest-aws/compare/v1.4.0...v1.4.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **s3_json:** stop the window loop re-reading the clock; warn on runaway empty runs ([a72a218](https://github.com/jtrusty/data-ingest-aws/commit/a72a218b90bfc36de7c609bb02011052c8d85862))
+
 ## [1.4.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.3.2...v1.4.0) (2026-09-16)
 
 
