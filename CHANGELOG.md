@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.2](https://github.com/jtrusty/data-ingest-aws/compare/v1.5.1...v1.5.2) (2026-09-18)
+
+
+### Bug Fixes
+
+* **bronze:** re-assert catalog column types after every merge, not only DDL ([b5c44d6](https://github.com/jtrusty/data-ingest-aws/commit/b5c44d61bb2d0c38eee4054ddddd59eaebcfe20c))
+
 ## [1.5.1](https://github.com/jtrusty/data-ingest-aws/compare/v1.5.0...v1.5.1) (2026-09-18)
 
 

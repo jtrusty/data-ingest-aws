@@ -14,7 +14,7 @@ name, pay for that name.
 """
 
 # x-release-please-version
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 __all__ = ["run_job", "run_table", "run_bronze_job"]
 
