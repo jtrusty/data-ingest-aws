@@ -743,3 +743,98 @@ def test_discovery_warns_when_most_committed_runs_are_empty():
     assert len(runs) == 150
     warned = [c.args for c in log.warning.call_args_list if "EMPTY" in c.args[0]]
     assert warned and warned[0][1:3] == (150, 150)
+
+
+# --------------------------------------------------------------------------
+# Consumer-facing catalog types survive Athena rewriting the catalog
+# --------------------------------------------------------------------------
+
+class AthenaRewritingGlue(FakeGlue):
+    """
+    Models what Athena actually does: every Iceberg commit -- CREATE, ALTER,
+    and MERGE alike -- rewrites the Glue entry's columns from the Iceberg
+    schema. So any consumer-facing type the loader sets is gone after the
+    next merge, unless the loader puts it back.
+    """
+
+    def __init__(self, athena, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.athena = athena
+        self.updates = []
+        self.iceberg_schema = {}
+        athena.on_execute = self._athena_committed
+
+    def _athena_committed(self, sql):
+        # A CREATE learns the Iceberg schema from the statement's columns; a
+        # MERGE (any later commit) rewrites the catalog from that schema.
+        if sql.startswith("CREATE TABLE") and self.athena.bronze_table in sql.split("(")[0]:
+            self.iceberg_schema = dict(self.athena.columns)
+            self.tables[self.athena.bronze_table] = dict(self.iceberg_schema)
+        elif sql.startswith("MERGE INTO"):
+            table = sql.split('"')[1]
+            self.tables[table] = dict(self.iceberg_schema)
+
+    def get_table(self, DatabaseName, Name):
+        out = super().get_table(DatabaseName, Name)
+        out["Table"].update({"Name": Name, "TableType": "EXTERNAL_TABLE", "VersionId": "1",
+                             "Parameters": {"metadata_location": "s3://x/metadata/00001.metadata.json"}})
+        return out
+
+    def update_table(self, DatabaseName, TableInput, **kwargs):
+        self.updates.append(TableInput)
+        self.tables[TableInput["Name"]] = {
+            c["Name"]: c["Type"] for c in TableInput["StorageDescriptor"]["Columns"]}
+
+
+class ObservableAthena(FakeAthena):
+    def __init__(self, bronze_table, columns):
+        super().__init__()
+        self.bronze_table, self.columns, self.on_execute = bronze_table, columns, None
+
+    def execute(self, sql, description=None):
+        out = super().execute(sql, description)
+        if self.on_execute:
+            self.on_execute(sql)
+        return out
+
+
+def test_declared_catalog_types_are_reasserted_after_every_merge(env):
+    """
+    Observed on the first production run: the override was applied before
+    merging and the columns were `string` again afterwards. Athena rewrites
+    the catalog on every commit, so the loader re-applies after each merge.
+    A consumer reading the catalog therefore sees `super` except during the
+    seconds between a commit and the re-apply.
+    """
+    from data_ingest.bronze.loader import bronze_table_name
+    s3, store = env
+    schema = [{"name": "ORDER_KEY", "type": "int64"},
+              {"name": "PAYLOAD_JSON", "type": "string"},
+              {"name": "LAST_UPDATE_DTTM", "type": "timestamp[ns]"}]
+    for i in range(3):
+        _write_run_with_schema(s3, f"run-{i}", schema, ingest_date=f"2026-08-2{4 + i}")
+
+    # Catalog types as Athena would record them for that schema.
+    catalog = {"order_key": "bigint", "payload_json": "string", "last_update_dttm": "timestamp"}
+    bronze_table = bronze_table_name(SOURCE_KEY, TABLE)
+    athena = ObservableAthena(bronze_table, catalog)
+    glue = AthenaRewritingGlue(athena)
+    # The landing external table already exists; only the bronze table is
+    # created and merged into here.
+    glue.tables[f"landing_{bronze_table}"] = dict(catalog)
+
+    result = load_table_runs(
+        athena=athena, s3_client=s3, processed_runs=store,
+        bucket=BUCKET, landing_prefix="landing",
+        source_key=SOURCE_KEY, table_config=make_table_config(),
+        bronze_location="s3://bronze-bucket/bronze",
+        partition_by=("month({checkpoint_column})",),
+        glue_client=glue, database="bronze_db",
+        catalog_column_types={"payload_json": "super"},
+    )
+
+    assert result.merged_count == 3
+    # After the final merge -- which reset the column -- it is super again.
+    assert glue.tables[bronze_table]["payload_json"] == "super"
+    # One re-apply after the create, then one after EACH merge that reset it.
+    assert len(glue.updates) == 1 + 3

@@ -339,11 +339,18 @@ by hand -- matters for two reasons:
   against the catalog and refuses type changes, because for any undeclared
   pair that is drift. A by-hand `super` was refused as `string -> super` and
   blocked the load. A declared override is a match.
-- **It survives.** Athena rewrites the catalog columns on `CREATE` and
-  `ALTER TABLE`, so the first time the source gains a column, a by-hand edit
-  reverts to `string` and Redshift starts truncating again with no error
-  anywhere. The loader re-applies declared overrides after every DDL of its
-  own, before merging.
+- **It survives.** Athena rewrites the catalog columns from the Iceberg
+  schema on **every commit** -- `CREATE`, `ALTER TABLE`, and each `MERGE`.
+  Observed directly: applied before merging, `string` again after the first
+  merge. A by-hand edit therefore lasts until the next load. The loader
+  re-applies declared overrides after every DDL and after every merge.
+
+  The exposure that leaves is the seconds between a merge commit and the
+  re-apply that follows it. A Spectrum query landing in that window reads
+  the column as varchar. On a 15-minute schedule with merges that take
+  seconds, that is a small window, but it is not zero, and a consumer that
+  cannot tolerate it should read through a Redshift view that is refreshed
+  after the Bronze job, not during it.
 
 The re-apply goes through Glue's `UpdateTable` with the entry's `VersionId`
 as an optimistic lock. The same catalog entry holds Iceberg's

@@ -454,6 +454,18 @@ def load_table_runs(
             RunResult(run_id=run.run_id, status="MERGED", row_count=run.row_count)
         )
 
+        # Every Iceberg commit Athena makes -- MERGE included, not just DDL --
+        # rewrites the catalog entry's columns from the Iceberg schema, which
+        # resets a consumer-facing type to `string`. Observed on the first
+        # production run: applied before merging, gone after the first merge.
+        # So it is re-asserted after each one. Idempotent, one GetTable and
+        # at most one UpdateTable per merge, against a merge that takes
+        # seconds. The window between a commit and this re-apply is the
+        # exposure a consumer has; README says so.
+        if catalog_column_types:
+            apply_catalog_overrides(glue_client, database, bronze_table,
+                                    catalog_column_types, label="bronze table")
+
     logger.info(
         "[%s] merged %s run(s) into %s", table_name, result.merged_count, bronze_table
     )
