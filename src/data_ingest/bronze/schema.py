@@ -201,6 +201,15 @@ def evolve_table(athena, glue_client, database, table, desired_columns, label,
     return True
 
 
+# The fields Glue's UpdateTable accepts in TableInput, per its own error
+# message when handed anything else. GetTable returns a superset.
+_TABLE_INPUT_FIELDS = (
+    "Name", "Description", "Owner", "LastAccessTime", "LastAnalyzedTime", "Retention",
+    "StorageDescriptor", "PartitionKeys", "ViewOriginalText", "ViewExpandedText",
+    "TableType", "Parameters", "TargetTable", "ViewDefinition",
+)
+
+
 def apply_catalog_overrides(glue_client, database, table, overrides, label):
     """
     Set the declared catalog column types on a table, if they are not
@@ -238,12 +247,12 @@ def apply_catalog_overrides(glue_client, database, table, overrides, label):
     if not changed:
         return []
 
-    # TableInput is the entry minus the read-only fields Glue refuses on
-    # update. Everything else -- Parameters with metadata_location included
-    # -- is sent back exactly as read.
-    read_only = {"DatabaseName", "CreateTime", "UpdateTime", "CreatedBy", "IsRegisteredWithLakeFormation",
-                 "CatalogId", "VersionId", "IsMultiDialectView", "FederatedTable", "Status"}
-    table_input = {k: v for k, v in entry.items() if k not in read_only}
+    # TableInput accepts a fixed set of fields, and GetTable returns more --
+    # CreateTime, VersionId, IsMaterializedView, and whatever Glue adds next.
+    # An allowlist of what UpdateTable takes is the only stable shape; a
+    # denylist of what it rejects broke the first time it met a field that
+    # was not on it. Parameters, with metadata_location, goes back as read.
+    table_input = {k: entry[k] for k in _TABLE_INPUT_FIELDS if k in entry}
     storage["Columns"] = columns
     table_input["StorageDescriptor"] = storage
     kwargs = {"DatabaseName": database, "TableInput": table_input}

@@ -334,6 +334,11 @@ class RecordingGlue(FakeGlue):
                            "metadata_location": "s3://lake/bronze/orders/metadata/00042.metadata.json"},
             "VersionId": self.version, "CreateTime": "2026-09-16", "UpdateTime": "2026-09-18",
             "CatalogId": "123456789012",
+            # Read-only fields a real GetTable returns that UpdateTable
+            # rejects -- including ones newer than any denylist would know.
+            "IsMaterializedView": False, "IsMultiDialectView": False,
+            "IsRegisteredWithLakeFormation": False, "CreatedBy": "arn:aws:iam::1:role/x",
+            "SomeFieldGlueAddsNextYear": True,
         })
         return out
 
@@ -353,8 +358,13 @@ def test_apply_sets_declared_types_and_preserves_the_iceberg_pointer():
     # exactly as read, and the write must carry the version lock.
     assert call["TableInput"]["Parameters"]["metadata_location"].endswith("00042.metadata.json")
     assert call["VersionId"] == "7"
-    # Read-only fields Glue rejects on update are not echoed back.
-    assert not {"CreateTime", "UpdateTime", "CatalogId", "VersionId", "DatabaseName"} & set(call["TableInput"])
+    # Only fields UpdateTable accepts are echoed back -- an allowlist, so a
+    # field Glue adds later cannot break the call the way IsMaterializedView did.
+    allowed = {"Name", "Description", "Owner", "LastAccessTime", "LastAnalyzedTime", "Retention",
+               "StorageDescriptor", "PartitionKeys", "ViewOriginalText", "ViewExpandedText",
+               "TableType", "Parameters", "TargetTable", "ViewDefinition"}
+    assert set(call["TableInput"]) <= allowed
+    assert call["TableInput"]["Name"] == "orders" and call["TableInput"]["TableType"] == "EXTERNAL_TABLE"
 
 
 def test_apply_is_idempotent():
