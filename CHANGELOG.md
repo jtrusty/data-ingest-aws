@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.4.2...v1.5.0) (2026-09-18)
+
+
+### Features
+
+* **bronze:** declare consumer-facing catalog column types ([0bb8092](https://github.com/jtrusty/data-ingest-aws/commit/0bb809214505922ca84b946722ebf9f0586c3eb7))
+
+
+### Bug Fixes
+
+* stream the empty-run sweep so it runs in constant memory ([467d6c8](https://github.com/jtrusty/data-ingest-aws/commit/467d6c8c7abe02744b6578bd996f95d7efdcba49))
+
+
+### Documentation
+
+* keep the package generic -- no real source names in docs, config, or tests ([8630eaa](https://github.com/jtrusty/data-ingest-aws/commit/8630eaac370114d36921ca7720d35768617e6f87))
+
 ## [1.4.2](https://github.com/jtrusty/data-ingest-aws/compare/v1.4.1...v1.4.2) (2026-09-18)
 
 
