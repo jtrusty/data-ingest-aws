@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.1](https://github.com/jtrusty/data-ingest-aws/compare/v1.5.0...v1.5.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **bronze:** build TableInput from an allowlist, not a denylist ([24e561e](https://github.com/jtrusty/data-ingest-aws/commit/24e561e0c97434b0e3e776523a8de827ee7451c4))
+
 ## [1.5.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.4.2...v1.5.0) (2026-09-18)
 
 
