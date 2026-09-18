@@ -25,7 +25,6 @@ import json
 import re
 import sys
 import time
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
@@ -42,6 +41,69 @@ def parse_uri(uri):
     return m.group(1), m.group(2).rstrip("/")
 
 
+class Sweeper:
+    """
+    Decide runs as the listing streams past them, and delete as it goes.
+
+    S3 lists in key order, so every object of one run_id is contiguous: the
+    moment a key belongs to a different run, the previous run is complete
+    and can be judged. Nothing about the listing is retained, so memory is
+    flat regardless of how many runs there are -- the version that grouped
+    the whole listing first was OOM-killed on 591k objects at 1/16 DPU.
+    """
+
+    def __init__(self, s3, bucket, delete, workers=16):
+        self.s3, self.bucket, self.delete = s3, bucket, delete
+        self.pool = ThreadPoolExecutor(max_workers=workers)
+        self.candidates = []          # manifest keys awaiting a read
+        self.runs = self.empty = self.kept = self.deleted = self.failed = self.flushes = 0
+        self.examples = []
+
+    def run_complete(self, keys):
+        self.runs += 1
+        if len(keys) == 1 and keys[0].endswith("/_manifest.json"):
+            self.candidates.append(keys[0])
+            if len(self.candidates) >= 1000:
+                self.flush()
+        else:
+            self.kept += 1
+
+    def _is_empty(self, key):
+        manifest = json.loads(self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read())
+        return key, manifest.get("row_count", 0) == 0 and manifest.get("file_count", 0) == 0
+
+    def flush(self):
+        """Read the buffered manifests in parallel; delete the empty ones."""
+        if not self.candidates:
+            return
+        empties = []
+        for key, ok in self.pool.map(self._is_empty, self.candidates):
+            if ok:
+                empties.append(key)
+                if len(self.examples) < 5:
+                    self.examples.append(key)
+            else:
+                self.kept += 1
+        self.candidates = []
+        self.empty += len(empties)
+        if self.delete and empties:
+            resp = self.s3.delete_objects(
+                Bucket=self.bucket, Delete={"Objects": [{"Key": k} for k in empties], "Quiet": True})
+            errors = resp.get("Errors", [])
+            for err in errors:
+                print("  FAILED", err["Key"], err["Code"], err["Message"])
+            self.failed += len(errors)
+            self.deleted += len(empties) - len(errors)
+        self.flushes += 1
+        if self.flushes % 10 == 0:
+            print(f"  {self.runs:,} runs seen: {self.empty:,} empty, {self.kept:,} kept"
+                  + (f", {self.deleted:,} deleted" if self.delete else ""))
+
+    def close(self):
+        self.flush()
+        self.pool.shutdown()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--uri", required=True, help="prefix holding run_id=... folders (an ingest_date=, a table, or higher)")
@@ -50,65 +112,33 @@ def main():
 
     bucket, prefix = parse_uri(args.uri)
     s3 = boto3.client("s3")
-
-    # One listing; group every object by its run_id folder.
+    sweeper = Sweeper(s3, bucket, args.delete)
     started = time.time()
-    runs = defaultdict(list)
-    listed = 0
+    print(f"{'DELETING' if args.delete else 'Dry run:'} empty runs under s3://{bucket}/{prefix}")
+
+    current, keys = None, []
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/"):
         for obj in page.get("Contents", []):
-            listed += 1
             m = re.search(r"^(.*/run_id=[^/]+)/", obj["Key"])
-            if m:
-                runs[m.group(1)].append(obj["Key"])
-        if listed % 10_000 < len(page.get("Contents", [])):
-            print(f"  listed {listed:,} objects, {len(runs):,} runs so far ...")
-    print(f"Listed {listed:,} objects in {len(runs):,} run(s) under s3://{bucket}/{prefix} "
+            if not m:
+                continue
+            if m.group(1) != current:
+                if current is not None:
+                    sweeper.run_complete(keys)
+                current, keys = m.group(1), []
+            keys.append(obj["Key"])
+    if current is not None:
+        sweeper.run_complete(keys)
+    sweeper.close()
+
+    print(f"\n{sweeper.runs:,} run(s): {sweeper.empty:,} empty, {sweeper.kept:,} kept "
           f"({time.time() - started:.0f}s)")
-
-    # Only manifest-only runs need their manifest read; runs with parts are
-    # kept without a request. Reads are pure I/O, so they go wide.
-    candidates = [keys[0] for keys in runs.values()
-                  if len(keys) == 1 and keys[0].endswith("/_manifest.json")]
-    print(f"{len(candidates):,} run(s) hold only a manifest; reading those to confirm they are empty ...")
-
-    def is_empty(key):
-        manifest = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
-        return key, manifest.get("row_count", 0) == 0 and manifest.get("file_count", 0) == 0
-
-    empty = []
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        for i, (key, ok) in enumerate(pool.map(is_empty, candidates), 1):
-            if ok:
-                empty.append(key)
-            if i % 1000 == 0:
-                print(f"  checked {i:,}/{len(candidates):,} manifests, {len(empty):,} empty ...")
-    empty.sort()
-    kept = len(runs) - len(empty)
-
-    print(f"{len(runs):,} run(s): {len(empty):,} empty, {kept:,} kept ({time.time() - started:.0f}s)")
-    if not empty:
-        return
-    for key in empty[:5]:
+    for key in sweeper.examples:
         print("  ", key)
-    if len(empty) > 5:
-        print(f"   ... and {len(empty) - 5} more")
-
-    if not args.delete:
-        print("\nDry run. Re-run with --delete to remove the empty runs listed above.")
-        return
-
-    # Each empty run is exactly one object, so deleting the manifests IS
-    # deleting the runs. Batched 1000 at a time, the API's limit.
-    failed = 0
-    for i in range(0, len(empty), 1000):
-        chunk = [{"Key": k} for k in empty[i:i + 1000]]
-        resp = s3.delete_objects(Bucket=bucket, Delete={"Objects": chunk, "Quiet": True})
-        for err in resp.get("Errors", []):
-            failed += 1
-            print("  FAILED", err["Key"], err["Code"], err["Message"])
-        print(f"  deleted {min(i + 1000, len(empty)):,}/{len(empty):,} ...")
-    print(f"Deleted {len(empty) - failed:,} empty run(s), {failed} failed.")
+    if args.delete:
+        print(f"Deleted {sweeper.deleted:,} empty run(s), {sweeper.failed} failed.")
+    elif sweeper.empty:
+        print("\nDry run. Re-run with --delete to remove them.")
 
 
 if __name__ == "__main__":
