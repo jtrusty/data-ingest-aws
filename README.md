@@ -326,7 +326,7 @@ bronze:
 ```
 
 ```sql
-SELECT payload_json.id, payload_json.version FROM bronze_par_pos.orders;   -- Redshift
+SELECT payload_json.id, payload_json.version FROM bronze_events.orders;   -- Redshift
 ```
 
 Iceberg has no such type, so the table deliberately carries **two schemas**:
@@ -489,7 +489,7 @@ small allowlist:
 
 ```yaml
 source:
-  name: par_pos                      # the producer
+  name: events                       # the producer
   type: s3_json                      # the adapter
 
   discovery:                         # how files are found
@@ -519,9 +519,9 @@ tables:
 the list of paths a producer publishes, each with its own `location`, start
 date, and checkpoint. A second feed -- timecards, refunds -- is a second
 entry under the same source, not a second source: same `source_key`, same
-config file, same pair of Glue jobs, landing at `.../par_pos_s3_json/orders/`
-and `.../par_pos_s3_json/timecards/`, Bronze at `bronze_par_pos.orders` and
-`bronze_par_pos.timecards`. What the source level holds is what those paths
+config file, same pair of Glue jobs, landing at `.../events_s3_json/orders/`
+and `.../events_s3_json/timecards/`, Bronze at `bronze_events.orders` and
+`bronze_events.timecards`. What the source level holds is what those paths
 share: how files are found and how they decode.
 
 Notice what is **not** there: nothing says which payload field identifies an
@@ -570,11 +570,11 @@ Promoting payload fields to their own columns is a **Silver** decision:
 ```sql
 SELECT json_extract_scalar(payload_json, '$.id')  AS order_id,
        json_extract_scalar(payload_json, '$.version') AS version
-FROM bronze_par_pos.orders;
+FROM bronze_events.orders;
 
 -- line items explode from the same column
 SELECT json_extract_scalar(o.payload_json, '$.id') AS order_id, i.sku, i.qty
-FROM bronze_par_pos.orders o
+FROM bronze_events.orders o
 CROSS JOIN UNNEST(
   CAST(json_extract(o.payload_json, '$.items') AS ARRAY(ROW(sku VARCHAR, qty INTEGER)))
 ) AS i (sku, qty);
@@ -652,8 +652,8 @@ quietly matching zero tables:
 | the job script | `run_job(expected_source_type="s3_json")` |
 
 It also fixes identity: `source_key` is `<source.name>_<source.type>`, so
-`name: par_pos` here lands under `landing/par_pos_s3_json/…` and
-keys DynamoDB on `par_pos_s3_json`. Changing the type after a run has
+`name: events` here lands under `landing/events_s3_json/…` and
+keys DynamoDB on `events_s3_json`. Changing the type after a run has
 committed re-partitions landing and orphans the checkpoint -- see
 [Identity](#identity).
 
@@ -737,7 +737,7 @@ and replay; for unbounded lateness, switch discovery to a full-prefix
 reconciliation or durable S3 event queue. Changing `start_at` alone does
 not rewind an existing checkpoint.
 
-**This contract was measured, not assumed.** Against the first production feed,
+**This contract was measured, not assumed.** Against one production feed,
 `scripts/json_folder_contract_check.py` listed 377,558 objects and replayed
 the discovery rule over them at the shipped settings (15-minute schedule,
 15-minute lookback, 120-second safety delay):
@@ -808,8 +808,8 @@ retained. Order identity is deliberately not part of that match key.
 
 ### Worked example: reconciling envelope and payload identity
 
-The first feed onboarded on this adapter, a point-of-sale order stream,
-illustrates a pattern worth knowing. Its parent `id` is not a bare GUID: it is `<guid>:<order_id>`,
+One production feed onboarded during development illustrates a pattern
+worth knowing. Its parent `id` is not a bare GUID: it is `<guid>:<order_id>`,
 where `order_id` is the 14-digit order number, and the decoded payload
 repeats that number in its own `id`. The example config therefore sets
 Silver reads `json_extract_scalar(payload_json, '$.id')` rather than parsing a
@@ -817,7 +817,7 @@ prefix off the envelope. The full `<guid>:<order_id>` string is still landed
 verbatim as `event_id`, so the two can be reconciled in Athena:
 
 ```sql
-SELECT count(*) FROM bronze_par_pos.orders
+SELECT count(*) FROM bronze_events.orders
 WHERE json_extract_scalar(payload_json, '$.id') IS NOT NULL
   AND split_part(event_id, ':', 2) <> json_extract_scalar(payload_json, '$.id');
 ```
@@ -846,7 +846,7 @@ FROM (
            ORDER BY CAST(json_extract_scalar(payload_json, '$.version') AS DECIMAL(38, 0)) DESC,
                     _s3_last_modified DESC, _source_record_id DESC
          ) AS version_rank
-  FROM bronze_par_pos.orders b
+  FROM bronze_events.orders b
   WHERE historical_data_type = 'order'
     AND json_extract_scalar(payload_json, '$.id') IS NOT NULL
     AND json_extract_scalar(payload_json, '$.version') IS NOT NULL
@@ -939,7 +939,7 @@ Every window is also one Bronze merge, so size it in days rather than hours:
 `24` turns a seven-month backfill into ~200 committed runs of a day each.
 `1` would produce thousands of merges. The example config sets 24.
 
-Measured on the first feed: roughly 150k rows/day in winter rising to ~550k
+Measured on one production feed: roughly 150k rows/day in winter rising to ~550k
 in spring, decoding at ~1,100 rows/s on 1/16 DPU -- the path is CPU-bound
 (gunzip, exact-Decimal JSON parse, base64, gunzip, parse, re-serialize), so
 `prefetch` is already doing all it can and a larger DPU does not help a
@@ -1703,10 +1703,10 @@ file, because the `bronze:` section lives beside the `landing:` section.
 
 | | Snowflake source | S3 JSON source |
 |---|---|---|
-| Config | `olo_snowflake.yaml` | `par_pos_s3_json.yaml` |
+| Config | `acme_snowflake.yaml` | `events_s3_json.yaml` |
 | Landing job | `landing_load_snowflake.py`, 1 DPU | `landing_load_s3_json.py`, 1 DPU |
 | Bronze job | `bronze_load.py`, 0.0625 DPU | `bronze_load.py`, 0.0625 DPU |
-| `source_key` | `olo_snowflake` | `par_pos_s3_json` |
+| `source_key` | `acme_snowflake` | `events_s3_json` |
 
 Four Glue job definitions, two scripts for landing, one script for Bronze,
 one wheel, two config files.

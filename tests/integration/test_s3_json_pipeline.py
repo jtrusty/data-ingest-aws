@@ -49,7 +49,7 @@ def env():
         now = datetime.now(timezone.utc)
         config_text = yaml.safe_dump({
             "source": {
-                "name": "par_pos", "type": "s3_json",
+                "name": "events", "type": "s3_json",
                 "document": {"preset": "cloudevents"},
             },
             "landing": {"location": f"s3://{LANDING_BUCKET}/landing",
@@ -97,11 +97,11 @@ def source(env, now, fetch_size=1):
 
 def run(env, now):
     return run_table(source(env, now), env["store"], env["writer"],
-                     "s3_json", "par_pos", env["config"].tables[0])
+                     "s3_json", "events", env["config"].tables[0])
 
 
 def state(env):
-    key = state_key_for("s3_json", "par_pos", env["config"].tables[0])
+    key = state_key_for("s3_json", "events", env["config"].tables[0])
     return env["store"].get(key)
 
 
@@ -143,7 +143,7 @@ def test_versions_and_complete_payload_survive_parquet_and_replay(env):
         assert row["_s3_record_index"] == ordinal
         assert row["_s3_last_modified"] == modified.replace(tzinfo=None)
         assert row["_ingest_run_id"] == first.run_id
-        assert row["_source_system"] == "par_pos_s3_json"
+        assert row["_source_system"] == "events_s3_json"
         envelope = json.loads(row["envelope_json"])
         assert gzip.decompress(base64.b64decode(envelope["data_base64"])).decode() == payloads[ordinal]
         assert json.loads(row["payload_json"], parse_float=Decimal)["amount"] == Decimal(
@@ -259,7 +259,7 @@ def test_real_bronze_loader_uses_source_identity_in_recorded_sql(env):
             catalog.add_client_error("get_table", service_error_code="EntityNotFoundException")
         result = load_table_runs(
             athena=athena, s3_client=env["s3"], processed_runs=NullProcessedRunStore(),
-            bucket=LANDING_BUCKET, landing_prefix="landing", source_key="par_pos_s3_json",
+            bucket=LANDING_BUCKET, landing_prefix="landing", source_key="events_s3_json",
             table_config=env["config"].tables[0], bronze_location=f"s3://{LANDING_BUCKET}/bronze",
             partition_by=("month({checkpoint_column})",), glue_client=glue, database="bronze_test",
         )

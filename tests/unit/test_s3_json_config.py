@@ -10,7 +10,7 @@ from data_ingest.exceptions import ConfigurationError
 
 CONFIG = {
     "source": {
-        "name": "par_pos",
+        "name": "events",
         "type": "s3_json",
         "document": {"preset": "cloudevents"},
     },
@@ -42,7 +42,7 @@ def source(**overrides):
 
 def test_name_identifies_the_producer_and_type_selects_the_adapter():
     config = parse(deepcopy(CONFIG))
-    assert config.source_key == "par_pos_s3_json"
+    assert config.source_key == "events_s3_json"
     assert config.connection.secret_id is None
     assert config.tables[0].source_object == "s3://pos-events/orders"
 
@@ -197,7 +197,7 @@ def test_each_table_is_one_path():
     config = parse(data)
     assert [t.s3.location for t in config.tables] == [
         "s3://pos-events/orders", "s3://pos-events/timecards"]
-    assert config.source_key == "par_pos_s3_json"       # one source, one key
+    assert config.source_key == "events_s3_json"       # one source, one key
 
 
 def test_location_is_required_per_table_not_inherited():
@@ -256,8 +256,8 @@ def test_source_level_wiring_is_rejected_for_a_relational_source():
 def test_example_is_a_valid_bronze_enabled_config():
     path = Path(__file__).parents[2] / "config" / "s3_json.example.yaml"
     config = parse_config(path.read_text())
-    assert config.source_key == "par_pos_s3_json"
-    assert config.bronze.database == "bronze_par_pos"
+    assert config.source_key == "events_s3_json"
+    assert config.bronze.database == "bronze_events"
     # One database per source, so the source_key prefix would only be noise.
     # Identity, applied once at CREATE TABLE: pinned so it cannot drift.
     assert config.bronze.table_prefix == "none"

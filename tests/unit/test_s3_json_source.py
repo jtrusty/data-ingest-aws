@@ -575,7 +575,7 @@ def test_a_backfill_drains_in_committed_windows_through_the_real_pipeline():
     table.database = 'b'; table.schema = 's3'; table.table = 'orders'
 
     for _ in range(5):
-        run_table(source, store, writer, 's3_json', 'par_pos', table)
+        run_table(source, store, writer, 's3_json', 'events', table)
 
     assert highs[:3] == [
         '2026-09-02 00:00:00.000000', '2026-09-03 00:00:00.000000', '2026-09-04 00:00:00.000000']

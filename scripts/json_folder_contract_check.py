@@ -4,7 +4,7 @@ Does the producer honour "folder hour == upload hour"?
 
 Read-only: only list_objects_v2, never get_object. Lists every object under
 the hourly prefixes in a date range, compares each object's LastModified to
-the yyyy/mm/dd/hh folder it sits in, then replays the par_pos_s3 adapter's
+the yyyy/mm/dd/hh folder it sits in, then replays the s3_json adapter's
 discovery rule over that listing -- scheduled runs every --interval minutes,
 --lookback minutes of overlap, --safety seconds of cutoff -- and reports the
 objects a real schedule would never have found.

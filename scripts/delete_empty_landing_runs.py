@@ -10,7 +10,7 @@ real backfill window cannot match even if it sits beside a thousand empties.
 Dry run by default. Nothing is deleted without --delete.
 
     python scripts/delete_empty_landing_runs.py \
-        --uri s3://<lake>/landing/par_pos_s3_json/orders/ingest_date=2026-09-18
+        --uri s3://<lake>/landing/<source_key>/<table>/ingest_date=2026-09-18
     python scripts/delete_empty_landing_runs.py --uri s3://... --delete
 
 Needs s3:ListBucket, s3:GetObject and (with --delete) s3:DeleteObject on the

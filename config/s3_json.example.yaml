@@ -2,7 +2,7 @@
 # Source files: s3://my-events/orders/yyyy/mm/dd/hh/<filename>.json.gz
 # Immutable objects; folders must reflect upload time in discovery.timezone.
 source:
-  name: par_pos          # the producer (example) -> source_key par_pos_s3_json
+  name: events           # the producer (example) -> source_key events_s3_json
   type: s3_json          # the adapter
 
   # How files are found. ".json.gz" names a compression, not a format, so the
@@ -50,7 +50,7 @@ landing:
   checkpoint_table: ingestion-checkpoints
 
 bronze:
-  database: bronze_par_pos
+  database: bronze_events
   location: s3://my-data-lake/bronze
   athena_output: s3://my-data-lake/athena-results/
   processed_runs_table: bronze-processed-runs

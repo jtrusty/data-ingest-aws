@@ -206,7 +206,7 @@ class BronzeConfig:
 
     # Whether Bronze table names carry the source key:
     #
-    #   "source_key" (default)  bronze_olo.olo_snowflake_order_fact_v
+    #   "source_key" (default)  bronze_acme.acme_snowflake_order_fact_v
     #   "none"                  bronze_olo.order_fact_v
     #
     # The prefix exists to keep two sources from colliding in ONE Glue

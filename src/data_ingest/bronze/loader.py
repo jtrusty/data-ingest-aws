@@ -67,7 +67,7 @@ def bronze_table_name(source_key, table_name, table_prefix="source_key"):
     With table_prefix="none" the prefix is dropped, giving "order_fact". That
     is only safe when the Glue database holds ONE source, which is the point:
     the database name already says which source it is, so
-    `bronze_olo.olo_snowflake_order_fact_v` repeats itself in every query an
+    `bronze_acme.acme_snowflake_order_fact_v` repeats itself in every query an
     analyst writes.
     """
     if table_prefix == "none":
