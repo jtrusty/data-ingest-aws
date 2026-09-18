@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.2](https://github.com/jtrusty/data-ingest-aws/compare/v1.4.1...v1.4.2) (2026-09-18)
+
+
+### Bug Fixes
+
+* **ci:** give the clean-exit check a region so it can construct its clients ([8e07ba4](https://github.com/jtrusty/data-ingest-aws/commit/8e07ba46b3eb909984a7ae8a3e6271cff41036e9))
+
 ## [1.4.1](https://github.com/jtrusty/data-ingest-aws/compare/v1.4.0...v1.4.1) (2026-09-18)
 
 
