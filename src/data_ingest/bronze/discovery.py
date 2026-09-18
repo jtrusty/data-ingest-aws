@@ -82,6 +82,7 @@ def discover_runs(s3_client, bucket, landing_prefix, source_key, table_name):
     paginator = s3_client.get_paginator("list_objects_v2")
 
     runs = []
+    empty = 0
     skipped_without_manifest = set()
 
     # List only manifests. Listing every Parquet object would be enormously
@@ -120,6 +121,9 @@ def discover_runs(s3_client, bucket, landing_prefix, source_key, table_name):
                 skipped_without_manifest.add(run_id)
                 continue
 
+            if manifest.get("row_count", 0) == 0 or manifest.get("file_count", 0) == 0:
+                empty += 1
+
             runs.append(
                 LandingRun(
                     run_id=run_id,
@@ -132,7 +136,17 @@ def discover_runs(s3_client, bucket, landing_prefix, source_key, table_name):
 
     runs.sort(key=lambda r: (r.ingest_date, r.run_id))
     logger.info(
-        "Discovered %s committed run(s) for %s/%s under s3://%s/%s",
-        len(runs), source_key, table_name, bucket, table_root,
+        "Discovered %s committed run(s) for %s/%s under s3://%s/%s (%s empty)",
+        len(runs), source_key, table_name, bucket, table_root, empty,
     )
+    if empty > 100:
+        # Dozens are normal for a quiet source on a 15-minute schedule.
+        # Hundreds or thousands means the landing job is spinning -- a
+        # window loop that never decides it is caught up, or a schedule far
+        # tighter than the source's arrival rate.
+        logger.warning(
+            "%s of %s committed runs for %s/%s are EMPTY. The landing job is committing "
+            "windows that contain nothing; check its schedule and its window loop.",
+            empty, len(runs), source_key, table_name,
+        )
     return runs

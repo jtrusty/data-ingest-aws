@@ -125,6 +125,7 @@ class S3JsonSource(Source):
         self._envelope_columns = tuple(s3_config.envelope_columns)
         self._document = s3_config.document
         self._discovery = s3_config.discovery
+        self._cap_bound_last_run = False
         # Built per table rather than as a module constant: which envelope
         # columns exist is configuration. Order is fixed by the config so the
         # Parquet schema is stable from run to run.
@@ -165,6 +166,12 @@ class S3JsonSource(Source):
     def get_current_checkpoint(self, previous_checkpoint=None):
         high = self._uncapped_high()
         cap_hours = self._discovery.max_window_hours
+        # Decided HERE, once, and remembered: is_caught_up must not consult
+        # the clock again. The bound is "now minus safety"; by the time the
+        # run has landed and committed, "now" has moved on, so re-reading it
+        # makes the committed bound look stale forever and the job cycles
+        # through empty windows a few seconds wide until someone kills it.
+        self._cap_bound_last_run = False
         if cap_hours is not None:
             # Bound the run to a window past where the last one stopped. The
             # pipeline commits THIS value after the manifest, so the cap has
@@ -173,17 +180,20 @@ class S3JsonSource(Source):
             resume = (_utc(previous_checkpoint.value)
                       if previous_checkpoint is not None and previous_checkpoint.value is not None
                       else self._start)
-            high = min(high, resume + timedelta(hours=cap_hours))
+            capped = resume + timedelta(hours=cap_hours)
+            if capped < high:
+                high = capped
+                self._cap_bound_last_run = True
         return WatermarkCheckpoint(
             column=_WATERMARK, value=high.strftime('%Y-%m-%d %H:%M:%S.%f'),
             lookback_minutes=self.lookback_minutes, value_type='TIMESTAMP',
         )
 
     def is_caught_up(self, committed_checkpoint):
-        # More is available only if the cap, not the clock, bounded the run.
-        if self._discovery.max_window_hours is None or committed_checkpoint is None:
-            return True
-        return _utc(committed_checkpoint.value) >= self._uncapped_high()
+        # More is available only if the CAP, not the clock, bounded the run
+        # just committed. Instance state rather than a fresh comparison, for
+        # the reason in get_current_checkpoint.
+        return not self._cap_bound_last_run
 
     def _path(self, moment):
         """The configured prefix for one instant, in the folder timezone."""

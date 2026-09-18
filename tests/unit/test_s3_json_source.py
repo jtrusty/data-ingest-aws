@@ -2,7 +2,7 @@ import base64
 import gzip
 import io
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -476,10 +476,32 @@ def test_cap_never_pushes_the_bound_past_now():
 def test_is_caught_up_reports_whether_the_cap_bounded_the_run():
     source, _, _, _ = setup_source(max_window_hours=6)
     source._now = lambda: instant('2026-09-12T00:00:00')
-    assert source.is_caught_up(checkpoint('2026-09-10 15:00:00.000000')) is False
-    assert source.is_caught_up(checkpoint('2026-09-11 23:58:00.000000')) is True
+    capped = source.get_current_checkpoint(None)                     # start + 6h < now
+    assert source.is_caught_up(capped) is False
+    clock = source.get_current_checkpoint(checkpoint('2026-09-11 23:00:00.000000'))
+    assert source.is_caught_up(clock) is True                        # clock bounded it
     uncapped, _, _, _ = setup_source()
-    assert uncapped.is_caught_up(checkpoint('2026-09-10 09:30:00.000000')) is True
+    assert uncapped.is_caught_up(uncapped.get_current_checkpoint(None)) is True
+
+
+def test_is_caught_up_does_not_reread_the_clock():
+    """
+    The bug this guards: the bound is now-minus-safety, and by the time the
+    run has committed, "now" has moved. A caught-up check that re-read the
+    clock would find the committed bound stale forever and the job would
+    cycle through empty windows a few seconds wide until killed. The
+    verdict must be made at checkpoint time, once.
+    """
+    ticks = [instant('2026-09-10T09:32:00'), instant('2026-09-10T09:32:05'), instant('2026-09-10T09:32:10')]
+    source, _, _, _ = setup_source(max_window_hours=24)
+    source._now = lambda: ticks.pop(0)
+    # start_at 09:00 + 24h is far past now, so the clock bounds this run.
+    bound = source.get_current_checkpoint(None)
+    assert bound.value == '2026-09-10 09:30:00.000000'
+    # Five seconds later, still caught up -- even though a fresh clock read
+    # would now say 09:30:05 > 09:30:00.
+    assert source.is_caught_up(bound) is True
+    assert len(ticks) == 2, 'is_caught_up must not consume a clock tick'
 
 
 def test_no_cap_by_default():
@@ -530,7 +552,14 @@ def test_a_backfill_drains_in_committed_windows_through_the_real_pipeline():
 
     source, client, _, obj = setup_source(max_window_hours=24, start_at='2026-09-01T00:00:00Z')
     _three_days_of_hourly_objects(client, obj)
-    source._now = lambda: instant('2026-09-04T12:00:00')
+    # A clock that ADVANCES between calls, like the real one. With a frozen
+    # clock the loop terminated by accident; with a moving one it must
+    # terminate because the cap stopped binding, not because time stood still.
+    tick = {'n': 0}
+    def now():
+        tick['n'] += 1
+        return instant('2026-09-04T12:00:00') + timedelta(seconds=tick['n'])
+    source._now = now
 
     committed, highs, landed = {}, [], []
     store = MagicMock()
@@ -548,10 +577,10 @@ def test_a_backfill_drains_in_committed_windows_through_the_real_pipeline():
     for _ in range(5):
         run_table(source, store, writer, 's3_json', 'par_pos', table)
 
-    assert highs == [
-        '2026-09-02 00:00:00.000000', '2026-09-03 00:00:00.000000',
-        '2026-09-04 00:00:00.000000', '2026-09-04 11:58:00.000000',
-        '2026-09-04 11:58:00.000000',
-    ]
+    assert highs[:3] == [
+        '2026-09-02 00:00:00.000000', '2026-09-03 00:00:00.000000', '2026-09-04 00:00:00.000000']
+    # Run 4 was bounded by the clock (a few seconds past 11:58), and reported
+    # caught up; runs 4 and 5 both land nothing new.
+    assert highs[3].startswith('2026-09-04 11:58:0')
     assert len(landed) == 72 and len(set(landed)) == 72
     assert source.is_caught_up(committed['rec'].checkpoint) is True

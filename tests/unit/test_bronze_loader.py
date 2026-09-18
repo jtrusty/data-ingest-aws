@@ -715,3 +715,31 @@ def test_a_first_run_chooses_freely(env):
 
     assert result.status == "SUCCESS"
     assert athena.merges, "the merge must actually run"
+
+
+def test_discovery_warns_when_most_committed_runs_are_empty():
+    """
+    Hundreds of empty runs means the landing job is spinning -- a window loop
+    that never decides it is caught up. Bronze is where that becomes visible
+    as a count, so it says so rather than quietly recording them all.
+    """
+    import json
+    from unittest.mock import MagicMock, patch
+    from data_ingest.bronze import discovery
+    from data_ingest.bronze.discovery import discover_runs
+
+    s3 = MagicMock()
+    keys = [f"landing/src/t/ingest_date=2026-09-17/run_id=r{i:04d}/_manifest.json" for i in range(150)]
+    s3.get_paginator.return_value.paginate.return_value = [
+        {"Contents": [{"Key": k} for k in keys]}]
+    empty = json.dumps({"status": "SUCCESS", "row_count": 0, "file_count": 0,
+                        "schema": [{"name": "a", "type": "string"}]}).encode()
+    s3.get_object.return_value = {"Body": MagicMock(read=lambda: empty)}
+
+    # Patch the module logger: an earlier test may have configured the
+    # package logger with propagate=False, which hides records from caplog.
+    with patch.object(discovery, "logger") as log:
+        runs = discover_runs(s3, "bucket", "landing", "src", "t")
+    assert len(runs) == 150
+    warned = [c.args for c in log.warning.call_args_list if "EMPTY" in c.args[0]]
+    assert warned and warned[0][1:3] == (150, 150)
