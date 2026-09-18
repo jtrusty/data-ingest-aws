@@ -61,6 +61,31 @@ bronze:
   # Defaults to month(_s3_last_modified); set before first Bronze run.
   # partition_by: ["month({checkpoint_column})"]
 
+  # Glue-catalog column types declared for a CONSUMER, not for Iceberg.
+  #
+  # WHEN: only if Redshift Spectrum reads this table AND a JSON column can
+  # exceed 65,535 bytes. Leave it out otherwise -- a plain JSON feed with
+  # small documents, or one read only through Athena, needs nothing here.
+  #
+  # WHY: Spectrum takes an Iceberg table's column types from the Glue
+  # catalog entry, and `string` there is a varchar capped at 65,535 bytes.
+  # An order with a couple hundred line items is longer than that, and the
+  # truncation is SILENT -- JSON_PARSE then fails row by row, or worse, you
+  # query a payload with its tail missing and never know. Declaring the
+  # catalog column as `super` lets Spectrum read it whole (16 MB) and query
+  # it with dot notation: payload.id, payload.version.
+  #
+  # Iceberg has no such type. The data stays `string` in Iceberg metadata
+  # and Athena keeps reading it as text; only the catalog entry differs.
+  # Declaring it here (rather than editing the catalog by hand) does two
+  # things: the loader accepts the difference instead of refusing it as a
+  # type change, and it RE-APPLIES the type after any DDL of its own --
+  # Athena rewrites the catalog columns on ALTER TABLE, so a hand edit is
+  # silently reverted the first time the source gains a column.
+  catalog_column_types:
+    payload_json: super
+    envelope_json: super
+
 defaults:
   fetch_size: 5000     # rows per Parquet part; the adapter caps at 5000
   fail_fast: true

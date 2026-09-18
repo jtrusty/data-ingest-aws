@@ -284,3 +284,106 @@ def test_an_s3_error_that_is_not_a_404_propagates():
     glue = FakeGlueWithParameters("s3://b/k.json")
     with pytest.raises(Exception, match="AccessDenied"):
         check_iceberg_metadata(glue, AngryS3(), "db", "t")
+
+
+# --------------------------------------------------------------------------
+# Consumer-facing catalog types  (bronze.catalog_column_types)
+# --------------------------------------------------------------------------
+
+from data_ingest.bronze.schema import apply_catalog_overrides
+
+
+def test_a_column_carrying_its_declared_override_is_not_a_type_change():
+    # Iceberg says string; the catalog says super for Redshift. Declared, so
+    # it is a match -- the loader must not refuse to merge.
+    existing = {"payload_json": "super", "event_id": "string"}
+    desired = [("payload_json", "string"), ("event_id", "string")]
+    added, changed = diff_columns(existing, desired, {"payload_json": "super"})
+    assert added == [] and changed == []
+
+
+def test_an_undeclared_override_is_still_a_type_change():
+    # The same catalog edit WITHOUT the declaration is exactly the drift the
+    # check exists for: refuse, as before.
+    existing = {"payload_json": "super"}
+    added, changed = diff_columns(existing, [("payload_json", "string")])
+    assert changed == [("payload_json", "super", "string")]
+
+
+def test_a_column_carrying_some_other_type_than_its_override_is_a_change():
+    existing = {"payload_json": "int"}
+    _, changed = diff_columns(existing, [("payload_json", "string")], {"payload_json": "super"})
+    assert changed == [("payload_json", "int", "string")]
+
+
+class RecordingGlue(FakeGlue):
+    """A catalog entry that looks like a real Iceberg table's, with the
+    metadata_location pointer and a VersionId, and records what UpdateTable
+    is asked to write."""
+
+    def __init__(self, columns, version="7"):
+        super().__init__({"orders": {"columns": columns}})
+        self.version = version
+        self.updates = []
+
+    def get_table(self, DatabaseName, Name):
+        out = super().get_table(DatabaseName, Name)
+        out["Table"].update({
+            "Name": Name, "DatabaseName": DatabaseName, "TableType": "EXTERNAL_TABLE",
+            "Parameters": {"table_type": "ICEBERG",
+                           "metadata_location": "s3://lake/bronze/orders/metadata/00042.metadata.json"},
+            "VersionId": self.version, "CreateTime": "2026-09-16", "UpdateTime": "2026-09-18",
+            "CatalogId": "123456789012",
+        })
+        return out
+
+    def update_table(self, **kwargs):
+        self.updates.append(kwargs)
+
+
+def test_apply_sets_declared_types_and_preserves_the_iceberg_pointer():
+    glue = RecordingGlue({"payload_json": "string", "envelope_json": "string", "event_id": "string"})
+    changed = apply_catalog_overrides(glue, "db", "orders",
+                                      {"payload_json": "super", "envelope_json": "super"}, "bronze table")
+    assert sorted(c[0] for c in changed) == ["envelope_json", "payload_json"]
+    (call,) = glue.updates
+    cols = {c["Name"]: c["Type"] for c in call["TableInput"]["StorageDescriptor"]["Columns"]}
+    assert cols == {"payload_json": "super", "envelope_json": "super", "event_id": "string"}
+    # The same entry carries Iceberg's metadata pointer: it must go back
+    # exactly as read, and the write must carry the version lock.
+    assert call["TableInput"]["Parameters"]["metadata_location"].endswith("00042.metadata.json")
+    assert call["VersionId"] == "7"
+    # Read-only fields Glue rejects on update are not echoed back.
+    assert not {"CreateTime", "UpdateTime", "CatalogId", "VersionId", "DatabaseName"} & set(call["TableInput"])
+
+
+def test_apply_is_idempotent():
+    glue = RecordingGlue({"payload_json": "super"})
+    assert apply_catalog_overrides(glue, "db", "orders", {"payload_json": "super"}, "bronze table") == []
+    assert glue.updates == []
+
+
+def test_apply_with_nothing_declared_touches_nothing():
+    glue = RecordingGlue({"payload_json": "string"})
+    assert apply_catalog_overrides(glue, "db", "orders", None, "bronze table") == []
+    assert glue.updates == []
+
+
+def test_evolve_then_apply_survives_a_ddl_reset():
+    """
+    The scenario the feature exists for. Athena's ALTER TABLE ADD COLUMNS
+    rewrites the catalog columns and resets a by-hand `super` to `string`.
+    With the override declared, the loader tolerates the pre-DDL state,
+    performs the DDL, and re-asserts the type -- so Redshift never sees the
+    reverted column.
+    """
+    glue = RecordingGlue({"payload_json": "super", "event_id": "string"})
+    athena = FakeAthena()
+    desired = [("payload_json", "string"), ("event_id", "string"), ("group_id", "string")]
+    assert evolve_table(athena, glue, "db", "orders", desired, "bronze table",
+                        catalog_overrides={"payload_json": "super"}) is True
+    assert any("ADD COLUMNS" in s for s in athena.statements)
+    # Simulate Athena's rewrite of the catalog after that DDL.
+    glue.tables["orders"]["columns"] = {"payload_json": "string", "event_id": "string", "group_id": "string"}
+    changed = apply_catalog_overrides(glue, "db", "orders", {"payload_json": "super"}, "bronze table")
+    assert changed == [("payload_json", "string", "super")]

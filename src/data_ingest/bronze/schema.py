@@ -108,7 +108,7 @@ def check_iceberg_metadata(glue_client, s3_client, database, table):
     )
 
 
-def diff_columns(existing, desired):
+def diff_columns(existing, desired, catalog_overrides=None):
     """
     Compare a catalog schema against the schema a landing run actually wrote.
 
@@ -118,14 +118,25 @@ def diff_columns(existing, desired):
 
     Columns present in `existing` but absent from `desired` are ignored on
     purpose -- see the module docstring.
+
+    `catalog_overrides` ({column: type}) names columns whose catalog type is
+    deliberately different from the landed type, for a consumer that reads
+    the catalog rather than Iceberg (see BronzeConfig.catalog_column_types).
+    A column already carrying its override is a match, not a change; one
+    carrying anything else is judged exactly as before.
     """
+    overrides = {k.lower(): _normalize(v) for k, v in (catalog_overrides or {}).items()}
     added = []
     changed = []
     for name, desired_type in desired:
         current = existing.get(name.lower())
         if current is None:
             added.append((name, desired_type))
-        elif _normalize(current) != _normalize(desired_type):
+        elif _normalize(current) == _normalize(desired_type):
+            continue
+        elif overrides.get(name.lower()) == _normalize(current):
+            continue
+        else:
             changed.append((name, current, desired_type))
     return added, changed
 
@@ -151,7 +162,8 @@ def add_columns_sql(table, columns):
     return f"ALTER TABLE {quote_ddl_identifier(table)} ADD COLUMNS ({rendered})"
 
 
-def evolve_table(athena, glue_client, database, table, desired_columns, label):
+def evolve_table(athena, glue_client, database, table, desired_columns, label,
+                 catalog_overrides=None):
     """
     Bring one catalog table up to date with a landing run's schema.
 
@@ -162,7 +174,7 @@ def evolve_table(athena, glue_client, database, table, desired_columns, label):
     if existing is None:
         return False
 
-    added, changed = diff_columns(existing, desired_columns)
+    added, changed = diff_columns(existing, desired_columns, catalog_overrides)
 
     if changed:
         details = "; ".join(
@@ -187,3 +199,59 @@ def evolve_table(athena, glue_client, database, table, desired_columns, label):
         )
 
     return True
+
+
+def apply_catalog_overrides(glue_client, database, table, overrides, label):
+    """
+    Set the declared catalog column types on a table, if they are not
+    already set. Idempotent; returns the columns it changed.
+
+    The write goes through Glue's optimistic lock. The same catalog entry
+    carries Iceberg's `metadata_location` pointer, which Athena advances on
+    every commit; a blind UpdateTable built from a stale read would rewind
+    that pointer and corrupt the table. VersionId makes a stale write fail
+    instead. Bronze is the only writer and runs one at a time, so in
+    practice the retry never fires -- but the guard is what makes that a
+    performance fact rather than a correctness assumption.
+    """
+    if not overrides:
+        return []
+    wanted = {k.lower(): _normalize(v) for k, v in overrides.items()}
+
+    response = glue_client.get_table(DatabaseName=database, Name=table)
+    entry = response["Table"]
+    storage = dict(entry.get("StorageDescriptor") or {})
+    columns = [dict(c) for c in storage.get("Columns") or []]
+
+    changed = []
+    for column in columns:
+        want = wanted.get(column["Name"].lower())
+        if want is not None and _normalize(column["Type"]) != want:
+            changed.append((column["Name"], column["Type"], want))
+            column["Type"] = want
+    missing = sorted(set(wanted) - {c["Name"].lower() for c in columns})
+    if missing:
+        logger.warning(
+            "%s `%s`: catalog_column_types names column(s) the table does not have: %s",
+            label, table, ", ".join(missing),
+        )
+    if not changed:
+        return []
+
+    # TableInput is the entry minus the read-only fields Glue refuses on
+    # update. Everything else -- Parameters with metadata_location included
+    # -- is sent back exactly as read.
+    read_only = {"DatabaseName", "CreateTime", "UpdateTime", "CreatedBy", "IsRegisteredWithLakeFormation",
+                 "CatalogId", "VersionId", "IsMultiDialectView", "FederatedTable", "Status"}
+    table_input = {k: v for k, v in entry.items() if k not in read_only}
+    storage["Columns"] = columns
+    table_input["StorageDescriptor"] = storage
+    kwargs = {"DatabaseName": database, "TableInput": table_input}
+    if entry.get("VersionId"):
+        kwargs["VersionId"] = entry["VersionId"]
+    glue_client.update_table(**kwargs)
+    logger.info(
+        "%s `%s`: catalog column type(s) set for consumers: %s",
+        label, table, ", ".join(f"{n} {was} -> {now}" for n, was, now in changed),
+    )
+    return changed

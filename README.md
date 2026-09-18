@@ -306,6 +306,56 @@ destroy hours of landed data, so the job prints the `aws glue delete-table`
 command and stops. That is also why neither Glue role holds
 `glue:DeleteTable` or `s3:DeleteObject`.
 
+### Consumer-facing column types  (`bronze.catalog_column_types`)
+
+Optional, and for one situation: **Redshift Spectrum reading a JSON column
+that can exceed 65,535 bytes.** Leave it out otherwise.
+
+Spectrum takes an Iceberg table's column types from its Glue catalog entry,
+where `string` is a varchar capped at 65,535 bytes. A payload longer than
+that is **silently truncated** -- `JSON_PARSE` fails on the row, or a query
+reads a document with its tail missing and nothing reports it. Declaring the
+catalog column as `super` lets Spectrum read it whole (16 MB) and query it
+with dot notation:
+
+```yaml
+bronze:
+  catalog_column_types:
+    payload_json: super
+    envelope_json: super
+```
+
+```sql
+SELECT payload_json.id, payload_json.version FROM bronze_par_pos.orders;   -- Redshift
+```
+
+Iceberg has no such type, so the table deliberately carries **two schemas**:
+Iceberg metadata says `string` (Athena reads that; the merge writes text) and
+the catalog entry says `super` (Spectrum reads that). This setting is where
+that split is declared, and declaring it -- rather than editing the catalog
+by hand -- matters for two reasons:
+
+- **The loader accepts it.** Bronze compares each landing run's schema
+  against the catalog and refuses type changes, because for any undeclared
+  pair that is drift. A by-hand `super` was refused as `string -> super` and
+  blocked the load. A declared override is a match.
+- **It survives.** Athena rewrites the catalog columns on `CREATE` and
+  `ALTER TABLE`, so the first time the source gains a column, a by-hand edit
+  reverts to `string` and Redshift starts truncating again with no error
+  anywhere. The loader re-applies declared overrides after every DDL of its
+  own, before merging.
+
+The re-apply goes through Glue's `UpdateTable` with the entry's `VersionId`
+as an optimistic lock. The same catalog entry holds Iceberg's
+`metadata_location` pointer, which Athena advances on every commit; a stale
+write there would rewind the pointer and corrupt the table, so a stale write
+fails instead. The Bronze role already holds `glue:UpdateTable` for schema
+evolution.
+
+A feed read only through Athena, or whose documents stay under 64 KB, needs
+none of this: `string` everywhere is correct, and the setting's absence is
+the default.
+
 ### Table naming  (`bronze.table_prefix`)
 
 | Setting | Table name | Use when |

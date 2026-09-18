@@ -612,3 +612,56 @@ tables:
     primary_key: [ID]
     checkpoint: {type: watermark, column: UPDATED_AT}
 """)
+
+
+# --- bronze.catalog_column_types ---------------------------------------------
+
+def _bronze_yaml(extra=""):
+    return f"""
+source:
+  name: acme
+  type: snowflake
+  database: DB
+  schema: SCH
+connection:
+  secret_id: x
+landing:
+  location: s3://b/landing
+  checkpoint_table: t
+bronze:
+  database: bronze_acme
+  location: s3://b/bronze
+  athena_output: s3://b/athena/
+{extra}
+tables:
+  - name: orders
+    table: ORDERS
+    primary_key: [ID]
+    checkpoint:
+      type: watermark
+      column: UPDATED_AT
+"""
+
+
+def test_catalog_column_types_defaults_to_nothing():
+    from data_ingest.config import parse_config
+    assert parse_config(_bronze_yaml()).bronze.catalog_column_types == {}
+
+
+def test_catalog_column_types_is_lowercased_for_comparison():
+    from data_ingest.config import parse_config
+    cfg = parse_config(_bronze_yaml("  catalog_column_types:\n    Payload_JSON: SUPER\n"))
+    assert cfg.bronze.catalog_column_types == {"payload_json": "super"}
+
+
+@pytest.mark.parametrize("bad", [
+    "  catalog_column_types: super\n",
+    "  catalog_column_types:\n    payload_json: 1\n",
+    "  catalog_column_types:\n    payload_json: ''\n",
+    "  catalog_column_types: [payload_json]\n",
+])
+def test_catalog_column_types_must_be_a_string_mapping(bad):
+    from data_ingest.config import parse_config
+    from data_ingest.exceptions import ConfigurationError
+    with pytest.raises(ConfigurationError, match="catalog_column_types"):
+        parse_config(_bronze_yaml(bad))

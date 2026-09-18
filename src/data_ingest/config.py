@@ -10,7 +10,7 @@ data_ingest.sources.registry.
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 import yaml
 
@@ -181,6 +181,28 @@ class BronzeConfig:
     # EXISTS. Iceberg supports partition evolution, but that is a separate
     # ALTER, not a re-CREATE.
     partition_by: tuple = DEFAULT_PARTITION_BY
+
+    # Glue-catalog column types declared for a CONSUMER, not for Iceberg.
+    #
+    # Redshift Spectrum reads an Iceberg table's column types from the Glue
+    # catalog entry, and `varchar` there caps at 65,535 bytes -- a JSON
+    # payload longer than that is silently truncated. Declaring the catalog
+    # column as `super` lets Spectrum read it whole (16 MB) and query it with
+    # dot notation. Iceberg itself has no such type: the data stays `string`
+    # in Iceberg metadata and Athena keeps reading it as text. So the table
+    # deliberately carries two schemas, and this is where that is declared.
+    #
+    # The loader treats a column whose catalog type equals its override as
+    # matching the landed type, and re-applies the override after any DDL of
+    # its own -- Athena rewrites the catalog columns on ALTER TABLE, which
+    # would otherwise reset a by-hand `super` back to `string` the first time
+    # the source gains a column, and Redshift would start truncating again
+    # without any error anywhere.
+    #
+    #     catalog_column_types:
+    #       payload_json: super
+    #       envelope_json: super
+    catalog_column_types: Mapping[str, str] = None
 
     # Whether Bronze table names carry the source key:
     #
@@ -516,9 +538,17 @@ def _parse_bronze(data):
             f"the database holds exactly one source."
         )
 
+    overrides = data.get("catalog_column_types") or {}
+    if not isinstance(overrides, dict) or not all(
+        isinstance(k, str) and k and isinstance(v, str) and v for k, v in overrides.items()
+    ):
+        raise ConfigurationError(
+            "bronze.catalog_column_types must be a mapping of column name to catalog type"
+        )
     return BronzeConfig(
         partition_by=tuple(partition_by),
         table_prefix=table_prefix,
+        catalog_column_types={k.lower(): v.lower() for k, v in overrides.items()},
         database=data["database"],
         location=data["location"],
         athena_output=data["athena_output"],
@@ -635,7 +665,7 @@ def parse_config(raw_text):
     _collect_unknown_keys(
         "bronze", data.get("bronze") or {},
         {"database", "location", "athena_output", "athena_workgroup",
-         "processed_runs_table", "partition_by", "table_prefix"},
+         "processed_runs_table", "partition_by", "table_prefix", "catalog_column_types"},
         problems,
     )
     for table_entry in data.get("tables") or []:

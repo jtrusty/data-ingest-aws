@@ -22,7 +22,7 @@ from typing import List, Optional
 
 from data_ingest.bronze import ddl
 from data_ingest.bronze.discovery import discover_runs
-from data_ingest.bronze.schema import check_iceberg_metadata, evolve_table
+from data_ingest.bronze.schema import apply_catalog_overrides, check_iceberg_metadata, evolve_table
 from data_ingest.exceptions import DataIngestError
 from data_ingest.logging import get_logger
 
@@ -233,7 +233,7 @@ def _check_not_stranded(glue_client, database, chosen, alternate, table_prefix):
 def _ensure_tables(athena, glue_client, s3_client, database, bronze_table,
                    landing_table, bronze_location, landing_location, columns,
                    table_config, partition_by, alternate_bronze_table=None,
-                   table_prefix="source_key"):
+                   table_prefix="source_key", catalog_column_types=None):
     """
     Create both Athena tables if absent, or evolve them if the source has
     gained columns since they were created.
@@ -271,7 +271,7 @@ def _ensure_tables(athena, glue_client, s3_client, database, bronze_table,
     check_iceberg_metadata(glue_client, s3_client, database, bronze_table)
 
     if not evolve_table(athena, glue_client, database, bronze_table, columns,
-                        label="bronze table"):
+                        label="bronze table", catalog_overrides=catalog_column_types):
         resolved_partitions = ddl.resolve_partition_spec(
             partition_by, table_config.checkpoint.column
         )
@@ -282,6 +282,13 @@ def _ensure_tables(athena, glue_client, s3_client, database, bronze_table,
             ),
             description=f"create bronze table {bronze_table}",
         )
+
+    # After every DDL of ours, and before any merge: Athena rewrites the
+    # catalog columns on CREATE and ALTER, so a consumer-facing type has to
+    # be re-asserted here or it silently reverts the first time the source
+    # gains a column.
+    apply_catalog_overrides(glue_client, database, bronze_table, catalog_column_types,
+                            label="bronze table")
 
 
 def load_table_runs(
@@ -297,6 +304,7 @@ def load_table_runs(
     glue_client=None,
     database=None,
     table_prefix="source_key",
+    catalog_column_types=None,
 ):
     """
     Merge every un-processed committed run for one table.
@@ -371,6 +379,7 @@ def load_table_runs(
         table_prefix=table_prefix,
         table_config=table_config,
         partition_by=partition_by,
+        catalog_column_types=catalog_column_types,
     )
 
     already_processed = processed_runs.processed_run_ids(source_key, table_name)
@@ -465,6 +474,7 @@ def load_bronze(
     glue_client=None,
     database=None,
     table_prefix="source_key",
+    catalog_column_types=None,
 ):
     """Run every requested table through load_table_runs."""
     results = []
@@ -486,6 +496,7 @@ def load_bronze(
                     glue_client=glue_client,
                     database=database,
                     table_prefix=table_prefix,
+                    catalog_column_types=catalog_column_types,
                 )
             )
         except Exception as exc:
