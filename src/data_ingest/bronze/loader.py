@@ -238,6 +238,9 @@ def _ensure_tables(athena, glue_client, s3_client, database, bronze_table,
     Create both Athena tables if absent, or evolve them if the source has
     gained columns since they were created.
 
+    Returns True if the BRONZE table was created here -- which means it is
+    empty, whatever the processed-runs bookkeeping claims. See the caller.
+
     Creating is not enough on its own: CREATE TABLE IF NOT EXISTS is a no-op
     once the table exists, so a column added in Snowflake would land in
     Parquet and then be invisible to Athena forever. See bronze/schema.py.
@@ -270,8 +273,10 @@ def _ensure_tables(athena, glue_client, s3_client, database, bronze_table,
     # far later, at merge time, with ICEBERG_MISSING_METADATA.
     check_iceberg_metadata(glue_client, s3_client, database, bronze_table)
 
-    if not evolve_table(athena, glue_client, database, bronze_table, columns,
-                        label="bronze table", catalog_overrides=catalog_column_types):
+    bronze_created = not evolve_table(
+        athena, glue_client, database, bronze_table, columns,
+        label="bronze table", catalog_overrides=catalog_column_types)
+    if bronze_created:
         resolved_partitions = ddl.resolve_partition_spec(
             partition_by, table_config.checkpoint.column
         )
@@ -289,6 +294,7 @@ def _ensure_tables(athena, glue_client, s3_client, database, bronze_table,
     # gains a column.
     apply_catalog_overrides(glue_client, database, bronze_table, catalog_column_types,
                             label="bronze table")
+    return bronze_created
 
 
 def load_table_runs(
@@ -357,7 +363,7 @@ def load_table_runs(
     # than from a hand-maintained DDL that can drift.
     table_columns = union_manifest_schemas(runs)
 
-    _ensure_tables(
+    bronze_created = _ensure_tables(
         athena=athena,
         glue_client=glue_client,
         s3_client=s3_client,
@@ -383,6 +389,23 @@ def load_table_runs(
     )
 
     already_processed = processed_runs.processed_run_ids(source_key, table_name)
+    if bronze_created and already_processed:
+        # The table did not exist a moment ago, so it is empty -- whatever
+        # the processed-runs table says was merged into it is describing a
+        # table that no longer exists. Dropping and recreating a Bronze
+        # table is a legitimate operation (relocating it, changing its
+        # layout), and the bookkeeping is the one thing that does not
+        # survive it. Trusting it here skips those runs into an empty table
+        # and reports SUCCESS: the data is in landing, absent from Bronze,
+        # and nothing fails. Re-merging instead is safe and idempotent.
+        logger.warning(
+            "[%s] `%s` was just created but %s run(s) are recorded as already merged "
+            "into it. The table was dropped and recreated; that bookkeeping describes "
+            "a table that no longer exists, so it is being ignored and every committed "
+            "run will be re-merged.",
+            table_name, bronze_table, len(already_processed),
+        )
+        already_processed = set()
     pending = [r for r in runs if r.run_id not in already_processed]
 
     logger.info(

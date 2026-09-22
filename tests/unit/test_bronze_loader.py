@@ -184,6 +184,14 @@ def test_corrupt_manifest_raises_rather_than_silently_skipping(env):
 # --------------------------------------------------------------------------
 
 
+def _existing_tables():
+    """A catalog where both tables already exist, as on any re-run."""
+    from data_ingest.bronze.loader import bronze_table_name, landing_table_name
+    columns = {"order_key": "bigint", "amount": "decimal(38,3)", "last_update_dttm": "timestamp"}
+    return FakeGlue({bronze_table_name(SOURCE_KEY, TABLE): dict(columns),
+                     landing_table_name(SOURCE_KEY, TABLE): dict(columns)})
+
+
 def test_reprocessing_skips_already_merged_runs(env):
     s3, store = env
     _write_run(s3, "run-1")
@@ -191,11 +199,39 @@ def test_reprocessing_skips_already_merged_runs(env):
     first = _load(s3, store, FakeAthena())
     assert [r.status for r in first.runs] == ["MERGED"]
 
+    # The table exists on the second pass, as it does on any re-run -- which
+    # is what makes the bookkeeping trustworthy.
     second_athena = FakeAthena()
-    second = _load(s3, store, second_athena)
+    second = _load(s3, store, second_athena, glue=_existing_tables())
 
     assert [r.status for r in second.runs] == ["SKIPPED_ALREADY_PROCESSED"]
     assert second_athena.merges == [], "an already-merged run must not be re-scanned"
+
+
+def test_a_recreated_bronze_table_ignores_stale_processed_runs(env):
+    """
+    Dropping and recreating a Bronze table is legitimate -- relocating it,
+    changing its layout -- and the processed-runs bookkeeping is the one
+    thing that does not survive it. Trusting it after a recreate skips those
+    runs into an EMPTY table and still reports SUCCESS: data in landing,
+    absent from Bronze, nothing failing. Observed in production at 229 of
+    234 runs skipped into a table that had just been recreated.
+    """
+    s3, store = env
+    _write_run(s3, "run-1")
+    _write_run(s3, "run-2", ingest_date="2026-08-25")
+
+    first = _load(s3, store, FakeAthena(), glue=_existing_tables())
+    assert [r.status for r in first.runs] == ["MERGED", "MERGED"]
+    assert store.processed_run_ids(SOURCE_KEY, TABLE) == {"run-1", "run-2"}
+
+    # Table dropped: the next pass creates it, so it is empty regardless of
+    # what the store says. Every run must be merged again.
+    athena = FakeAthena()
+    second = _load(s3, store, athena, glue=FakeGlue())
+
+    assert [r.status for r in second.runs] == ["MERGED", "MERGED"]
+    assert len(athena.merges) == 2
 
 
 def test_a_crash_after_merge_before_recording_is_safe(env):

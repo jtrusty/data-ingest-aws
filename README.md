@@ -208,6 +208,21 @@ Three properties follow from `WHEN NOT MATCHED THEN INSERT`:
   There is deliberately no `WHEN MATCHED` clause; collapsing to current state
   belongs downstream in Redshift.
 
+**Dropping a Bronze table invalidates its processed-runs bookkeeping.** The
+processed-runs table is a cost optimization rather than a correctness
+mechanism -- the merge is idempotent, so re-merging a run inserts nothing --
+but that holds only while the Bronze table itself persists. Drop and
+recreate it (to relocate it, or change its layout) and those entries now
+describe a table that no longer exists: the loader would skip every recorded
+run into an empty table and report SUCCESS, leaving the data in landing,
+absent from Bronze, with nothing failing anywhere.
+
+So the loader checks. When it *creates* the Bronze table rather than finding
+it, the table is empty by definition, and any processed-runs entries for it
+are stale: it logs that it is ignoring them and re-merges every committed
+run. Clearing the rows by hand after a drop also works, and is no longer
+required.
+
 A landing run without a `_manifest.json` is ignored — a crashed or
 OOM-killed extraction leaves Parquet behind, and the ingestion job
 deliberately does not clean up after itself. A run with an *unreadable*
