@@ -10,7 +10,14 @@ source:
   discovery:
     type: time_partitioned
     path_format: "%Y/%m/%d/%H"   # e.g. "year=%Y/month=%m/day=%d/hour=%H"
-    timezone: UTC                # Confirm with producer; e.g. America/Chicago.
+    # VERIFY THIS against a real object before the first run: compare the
+    # hour in a key to that object's LastModified in UTC. Equal -> UTC;
+    # offset -> the producer's local zone, e.g. America/Chicago. Getting it
+    # wrong does not fail: the walk looks in folders that do not exist,
+    # finds nothing, and the checkpoint advances past data anyway. A wide
+    # backfill window hides it by overlapping enough folders to find most
+    # files; steady state then finds none.
+    timezone: UTC
     suffix: ".json.gz"
     safety_delay_seconds: 120    # upper bound is run start minus this
     # The most one landing run may advance, in hours of SOURCE time. The job

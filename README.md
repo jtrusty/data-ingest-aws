@@ -760,9 +760,10 @@ reconciliation or durable S3 event queue. Changing `start_at` alone does
 not rewind an existing checkpoint.
 
 **This contract was measured, not assumed.** Against one production feed,
-`scripts/json_folder_contract_check.py` listed 377,558 objects and replayed
-the discovery rule over them at the shipped settings (15-minute schedule,
-15-minute lookback, 120-second safety delay):
+`scripts/json_folder_contract_check.py` listed 377,558 objects over roughly
+31 days (~512 files/hour) and replayed the discovery rule over them at the
+shipped settings (15-minute schedule, 15-minute lookback, 120-second safety
+delay), with `--tz America/Chicago` -- that feed's folder clock:
 
 | Lateness past folder end | Objects | |
 |---|---:|---:|
@@ -770,8 +771,13 @@ the discovery rule over them at the shipped settings (15-minute schedule,
 | <= 15m late | 7,148 | 1.9% |
 | > 15m late | 0 | 0% |
 
-**Zero objects would have been missed**, and no object predated its folder
-hour, which confirms `folder_timezone: UTC`. This is why the design stayed
+**Zero objects would have been missed** -- *at the timezone the check was
+run with*. That qualifier is the whole point of the next section: the same
+listing measured against UTC would have shown every object hours late,
+because those folders are named in local time. Read the header line of the
+check's output and confirm the timezone it used before trusting the table.
+
+This is why the design stayed
 on prefix scanning with a DynamoDB watermark rather than moving to S3 event
 notifications: the failure mode a queue protects against does not occur in
 this feed, and a queue would add SNS fan-out, visibility timeouts, a DLQ,
@@ -786,6 +792,31 @@ hour of lateness, and nothing in the sample came close.
 
 Re-run the check if the producer changes, and see
 [Watch for](#watch-for) below for the signal that this has drifted.
+
+### `discovery.timezone` is not cosmetic
+
+The walk renders prefixes in this timezone. Set it wrong and the job looks
+in folders the producer never wrote to, finds nothing, commits an empty
+window, and **advances the checkpoint anyway** -- because an empty window is
+a legitimate outcome. Nothing fails. The log says `0 objects, 0 in window`
+and the watermark moves past data that was never read.
+
+Worse, a wide window hides it. This was shipped as `UTC` against a feed
+whose folders are named in `America/Chicago`, and the backfill appeared to
+work: a 24-hour window walks ~26 hourly folders, so a five-hour offset still
+overlapped enough of them to find most files. It quietly lost the rest --
+about four hours of every day, roughly 17%, the files whose local folder
+belongs to the previous UTC day but whose timestamps fall in the next
+window. The failure only became visible in steady state, where a 15-minute
+window walks two or three folders and a five-hour offset finds nothing at
+all.
+
+So: **verify it against a real object before the first run.** Take the
+newest object in the source bucket and compare the hour in its key to its
+`LastModified` in UTC. Equal means UTC. Offset by the producer's local
+offset means local, and this setting must say so. The contract check is the
+same test at scale -- run it with the timezone you intend to configure, and
+read the header line it prints to be sure that is what it used.
 
 DynamoDB advances only after the Parquet run's manifest commits. Empty
 intervals also commit, keeping idle sources from rescanning their history.
