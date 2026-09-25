@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.6.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.5.2...v1.6.0) (2026-09-25)
+
+
+### Features
+
+* **s3_json:** full_prefix discovery for locations with no folder layout ([404b979](https://github.com/jtrusty/data-ingest-aws/commit/404b97952652652e5b9aa4f67d659e2d54984b4e))
+
+
+### Bug Fixes
+
+* **bronze:** ignore processed-runs bookkeeping when the table was just created ([ac4bd2d](https://github.com/jtrusty/data-ingest-aws/commit/ac4bd2d5dffdc3be2d78833798facc297c070d0c))
+
+
+### Documentation
+
+* record that a wrong discovery.timezone fails silently, and correct the measurement ([5ca68dd](https://github.com/jtrusty/data-ingest-aws/commit/5ca68ddfaa7905dfd277971b8d5a7299462baa27))
+
 ## [1.5.2](https://github.com/jtrusty/data-ingest-aws/compare/v1.5.1...v1.5.2) (2026-09-18)
 
 
