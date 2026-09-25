@@ -254,10 +254,10 @@ def test_source_level_wiring_is_rejected_for_a_relational_source():
 
 
 def test_example_is_a_valid_bronze_enabled_config():
-    path = Path(__file__).parents[2] / "config" / "s3_json.example.yaml"
+    path = Path(__file__).parents[2] / "config" / "s3_json_time_partitioned.example.yaml"
     config = parse_config(path.read_text())
-    assert config.source_key == "events_s3_json"
-    assert config.bronze.database == "bronze_events"
+    assert config.source_key == "acme_s3_json"
+    assert config.bronze.database == "bronze_acme"
     # One database per source, so the source_key prefix would only be noise.
     # Identity, applied once at CREATE TABLE: pinned so it cannot drift.
     assert config.bronze.table_prefix == "none"
@@ -336,32 +336,31 @@ def test_time_partitioned_still_requires_positive_lookback():
 
 
 def test_a_source_can_have_multiple_full_prefix_tables_with_different_locations():
-    # The dynamic-store scenario: rti_shifts and rti_cash_sheet_info are two
-    # tables under one source, each its own location, no time partitioning,
-    # and no config change needed when a new store-XXX prefix appears under
-    # either location.
+    # The dynamic-store scenario: shifts and cash_sheets are two tables
+    # under one source, each its own location, no time partitioning, and no
+    # config change needed when a new store-XXX prefix appears under either.
     data = deepcopy(CONFIG)
     data["source"]["discovery"] = {"type": "full_prefix", "suffix": ".json"}
     data["tables"] = [
-        {"name": "rti_shifts", "location": "s3://bucket/rti-data-export/rti_shifts",
+        {"name": "shifts", "location": "s3://bucket/acme-data-export/shifts",
          "start_at": "2026-01-01T00:00:00Z"},
-        {"name": "rti_cash_sheet_info", "location": "s3://bucket/rti-data-export/rti_cash_sheet_info",
+        {"name": "cash_sheets", "location": "s3://bucket/acme-data-export/cash_sheets",
          "start_at": "2026-01-01T00:00:00Z"},
     ]
     cfg = parse(data)
     assert [t.s3.location for t in cfg.tables] == [
-        "s3://bucket/rti-data-export/rti_shifts", "s3://bucket/rti-data-export/rti_cash_sheet_info"]
+        "s3://bucket/acme-data-export/shifts", "s3://bucket/acme-data-export/cash_sheets"]
     assert all(t.s3.discovery.type == "full_prefix" for t in cfg.tables)
 
 
 def test_full_prefix_example_is_a_valid_bronze_enabled_config():
     path = Path(__file__).parents[2] / "config" / "s3_json_full_prefix.example.yaml"
     config = parse_config(path.read_text())
-    assert config.source_key == "rti_s3_json"
+    assert config.source_key == "acme_s3_json"
     assert len(config.tables) == 2
     shifts, cash = config.tables
-    assert shifts.name == "rti_shifts" and shifts.s3.location == "s3://my-exports/rti_shifts"
-    assert cash.name == "rti_cash_sheet_info" and cash.s3.location == "s3://my-exports/rti_cash_sheet_info"
+    assert shifts.name == "shifts" and shifts.s3.location == "s3://my-acme/shifts"
+    assert cash.name == "cash_sheets" and cash.s3.location == "s3://my-acme/cash_sheets"
     assert shifts.s3.discovery.type == "full_prefix"
     assert shifts.checkpoint.lookback_minutes == 0
     # The second table omits checkpoint entirely -- the (unused) default

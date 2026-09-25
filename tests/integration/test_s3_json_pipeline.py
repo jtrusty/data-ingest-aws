@@ -314,7 +314,7 @@ def test_full_prefix_discovers_new_store_subprefixes_with_no_config_change():
         start = datetime.now(timezone.utc) - timedelta(minutes=30)
         config_text = yaml.safe_dump({
             "source": {
-                "name": "rti", "type": "s3_json",
+                "name": "acme", "type": "s3_json",
                 "discovery": {"type": "full_prefix", "suffix": ".json"},
                 "document": {"preset": "records", "compression": "none", "records": "array"},
             },
@@ -322,7 +322,7 @@ def test_full_prefix_discovers_new_store_subprefixes_with_no_config_change():
                         "checkpoint_table": STATE_TABLE},
             "tables": [{
                 "name": "shifts",
-                "location": f"s3://{RAW_BUCKET}/rti_shifts",
+                "location": f"s3://{RAW_BUCKET}/shifts",
                 "start_at": start.isoformat(),
                 "checkpoint": {"type": "watermark", "column": "_s3_last_modified",
                               "lookback_minutes": 0},
@@ -335,7 +335,7 @@ def test_full_prefix_discovers_new_store_subprefixes_with_no_config_change():
         # deep under the table's one location, the way a real per-store dump
         # would grow over time.
         for store_id, shift_id in [("001", "a"), ("103", "b"), ("999", "c")]:
-            s3.put_object(Bucket=RAW_BUCKET, Key=f"rti_shifts/store-{store_id}/{shift_id}.json",
+            s3.put_object(Bucket=RAW_BUCKET, Key=f"shifts/store-{store_id}/{shift_id}.json",
                           Body=json.dumps([{"shift_id": shift_id, "store": store_id}]).encode())
 
         def make_source(now):
@@ -345,7 +345,7 @@ def test_full_prefix_discovers_new_store_subprefixes_with_no_config_change():
         # Generous margin past the 120s safety_delay -- this is a first run
         # (inclusive at both ends), so there is no tight boundary to hit.
         first = run_table(make_source(datetime.now(timezone.utc) + timedelta(minutes=5)),
-                          store, writer, "s3_json", "rti", table_config)
+                          store, writer, "s3_json", "acme", table_config)
         assert first.status == "SUCCESS"
         assert first.row_count == 3
 
@@ -356,7 +356,7 @@ def test_full_prefix_discovers_new_store_subprefixes_with_no_config_change():
             s3.get_object(Bucket=LANDING_BUCKET, Key=parquet_keys[0])["Body"].read())
         ).to_pandas()
         assert sorted(landed["_s3_key"]) == [
-            "rti_shifts/store-001/a.json", "rti_shifts/store-103/b.json", "rti_shifts/store-999/c.json"]
+            "shifts/store-001/a.json", "shifts/store-103/b.json", "shifts/store-999/c.json"]
         committed_manifest = json.loads(s3.get_object(
             Bucket=LANDING_BUCKET,
             Key=[k["Key"] for k in s3.list_objects_v2(Bucket=LANDING_BUCKET, Prefix="landing/")["Contents"]
@@ -368,6 +368,6 @@ def test_full_prefix_discovers_new_store_subprefixes_with_no_config_change():
         # committed checkpoint (already minutes ahead of the real objects'
         # LastModified) and finds nothing, without re-landing what exists.
         second = run_table(make_source(datetime.now(timezone.utc) + timedelta(minutes=10)),
-                           store, writer, "s3_json", "rti", table_config)
+                           store, writer, "s3_json", "acme", table_config)
         assert second.status == "SUCCESS"
         assert second.row_count == 0

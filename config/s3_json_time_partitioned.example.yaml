@@ -1,8 +1,8 @@
 # Copy to <name>_s3_json.yaml and replace bucket names/start_at.
-# Source files: s3://my-events/orders/yyyy/mm/dd/hh/<filename>.json.gz
+# Source files: s3://my-acme/orders/yyyy/mm/dd/hh/<filename>.json.gz
 # Immutable objects; folders must reflect upload time in discovery.timezone.
 source:
-  name: events           # the producer (example) -> source_key events_s3_json
+  name: acme             # the producer (example) -> source_key acme_s3_json
   type: s3_json          # the adapter
 
   # How files are found. ".json.gz" names a compression, not a format, so the
@@ -57,7 +57,7 @@ landing:
   checkpoint_table: ingestion-checkpoints
 
 bronze:
-  database: bronze_events
+  database: bronze_acme
   location: s3://my-data-lake/bronze
   athena_output: s3://my-data-lake/athena-results/
   processed_runs_table: bronze-processed-runs
@@ -102,7 +102,7 @@ defaults:
 # a second feed (timecards, refunds) is a second entry, not a second source.
 tables:
   - name: orders
-    location: s3://my-events/orders   # ends immediately BEFORE the path_format
+    location: s3://my-acme/orders   # ends immediately BEFORE the path_format
     # Inclusive first-load boundary in upload time. Quote to keep a string.
     # Set to the earliest upload to ingest; existing checkpoints take precedence.
     start_at: "2026-09-01T00:00:00Z"

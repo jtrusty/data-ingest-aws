@@ -76,7 +76,8 @@ jobs/                      thin Glue entry points, named <layer>_load[_<source>]
                              every source.
   landing_load_s3_json.py     JSON documents in S3 -> landing, using the job IAM role
 config/snowflake.example.yaml  example config; real ones are gitignored
-config/s3_json.example.yaml     S3 JSON source template, including bootstrap date
+config/s3_json_time_partitioned.example.yaml   S3 JSON, hourly-folder template
+config/s3_json_full_prefix.example.yaml         S3 JSON, no-folder-layout template
 constraints-glue.txt       frozen dependency set matching the Glue runtime
 tests/unit/                pytest suite (moto-mocked AWS)
 tests/conftest.py          pins AWS region/credentials so tests don't inherit
@@ -341,7 +342,7 @@ bronze:
 ```
 
 ```sql
-SELECT payload_json.id, payload_json.version FROM bronze_events.orders;   -- Redshift
+SELECT payload_json.id, payload_json.version FROM bronze_acme.orders;   -- Redshift
 ```
 
 Iceberg has no such type, so the table deliberately carries **two schemas**:
@@ -511,7 +512,7 @@ small allowlist:
 
 ```yaml
 source:
-  name: events                       # the producer
+  name: acme                         # the producer
   type: s3_json                      # the adapter
 
   discovery:                         # how files are found
@@ -541,9 +542,9 @@ tables:
 the list of paths a producer publishes, each with its own `location`, start
 date, and checkpoint. A second feed -- timecards, refunds -- is a second
 entry under the same source, not a second source: same `source_key`, same
-config file, same pair of Glue jobs, landing at `.../events_s3_json/orders/`
-and `.../events_s3_json/timecards/`, Bronze at `bronze_events.orders` and
-`bronze_events.timecards`. What the source level holds is what those paths
+config file, same pair of Glue jobs, landing at `.../acme_s3_json/orders/`
+and `.../acme_s3_json/timecards/`, Bronze at `bronze_acme.orders` and
+`bronze_acme.timecards`. What the source level holds is what those paths
 share: how files are found and how they decode.
 
 Notice what is **not** there: nothing says which payload field identifies an
@@ -592,11 +593,11 @@ Promoting payload fields to their own columns is a **Silver** decision:
 ```sql
 SELECT json_extract_scalar(payload_json, '$.id')  AS order_id,
        json_extract_scalar(payload_json, '$.version') AS version
-FROM bronze_events.orders;
+FROM bronze_acme.orders;
 
 -- line items explode from the same column
 SELECT json_extract_scalar(o.payload_json, '$.id') AS order_id, i.sku, i.qty
-FROM bronze_events.orders o
+FROM bronze_acme.orders o
 CROSS JOIN UNNEST(
   CAST(json_extract(o.payload_json, '$.items') AS ARRAY(ROW(sku VARCHAR, qty INTEGER)))
 ) AS i (sku, qty);
@@ -674,8 +675,8 @@ quietly matching zero tables:
 | the job script | `run_job(expected_source_type="s3_json")` |
 
 It also fixes identity: `source_key` is `<source.name>_<source.type>`, so
-`name: events` here lands under `landing/events_s3_json/…` and
-keys DynamoDB on `events_s3_json`. Changing the type after a run has
+`name: acme` here lands under `landing/acme_s3_json/…` and
+keys DynamoDB on `acme_s3_json`. Changing the type after a run has
 committed re-partitions landing and orphans the checkpoint -- see
 [Identity](#identity).
 
@@ -685,7 +686,7 @@ is a *different adapter* -- one new module plus one line in the registry (see
 [Adding a future source adapter](#adding-a-future-source-adapter)) -- not a
 format flag on this one: the record shape is declared by `document`, not by the type name.
 
-Use [config/s3_json.example.yaml](config/s3_json.example.yaml) with
+Use [config/s3_json_time_partitioned.example.yaml](config/s3_json_time_partitioned.example.yaml) with
 `jobs/landing_load_s3_json.py`, then pass **that same file** to
 `jobs/bronze_load.py` -- this source's own config, not the Snowflake one.
 Each source gets its own config file and its own pair of Glue job
@@ -926,7 +927,7 @@ prefix off the envelope. The full `<guid>:<order_id>` string is still landed
 verbatim as `event_id`, so the two can be reconciled in Athena:
 
 ```sql
-SELECT count(*) FROM bronze_events.orders
+SELECT count(*) FROM bronze_acme.orders
 WHERE json_extract_scalar(payload_json, '$.id') IS NOT NULL
   AND split_part(event_id, ':', 2) <> json_extract_scalar(payload_json, '$.id');
 ```
@@ -955,7 +956,7 @@ FROM (
            ORDER BY CAST(json_extract_scalar(payload_json, '$.version') AS DECIMAL(38, 0)) DESC,
                     _s3_last_modified DESC, _source_record_id DESC
          ) AS version_rank
-  FROM bronze_events.orders b
+  FROM bronze_acme.orders b
   WHERE historical_data_type = 'order'
     AND json_extract_scalar(payload_json, '$.id') IS NOT NULL
     AND json_extract_scalar(payload_json, '$.version') IS NOT NULL
@@ -1812,10 +1813,10 @@ file, because the `bronze:` section lives beside the `landing:` section.
 
 | | Snowflake source | S3 JSON source |
 |---|---|---|
-| Config | `acme_snowflake.yaml` | `events_s3_json.yaml` |
+| Config | `acme_snowflake.yaml` | `acme_s3_json.yaml` |
 | Landing job | `landing_load_snowflake.py`, 1 DPU | `landing_load_s3_json.py`, 1 DPU |
 | Bronze job | `bronze_load.py`, 0.0625 DPU | `bronze_load.py`, 0.0625 DPU |
-| `source_key` | `acme_snowflake` | `events_s3_json` |
+| `source_key` | `acme_snowflake` | `acme_s3_json` |
 
 Four Glue job definitions, two scripts for landing, one script for Bronze,
 one wheel, two config files.

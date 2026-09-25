@@ -2,17 +2,17 @@
 #
 # For a source with NO time-based folder layout at all -- files dropped into
 # arbitrary sub-prefixes (per-store, per-tenant, ...) that are not known in
-# advance and grow over time. Use config/s3_json.example.yaml instead if the
-# layout is yyyy/mm/dd/hh partitioned; that shape gets an hourly folder walk
-# instead of listing the whole location on every run.
+# advance and grow over time. Use config/s3_json_time_partitioned.example.yaml
+# instead if the layout is yyyy/mm/dd/hh partitioned; that shape gets an
+# hourly folder walk instead of listing the whole location on every run.
 #
 # Source files, one table:
-#   s3://my-exports/rti_shifts/store-001/2026-09-23-to-2026-09-23.json
-#   s3://my-exports/rti_shifts/store-002/file2.json
-#   s3://my-exports/rti_shifts/store-NNN/...          <- new stores need no config change
+#   s3://my-acme/shifts/store-001/2026-09-23-to-2026-09-23.json
+#   s3://my-acme/shifts/store-002/file2.json
+#   s3://my-acme/shifts/store-NNN/...          <- new stores need no config change
 source:
-  name: rti                # the producer (example) -> source_key rti_s3_json
-  type: s3_json             # the adapter
+  name: acme                # the producer (example) -> source_key acme_s3_json
+  type: s3_json              # the adapter
 
   # No folder structure to walk: `full_prefix` lists each table's `location`
   # in full on every run and filters by LastModified alone. path_format,
@@ -33,8 +33,8 @@ landing:
   checkpoint_table: ingestion-checkpoints
 
 bronze:
-  database: bronze_rti
-  location: s3://my-data-lake/bronze/rti
+  database: bronze_acme
+  location: s3://my-data-lake/bronze/acme
   athena_output: s3://my-data-lake/athena-results/
   processed_runs_table: bronze-processed-runs
   table_prefix: none
@@ -47,8 +47,8 @@ defaults:
 # recurses through every sub-prefix under it (store-001, store-002, a
 # store-NNN added next month) with nothing here naming a single one of them.
 tables:
-  - name: rti_shifts
-    location: s3://my-exports/rti_shifts
+  - name: shifts
+    location: s3://my-acme/shifts
     start_at: "2026-01-01T00:00:00Z"
 
     # There is no folder-boundary lateness problem here -- every run lists
@@ -67,7 +67,7 @@ tables:
 
   # A second feed under the same root is this thin: its own name, its own
   # location, its own checkpoint. Same source_key, same config file, same
-  # pair of Glue jobs as rti_shifts above.
-  - name: rti_cash_sheet_info
-    location: s3://my-exports/rti_cash_sheet_info
+  # pair of Glue jobs as `shifts` above.
+  - name: cash_sheets
+    location: s3://my-acme/cash_sheets
     start_at: "2026-01-01T00:00:00Z"
