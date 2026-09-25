@@ -254,10 +254,10 @@ def test_source_level_wiring_is_rejected_for_a_relational_source():
 
 
 def test_example_is_a_valid_bronze_enabled_config():
-    path = Path(__file__).parents[2] / "config" / "s3_json.example.yaml"
+    path = Path(__file__).parents[2] / "config" / "s3_json_time_partitioned.example.yaml"
     config = parse_config(path.read_text())
-    assert config.source_key == "events_s3_json"
-    assert config.bronze.database == "bronze_events"
+    assert config.source_key == "acme_s3_json"
+    assert config.bronze.database == "bronze_acme"
     # One database per source, so the source_key prefix would only be noise.
     # Identity, applied once at CREATE TABLE: pinned so it cannot drift.
     assert config.bronze.table_prefix == "none"
@@ -285,3 +285,85 @@ def test_reserved_columns_include_everything_the_landing_writer_stamps():
     for column in LINEAGE_COLUMNS:
         with pytest.raises(ConfigurationError, match="reserved"):
             table(envelope_fields={column: "groupid"})
+
+
+# --- full_prefix discovery --------------------------------------------------
+
+def test_full_prefix_discovery_is_accepted():
+    discovery = source(discovery={"type": "full_prefix", "suffix": ".json"}).s3.discovery
+    assert discovery.type == "full_prefix"
+    assert discovery.suffix == ".json"
+
+
+@pytest.mark.parametrize("override", [
+    {"path_format": "year=%Y/month=%m"},
+    {"timezone": "America/Chicago"},
+    {"lookahead_hours": 2},
+])
+def test_full_prefix_rejects_time_partitioned_only_settings(override):
+    # These exist to configure a folder walk full_prefix does not have.
+    # Leaving them set (a copy-paste from a time_partitioned source) would
+    # silently do nothing, so they are refused instead.
+    with pytest.raises(ConfigurationError, match="only apply to discovery.type: time_partitioned"):
+        source(discovery={"type": "full_prefix", **override})
+
+
+def test_full_prefix_defaults_for_those_settings_are_fine():
+    # The defaults happen to equal what time_partitioned would also use, so
+    # they are not "set" in any meaningful sense -- only an explicit,
+    # non-default value is refused.
+    discovery = source(discovery={"type": "full_prefix"}).s3.discovery
+    assert discovery.type == "full_prefix"
+
+
+def test_full_prefix_does_not_require_positive_lookback():
+    # There is no folder to keep in the walk after its hour closes -- the
+    # whole location is listed every run regardless of lateness.
+    data = deepcopy(CONFIG)
+    data["source"]["discovery"] = {"type": "full_prefix"}
+    data["tables"][0]["checkpoint"] = {"type": "watermark", "column": "_s3_last_modified",
+                                       "lookback_minutes": 0}
+    cfg = parse(data)
+    assert cfg.tables[0].checkpoint.lookback_minutes == 0
+
+
+def test_time_partitioned_still_requires_positive_lookback():
+    data = deepcopy(CONFIG)
+    data["tables"][0]["checkpoint"] = {"type": "watermark", "column": "_s3_last_modified",
+                                       "lookback_minutes": 0}
+    with pytest.raises(ConfigurationError, match="positive lookback_minutes"):
+        parse(data)
+
+
+def test_a_source_can_have_multiple_full_prefix_tables_with_different_locations():
+    # The dynamic-store scenario: shifts and cash_sheets are two tables
+    # under one source, each its own location, no time partitioning, and no
+    # config change needed when a new store-XXX prefix appears under either.
+    data = deepcopy(CONFIG)
+    data["source"]["discovery"] = {"type": "full_prefix", "suffix": ".json"}
+    data["tables"] = [
+        {"name": "shifts", "location": "s3://bucket/acme-data-export/shifts",
+         "start_at": "2026-01-01T00:00:00Z"},
+        {"name": "cash_sheets", "location": "s3://bucket/acme-data-export/cash_sheets",
+         "start_at": "2026-01-01T00:00:00Z"},
+    ]
+    cfg = parse(data)
+    assert [t.s3.location for t in cfg.tables] == [
+        "s3://bucket/acme-data-export/shifts", "s3://bucket/acme-data-export/cash_sheets"]
+    assert all(t.s3.discovery.type == "full_prefix" for t in cfg.tables)
+
+
+def test_full_prefix_example_is_a_valid_bronze_enabled_config():
+    path = Path(__file__).parents[2] / "config" / "s3_json_full_prefix.example.yaml"
+    config = parse_config(path.read_text())
+    assert config.source_key == "acme_s3_json"
+    assert len(config.tables) == 2
+    shifts, cash = config.tables
+    assert shifts.name == "shifts" and shifts.s3.location == "s3://my-acme/shifts"
+    assert cash.name == "cash_sheets" and cash.s3.location == "s3://my-acme/cash_sheets"
+    assert shifts.s3.discovery.type == "full_prefix"
+    assert shifts.checkpoint.lookback_minutes == 0
+    # The second table omits checkpoint entirely -- the (unused) default
+    # still parses, proving it really is optional for this discovery type.
+    assert cash.checkpoint.lookback_minutes == 15
+    assert shifts.s3.document.records == "array" and shifts.s3.document.compression == "none"

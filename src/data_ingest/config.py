@@ -576,7 +576,11 @@ def _parse_s3_table(data, source_s3):
         )
     if checkpoint.type != "watermark" or checkpoint.column != "_s3_last_modified":
         raise ConfigurationError("s3_json checkpoint must watermark _s3_last_modified")
-    if checkpoint.lookback_minutes < 1:
+    # Positive lookback exists to keep a folder in the walk after its hour
+    # has closed, so a late arrival is still found. full_prefix has no
+    # folder walk -- it lists the whole location every run regardless of
+    # lateness -- so the requirement is specific to time_partitioned.
+    if source_s3["discovery"].type == "time_partitioned" and checkpoint.lookback_minutes < 1:
         raise ConfigurationError("s3_json requires positive lookback_minutes for boundary arrivals")
     bucket, prefix = split_s3_uri(settings.location)
     return TableConfig(

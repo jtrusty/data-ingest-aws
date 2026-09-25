@@ -28,7 +28,7 @@ ENVELOPE_FIELDS = {'group_id': 'groupid', 'business_date': 'businessdate',
                    'historical_data_type': 'historicaldatatype'}
 
 
-_DISCOVERY_KEYS = {'timezone', 'path_format', 'suffix', 'safety_delay_seconds', 'prefetch', 'lookahead_hours', 'max_window_hours'}
+_DISCOVERY_KEYS = {'type', 'timezone', 'path_format', 'suffix', 'safety_delay_seconds', 'prefetch', 'lookahead_hours', 'max_window_hours'}
 _DOCUMENT_KEYS = {'compression', 'records', 'envelope', 'preset',
                   'max_object_bytes', 'max_outer_bytes', 'max_payload_bytes', 'batch_bytes'}
 
@@ -584,3 +584,79 @@ def test_a_backfill_drains_in_committed_windows_through_the_real_pipeline():
     assert highs[3].startswith('2026-09-04 11:58:0')
     assert len(landed) == 72 and len(set(landed)) == 72
     assert source.is_caught_up(committed['rec'].checkpoint) is True
+
+
+# --- full_prefix discovery --------------------------------------------------
+
+def test_prefixes_yields_the_table_location_once_regardless_of_window():
+    source, *_ = setup_source(type='full_prefix', location='s3://bucket/rti_shifts')
+    # low/high are irrelevant to full_prefix -- pass values that would walk
+    # dozens of hourly folders under time_partitioned, to prove they're unused.
+    prefixes = list(source._prefixes(instant('2026-01-01T00:00:00'), instant('2026-09-10T09:30:00')))
+    assert prefixes == ['rti_shifts/']
+
+
+def test_prefixes_with_no_prefix_component_yields_empty_string():
+    source, *_ = setup_source(type='full_prefix', location='s3://bucket')
+    assert list(source._prefixes(instant('2026-09-10T09:00:00'), instant('2026-09-10T09:30:00'))) == ['']
+
+
+def test_new_store_subprefixes_are_found_with_no_config_change():
+    """
+    The scenario full_prefix exists for: store-XXX folders under one table
+    location, unknown in advance, growing over time. A flat listing recurses
+    through all of them -- no store list to maintain in config.
+    """
+    client = Mock()
+    objects = {
+        'rti_shifts/store-001/a.json': instant('2026-09-10T09:00:00'),
+        'rti_shifts/store-103/b.json': instant('2026-09-10T09:05:00'),
+        'rti_shifts/store-999/c.json': instant('2026-09-10T09:10:00'),  # a store never configured anywhere
+    }
+    client.get_paginator.return_value.paginate.return_value = [{'Contents': [
+        dict(Key=k, ETag='"e"', LastModified=lm, Size=10) for k, lm in objects.items()]}]
+    body = json.dumps([{'id': 1}]).encode()
+    client.get_object.side_effect = lambda **kw: {'Body': io.BytesIO(body), 'ContentLength': len(body)}
+    source = S3JsonSource(
+        config(type='full_prefix', location='s3://bucket/rti_shifts', suffix='.json',
+              preset='records', compression='none', records='array'),
+        s3_client=client, now=lambda: instant('2026-09-10T09:32:00'))
+
+    frames = list(source.extract(None, source.get_current_checkpoint()))
+    keys = sorted(k for f in frames for k in f['_s3_key'])
+    assert keys == sorted(objects)          # all three stores found, none configured by name
+    assert client.get_paginator.return_value.paginate.call_args.kwargs['Prefix'] == 'rti_shifts/'
+
+
+def test_full_prefix_window_is_exclusive_at_previous_checkpoint_inclusive_at_high():
+    client = Mock()
+    at = lambda t, key: dict(Key=key, ETag='"e"', LastModified=instant(t), Size=10)
+    objects = [
+        at('2026-09-10T09:29:59', 'shifts/store-001/before.json'),   # before prev high: already landed
+        at('2026-09-10T09:30:00', 'shifts/store-002/at-prev.json'),  # == prev high: already landed
+        at('2026-09-10T09:45:00', 'shifts/store-003/in-window.json'),
+        at('2026-09-10T10:00:00', 'shifts/store-004/at-high.json'),  # == high: inclusive
+        at('2026-09-10T10:00:01', 'shifts/store-005/after.json'),    # after high
+    ]
+    client.get_paginator.return_value.paginate.return_value = [{'Contents': objects}]
+    body = json.dumps([{'id': 1}]).encode()
+    client.get_object.side_effect = lambda **kw: {'Body': io.BytesIO(body), 'ContentLength': len(body)}
+    source = S3JsonSource(
+        config(type='full_prefix', location='s3://bucket/shifts', suffix='.json',
+              preset='records', compression='none', records='array'),
+        s3_client=client, now=lambda: instant('2026-09-10T10:02:00'))
+
+    frames = list(source.extract(checkpoint('2026-09-10 09:30:00.000000'),
+                                 checkpoint('2026-09-10 10:00:00.000000')))
+    keys = sorted(k for f in frames for k in f['_s3_key'])
+    assert keys == ['shifts/store-003/in-window.json', 'shifts/store-004/at-high.json']
+
+
+def test_full_prefix_metadata_records_the_discovery_type():
+    source, *_ = setup_source(type='full_prefix', location='s3://bucket/rti_shifts')
+    assert source.metadata()['discovery_type'] == 'full_prefix'
+
+
+def test_time_partitioned_metadata_still_records_its_type():
+    source, *_ = setup_source()
+    assert source.metadata()['discovery_type'] == 'time_partitioned'

@@ -1,8 +1,10 @@
-"""Bounded extraction of immutable, time-partitioned JSON documents in S3.
+"""Bounded extraction of immutable JSON documents in S3.
 
-The wire format is declared, not assumed: prefix layout and file suffix come
-from `discovery`, and how a file is opened, framed, and where its payload
-lives come from `document`. So the adapter carries no vocabulary from any one
+How files are found is declared, not assumed: `discovery.type` is either
+`time_partitioned` (hourly yyyy/mm/dd/hh-style folders, walked incrementally)
+or `full_prefix` (no folder layout at all -- list the table's whole location
+on every run). How a file is opened, framed, and where its payload lives
+comes from `document`. So the adapter carries no vocabulary from any one
 producer -- CloudEvents is one preset among others, not a built-in assumption.
 
 Envelope attributes become columns via `envelope_fields`. The payload is
@@ -111,9 +113,16 @@ class S3JsonSource(Source):
 
     def __init__(self, s3_config, lookback_minutes=15, fetch_size=10_000,
                  s3_client=None, now=None):
-        for name, value in (('fetch_size', fetch_size), ('lookback_minutes', lookback_minutes)):
-            if type(value) is not int or value <= 0:
-                raise ConfigurationError(f'{name} must be a positive integer')
+        if type(fetch_size) is not int or fetch_size <= 0:
+            raise ConfigurationError('fetch_size must be a positive integer')
+        # lookback only widens the folder walk for time_partitioned, so a
+        # full_prefix table -- which lists everything every run regardless
+        # of lateness -- may leave it at 0. config.py enforces the same
+        # split when parsing YAML; this repeats it for callers (tests,
+        # build_source) that construct the source directly.
+        min_lookback = 1 if s3_config.discovery.type == 'time_partitioned' else 0
+        if type(lookback_minutes) is not int or lookback_minutes < min_lookback:
+            raise ConfigurationError(f'lookback_minutes must be an integer >= {min_lookback}')
         self.config = s3_config
         self.bucket, self.prefix = split_s3_uri(s3_config.location)
         self.lookback_minutes = lookback_minutes
@@ -145,6 +154,7 @@ class S3JsonSource(Source):
         payload = self._document.payload
         return {
             'bucket': self.bucket, 'prefix': self.prefix,
+            'discovery_type': self._discovery.type,
             'folder_timezone': self._discovery.timezone,
             'path_format': self._discovery.path_format,
             'suffix': self._discovery.suffix,
@@ -201,6 +211,16 @@ class S3JsonSource(Source):
         return rendered if rendered.endswith('/') else rendered + '/'
 
     def _prefixes(self, low, high):
+        if self._discovery.type == "full_prefix":
+            # No folder structure to walk: the table's own location is the
+            # one prefix, listed in full on every run regardless of the
+            # window. A new sub-prefix (a new store, say) needs no config
+            # change -- S3 lists it along with everything else the moment it
+            # exists. `_objects` still filters every yielded item by suffix
+            # and LastModified, so the window semantics are identical to
+            # time_partitioned; only how prefixes are found differs.
+            yield f'{self.prefix}/' if self.prefix else ''
+            return
         # Round in local time, then step on the UTC timeline. This handles
         # fractional UTC offsets and skips nonexistent daylight-saving hours.
         hour = low.astimezone(self._folder_timezone).replace(minute=0, second=0, microsecond=0)

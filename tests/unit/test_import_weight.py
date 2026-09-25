@@ -61,7 +61,7 @@ def test_bronze_stays_light_while_parsing_a_s3_json_config():
     # the child's stderr is captured and never shown.
     from pathlib import Path
 
-    example = Path(__file__).parents[2] / "config" / "s3_json.example.yaml"
+    example = Path(__file__).parents[2] / "config" / "s3_json_time_partitioned.example.yaml"
     assert _loaded_heavy_modules(
         f"""
         from data_ingest.bronze.job import run_bronze_job

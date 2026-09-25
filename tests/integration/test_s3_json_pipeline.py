@@ -274,3 +274,100 @@ def test_real_bronze_loader_uses_source_identity_in_recorded_sql(env):
     assert 'target."_s3_last_modified" = source."_s3_last_modified"' in merge
     assert "WHEN NOT MATCHED THEN INSERT" in merge
     assert 'target."order_id" = source."order_id"' not in merge
+
+
+# --------------------------------------------------------------------------
+# full_prefix discovery: unpartitioned, dynamically-appearing sub-prefixes
+# --------------------------------------------------------------------------
+
+def test_full_prefix_discovers_new_store_subprefixes_with_no_config_change():
+    """
+    Real moto S3, not a mock: proves list_objects_v2 with a bare prefix
+    genuinely recurses through nested "store" folders the config never
+    names, and that the real pipeline (Parquet, manifest, checkpoint) lands
+    them. This is the scenario full_prefix exists for -- a nightly dump into
+    store-XXX subfolders under one flat location, where the store list is
+    not known in advance.
+
+    The three timestamps involved (put, checkpoint, next run) stay minutes
+    apart on purpose: S3's LastModified has ONE-SECOND resolution, so a
+    test that put new objects between two runs a fraction of a second apart
+    would be exercising moto's clock granularity, not the adapter -- that
+    precise boundary behavior (exclusive at the previous checkpoint,
+    inclusive at high) is already covered deterministically with a
+    fabricated clock in test_s3_json_source.py.
+    """
+    with mock_aws():
+        s3 = boto3.client("s3")
+        s3.create_bucket(Bucket=RAW_BUCKET)
+        s3.create_bucket(Bucket=LANDING_BUCKET)
+        table = boto3.resource("dynamodb").create_table(
+            TableName=STATE_TABLE,
+            KeySchema=[{"AttributeName": "source_key", "KeyType": "HASH"},
+                       {"AttributeName": "table_name", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": "source_key", "AttributeType": "S"},
+                                  {"AttributeName": "table_name", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        store = DynamoDBStateStore(table)
+        writer = LandingWriter(s3, LANDING_BUCKET, "landing")
+        start = datetime.now(timezone.utc) - timedelta(minutes=30)
+        config_text = yaml.safe_dump({
+            "source": {
+                "name": "acme", "type": "s3_json",
+                "discovery": {"type": "full_prefix", "suffix": ".json"},
+                "document": {"preset": "records", "compression": "none", "records": "array"},
+            },
+            "landing": {"location": f"s3://{LANDING_BUCKET}/landing",
+                        "checkpoint_table": STATE_TABLE},
+            "tables": [{
+                "name": "shifts",
+                "location": f"s3://{RAW_BUCKET}/shifts",
+                "start_at": start.isoformat(),
+                "checkpoint": {"type": "watermark", "column": "_s3_last_modified",
+                              "lookback_minutes": 0},
+            }],
+        }, sort_keys=False)
+        config = parse_config(config_text)
+        table_config = config.tables[0]
+
+        # Three stores, none named anywhere in the config -- nested arbitrarily
+        # deep under the table's one location, the way a real per-store dump
+        # would grow over time.
+        for store_id, shift_id in [("001", "a"), ("103", "b"), ("999", "c")]:
+            s3.put_object(Bucket=RAW_BUCKET, Key=f"shifts/store-{store_id}/{shift_id}.json",
+                          Body=json.dumps([{"shift_id": shift_id, "store": store_id}]).encode())
+
+        def make_source(now):
+            return S3JsonSource(table_config.s3, lookback_minutes=table_config.checkpoint.lookback_minutes,
+                                fetch_size=10, s3_client=s3, now=lambda: now)
+
+        # Generous margin past the 120s safety_delay -- this is a first run
+        # (inclusive at both ends), so there is no tight boundary to hit.
+        first = run_table(make_source(datetime.now(timezone.utc) + timedelta(minutes=5)),
+                          store, writer, "s3_json", "acme", table_config)
+        assert first.status == "SUCCESS"
+        assert first.row_count == 3
+
+        parquet_keys = [k["Key"] for k in s3.list_objects_v2(
+            Bucket=LANDING_BUCKET, Prefix="landing/").get("Contents", []) if k["Key"].endswith(".parquet")]
+        assert len(parquet_keys) == 1
+        landed = pq.read_table(io.BytesIO(
+            s3.get_object(Bucket=LANDING_BUCKET, Key=parquet_keys[0])["Body"].read())
+        ).to_pandas()
+        assert sorted(landed["_s3_key"]) == [
+            "shifts/store-001/a.json", "shifts/store-103/b.json", "shifts/store-999/c.json"]
+        committed_manifest = json.loads(s3.get_object(
+            Bucket=LANDING_BUCKET,
+            Key=[k["Key"] for k in s3.list_objects_v2(Bucket=LANDING_BUCKET, Prefix="landing/")["Contents"]
+                if k["Key"].endswith("_manifest.json")][0],
+        )["Body"].read())
+        assert committed_manifest["status"] == "SUCCESS" and committed_manifest["row_count"] == 3
+
+        # No new objects: the second run's window starts strictly after the
+        # committed checkpoint (already minutes ahead of the real objects'
+        # LastModified) and finds nothing, without re-landing what exists.
+        second = run_table(make_source(datetime.now(timezone.utc) + timedelta(minutes=10)),
+                           store, writer, "s3_json", "acme", table_config)
+        assert second.status == "SUCCESS"
+        assert second.row_count == 0

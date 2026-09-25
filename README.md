@@ -3,7 +3,7 @@
 Reusable AWS Glue ingestion framework: source -> immutable S3 Landing, with
 a generic checkpoint/state model and transactional commit semantics.
 
-Adapters: **Snowflake -> S3 Landing** and **time-partitioned JSON in S3 -> S3 Landing**.
+Adapters: **Snowflake -> S3 Landing** and **JSON documents in S3 -> S3 Landing**.
 Both use the same transactional pipeline and Bronze loader.
 
 ## Architecture
@@ -51,7 +51,7 @@ src/data_ingest/
     base.py         Source interface (get_current_checkpoint / extract / metadata)
     registry.py     source.type -> adapter module; add a source with one line here
     snowflake.py    Snowflake adapter (fetchmany batching; lossless watermark codecs)
-    s3_json.py       time-partitioned JSON in S3, modification-time checkpoint + overlap
+    s3_json.py       JSON documents in S3, time-partitioned or full-prefix discovery
     json_decode.py   bounded gzip/base64 decoding with exact JSON preservation
   checkpoints/
     base.py         Checkpoint interface
@@ -74,9 +74,10 @@ jobs/                      thin Glue entry points, named <layer>_load[_<source>]
   bronze_load.py             landing -> bronze. No source suffix: landing is
                              the normalization boundary, so one script serves
                              every source.
-  landing_load_s3_json.py     time-partitioned JSON in S3 -> landing, using the job IAM role
+  landing_load_s3_json.py     JSON documents in S3 -> landing, using the job IAM role
 config/snowflake.example.yaml  example config; real ones are gitignored
-config/s3_json.example.yaml     S3 JSON source template, including bootstrap date
+config/s3_json_time_partitioned.example.yaml   S3 JSON, hourly-folder template
+config/s3_json_full_prefix.example.yaml         S3 JSON, no-folder-layout template
 constraints-glue.txt       frozen dependency set matching the Glue runtime
 tests/unit/                pytest suite (moto-mocked AWS)
 tests/conftest.py          pins AWS region/credentials so tests don't inherit
@@ -341,7 +342,7 @@ bronze:
 ```
 
 ```sql
-SELECT payload_json.id, payload_json.version FROM bronze_events.orders;   -- Redshift
+SELECT payload_json.id, payload_json.version FROM bronze_acme.orders;   -- Redshift
 ```
 
 Iceberg has no such type, so the table deliberately carries **two schemas**:
@@ -487,7 +488,7 @@ names) and are uploaded to S3, where the job reads them via `--config-uri`.
 Adding table #13 is a YAML change only — no Python, no new DynamoDB setup
 (the first run for a new table creates its own state record).
 
-## Time-partitioned JSON in S3  (`s3_json`)
+## JSON documents in S3  (`s3_json`)
 
 Same two jobs as any other source; only the extraction end changes:
 
@@ -511,7 +512,7 @@ small allowlist:
 
 ```yaml
 source:
-  name: events                       # the producer
+  name: acme                         # the producer
   type: s3_json                      # the adapter
 
   discovery:                         # how files are found
@@ -541,9 +542,9 @@ tables:
 the list of paths a producer publishes, each with its own `location`, start
 date, and checkpoint. A second feed -- timecards, refunds -- is a second
 entry under the same source, not a second source: same `source_key`, same
-config file, same pair of Glue jobs, landing at `.../events_s3_json/orders/`
-and `.../events_s3_json/timecards/`, Bronze at `bronze_events.orders` and
-`bronze_events.timecards`. What the source level holds is what those paths
+config file, same pair of Glue jobs, landing at `.../acme_s3_json/orders/`
+and `.../acme_s3_json/timecards/`, Bronze at `bronze_acme.orders` and
+`bronze_acme.timecards`. What the source level holds is what those paths
 share: how files are found and how they decode.
 
 Notice what is **not** there: nothing says which payload field identifies an
@@ -592,11 +593,11 @@ Promoting payload fields to their own columns is a **Silver** decision:
 ```sql
 SELECT json_extract_scalar(payload_json, '$.id')  AS order_id,
        json_extract_scalar(payload_json, '$.version') AS version
-FROM bronze_events.orders;
+FROM bronze_acme.orders;
 
 -- line items explode from the same column
 SELECT json_extract_scalar(o.payload_json, '$.id') AS order_id, i.sku, i.qty
-FROM bronze_events.orders o
+FROM bronze_acme.orders o
 CROSS JOIN UNNEST(
   CAST(json_extract(o.payload_json, '$.items') AS ARRAY(ROW(sku VARCHAR, qty INTEGER)))
 ) AS i (sku, qty);
@@ -674,8 +675,8 @@ quietly matching zero tables:
 | the job script | `run_job(expected_source_type="s3_json")` |
 
 It also fixes identity: `source_key` is `<source.name>_<source.type>`, so
-`name: events` here lands under `landing/events_s3_json/…` and
-keys DynamoDB on `events_s3_json`. Changing the type after a run has
+`name: acme` here lands under `landing/acme_s3_json/…` and
+keys DynamoDB on `acme_s3_json`. Changing the type after a run has
 committed re-partitions landing and orphans the checkpoint -- see
 [Identity](#identity).
 
@@ -685,7 +686,7 @@ is a *different adapter* -- one new module plus one line in the registry (see
 [Adding a future source adapter](#adding-a-future-source-adapter)) -- not a
 format flag on this one: the record shape is declared by `document`, not by the type name.
 
-Use [config/s3_json.example.yaml](config/s3_json.example.yaml) with
+Use [config/s3_json_time_partitioned.example.yaml](config/s3_json_time_partitioned.example.yaml) with
 `jobs/landing_load_s3_json.py`, then pass **that same file** to
 `jobs/bronze_load.py` -- this source's own config, not the Snowflake one.
 Each source gets its own config file and its own pair of Glue job
@@ -704,7 +705,7 @@ needs the `.json.gz` suffix; its embedded timestamp is not parsed.
 `folder_timezone` defaults to UTC and must match the producer's folder
 clock, which is independent of any business date inside the records.
 
-### Discovery and replay
+### Discovery and replay  (`discovery.type: time_partitioned`, the default)
 
 Each run has two bounds that are deliberately **not** the same thing:
 
@@ -755,9 +756,10 @@ uploads into old folders, files moved between prefixes, and overwrites are
 not supported by this discovery strategy. A small delay crossing an hour
 boundary is covered only while that folder remains in the scan window.
 If the producer backfills old folders, use a deliberate checkpoint rewind
-and replay; for unbounded lateness, switch discovery to a full-prefix
-reconciliation or durable S3 event queue. Changing `start_at` alone does
-not rewind an existing checkpoint.
+and replay; for unbounded lateness or a layout with no time-based folders at
+all, use [`discovery.type: full_prefix`](#discovery-full_prefix) instead, or
+a durable S3 event queue. Changing `start_at` alone does not rewind an
+existing checkpoint.
 
 **This contract was measured, not assumed.** Against one production feed,
 `scripts/json_folder_contract_check.py` listed 377,558 objects over roughly
@@ -823,6 +825,61 @@ intervals also commit, keeping idle sources from rescanning their history.
 Decode, download, or landing failures leave the checkpoint unchanged.
 Incomplete landing runs remain invisible to Bronze.
 
+### Discovery: `full_prefix`
+
+For a location with **no time-based folder layout at all** -- files dropped
+into sub-prefixes that are not partitioned by upload hour, and not
+necessarily known in advance:
+
+```
+s3://exports/rti_shifts/store-001/2026-09-23-to-2026-09-23.json
+s3://exports/rti_shifts/store-002/file2.json
+s3://exports/rti_shifts/store-NNN/...          <- a new store, no config change
+```
+
+```yaml
+discovery:
+  type: full_prefix
+  suffix: ".json"
+
+tables:
+  - name: rti_shifts
+    location: s3://exports/rti_shifts   # the WHOLE path is listed, every run
+    start_at: "2026-01-01T00:00:00Z"
+```
+
+There is no folder to walk. Every run lists the table's `location` in full,
+recursively, and filters by `suffix` and `LastModified` -- the same window
+semantics as `time_partitioned` (exclusive at the previous checkpoint,
+inclusive at the upper bound), just without a folder walk deciding what gets
+listed first. A `store-NNN` that appears next month is found the moment it
+exists; there is no store list to maintain.
+
+Three settings are **specific to `time_partitioned` and are refused if set
+here**: `path_format`, `timezone`, `lookahead_hours`. There is no folder to
+name or walk, so a leftover value from copying a `time_partitioned` config
+would silently do nothing -- refusing it catches the copy-paste rather than
+letting the setting sit there doing nothing.
+
+`checkpoint.lookback_minutes` is **not required to be positive** for this
+type, unlike `time_partitioned`. Lookback exists to keep a folder in the
+walk after its hour has closed; `full_prefix` has no such folder-boundary
+lateness problem, since the whole location is listed every run regardless of
+when a file arrived. `0` is a reasonable default.
+
+**The cost tradeoff is the opposite of `time_partitioned`'s.** A full
+listing costs more per run than a couple of hourly-folder listings, and that
+cost grows with total object count under `location`, not with how much is
+new. It suits a nightly dump or a modest, slowly-growing tree; a location
+with millions of objects and a tight schedule would spend most of a run just
+listing. `time_partitioned` was chosen over this for the project's own
+production feed specifically because that feed's layout has folder
+structure to exploit — see the measurement above.
+
+`config/s3_json_full_prefix.example.yaml` is a complete worked example,
+including a second table under the same source to show how thin adding one
+is.
+
 ### Decoded data and history
 
 The outer gzip file holds an array of parent event records; a single object
@@ -870,7 +927,7 @@ prefix off the envelope. The full `<guid>:<order_id>` string is still landed
 verbatim as `event_id`, so the two can be reconciled in Athena:
 
 ```sql
-SELECT count(*) FROM bronze_events.orders
+SELECT count(*) FROM bronze_acme.orders
 WHERE json_extract_scalar(payload_json, '$.id') IS NOT NULL
   AND split_part(event_id, ':', 2) <> json_extract_scalar(payload_json, '$.id');
 ```
@@ -899,7 +956,7 @@ FROM (
            ORDER BY CAST(json_extract_scalar(payload_json, '$.version') AS DECIMAL(38, 0)) DESC,
                     _s3_last_modified DESC, _source_record_id DESC
          ) AS version_rank
-  FROM bronze_events.orders b
+  FROM bronze_acme.orders b
   WHERE historical_data_type = 'order'
     AND json_extract_scalar(payload_json, '$.id') IS NOT NULL
     AND json_extract_scalar(payload_json, '$.version') IS NOT NULL
@@ -1756,10 +1813,10 @@ file, because the `bronze:` section lives beside the `landing:` section.
 
 | | Snowflake source | S3 JSON source |
 |---|---|---|
-| Config | `acme_snowflake.yaml` | `events_s3_json.yaml` |
+| Config | `acme_snowflake.yaml` | `acme_s3_json.yaml` |
 | Landing job | `landing_load_snowflake.py`, 1 DPU | `landing_load_s3_json.py`, 1 DPU |
 | Bronze job | `bronze_load.py`, 0.0625 DPU | `bronze_load.py`, 0.0625 DPU |
-| `source_key` | `acme_snowflake` | `events_s3_json` |
+| `source_key` | `acme_snowflake` | `acme_s3_json` |
 
 Four Glue job definitions, two scripts for landing, one script for Bronze,
 one wheel, two config files.

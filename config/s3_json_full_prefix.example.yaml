@@ -1,0 +1,73 @@
+# Copy to <name>_s3_json.yaml and replace bucket names/start_at.
+#
+# For a source with NO time-based folder layout at all -- files dropped into
+# arbitrary sub-prefixes (per-store, per-tenant, ...) that are not known in
+# advance and grow over time. Use config/s3_json_time_partitioned.example.yaml
+# instead if the layout is yyyy/mm/dd/hh partitioned; that shape gets an
+# hourly folder walk instead of listing the whole location on every run.
+#
+# Source files, one table:
+#   s3://my-acme/shifts/store-001/2026-09-23-to-2026-09-23.json
+#   s3://my-acme/shifts/store-002/file2.json
+#   s3://my-acme/shifts/store-NNN/...          <- new stores need no config change
+source:
+  name: acme                # the producer (example) -> source_key acme_s3_json
+  type: s3_json              # the adapter
+
+  # No folder structure to walk: `full_prefix` lists each table's `location`
+  # in full on every run and filters by LastModified alone. path_format,
+  # timezone and lookahead_hours are time_partitioned-only and are REFUSED
+  # if set here -- there is no folder for them to describe.
+  discovery:
+    type: full_prefix
+    suffix: ".json"          # not gzipped in this example; ".json.gz" also fine
+    safety_delay_seconds: 120
+
+  document:
+    preset: records          # no envelope; each array element IS the record
+    compression: none        # the files themselves are not gzipped
+    records: array           # or "auto" if a file could ever be a lone object
+
+landing:
+  location: s3://my-data-lake/landing
+  checkpoint_table: ingestion-checkpoints
+
+bronze:
+  database: bronze_acme
+  location: s3://my-data-lake/bronze/acme
+  athena_output: s3://my-data-lake/athena-results/
+  processed_runs_table: bronze-processed-runs
+  table_prefix: none
+
+defaults:
+  fetch_size: 5000
+  fail_fast: true
+
+# One table per feed-type root, each its own `location`. `full_prefix`
+# recurses through every sub-prefix under it (store-001, store-002, a
+# store-NNN added next month) with nothing here naming a single one of them.
+tables:
+  - name: shifts
+    location: s3://my-acme/shifts
+    start_at: "2026-01-01T00:00:00Z"
+
+    # There is no folder-boundary lateness problem here -- every run lists
+    # the whole location regardless of when a file arrived -- so lookback
+    # is not required and 0 is a reasonable default for a nightly dump.
+    # Omitting this block entirely also works: the unused 15-minute default
+    # is harmless for full_prefix, just not meaningful.
+    checkpoint:
+      type: watermark
+      column: _s3_last_modified
+      lookback_minutes: 0
+
+    # Fixed; config rejects any other value. See "Physical identity vs
+    # business identity" in the README. Same for every s3_json table.
+    primary_key: [_source_record_id]
+
+  # A second feed under the same root is this thin: its own name, its own
+  # location, its own checkpoint. Same source_key, same config file, same
+  # pair of Glue jobs as `shifts` above.
+  - name: cash_sheets
+    location: s3://my-acme/cash_sheets
+    start_at: "2026-01-01T00:00:00Z"
