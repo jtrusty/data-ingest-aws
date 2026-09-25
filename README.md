@@ -3,7 +3,7 @@
 Reusable AWS Glue ingestion framework: source -> immutable S3 Landing, with
 a generic checkpoint/state model and transactional commit semantics.
 
-Adapters: **Snowflake -> S3 Landing** and **time-partitioned JSON in S3 -> S3 Landing**.
+Adapters: **Snowflake -> S3 Landing** and **JSON documents in S3 -> S3 Landing**.
 Both use the same transactional pipeline and Bronze loader.
 
 ## Architecture
@@ -51,7 +51,7 @@ src/data_ingest/
     base.py         Source interface (get_current_checkpoint / extract / metadata)
     registry.py     source.type -> adapter module; add a source with one line here
     snowflake.py    Snowflake adapter (fetchmany batching; lossless watermark codecs)
-    s3_json.py       time-partitioned JSON in S3, modification-time checkpoint + overlap
+    s3_json.py       JSON documents in S3, time-partitioned or full-prefix discovery
     json_decode.py   bounded gzip/base64 decoding with exact JSON preservation
   checkpoints/
     base.py         Checkpoint interface
@@ -74,7 +74,7 @@ jobs/                      thin Glue entry points, named <layer>_load[_<source>]
   bronze_load.py             landing -> bronze. No source suffix: landing is
                              the normalization boundary, so one script serves
                              every source.
-  landing_load_s3_json.py     time-partitioned JSON in S3 -> landing, using the job IAM role
+  landing_load_s3_json.py     JSON documents in S3 -> landing, using the job IAM role
 config/snowflake.example.yaml  example config; real ones are gitignored
 config/s3_json.example.yaml     S3 JSON source template, including bootstrap date
 constraints-glue.txt       frozen dependency set matching the Glue runtime
@@ -487,7 +487,7 @@ names) and are uploaded to S3, where the job reads them via `--config-uri`.
 Adding table #13 is a YAML change only — no Python, no new DynamoDB setup
 (the first run for a new table creates its own state record).
 
-## Time-partitioned JSON in S3  (`s3_json`)
+## JSON documents in S3  (`s3_json`)
 
 Same two jobs as any other source; only the extraction end changes:
 
@@ -704,7 +704,7 @@ needs the `.json.gz` suffix; its embedded timestamp is not parsed.
 `folder_timezone` defaults to UTC and must match the producer's folder
 clock, which is independent of any business date inside the records.
 
-### Discovery and replay
+### Discovery and replay  (`discovery.type: time_partitioned`, the default)
 
 Each run has two bounds that are deliberately **not** the same thing:
 
@@ -755,9 +755,10 @@ uploads into old folders, files moved between prefixes, and overwrites are
 not supported by this discovery strategy. A small delay crossing an hour
 boundary is covered only while that folder remains in the scan window.
 If the producer backfills old folders, use a deliberate checkpoint rewind
-and replay; for unbounded lateness, switch discovery to a full-prefix
-reconciliation or durable S3 event queue. Changing `start_at` alone does
-not rewind an existing checkpoint.
+and replay; for unbounded lateness or a layout with no time-based folders at
+all, use [`discovery.type: full_prefix`](#discovery-full_prefix) instead, or
+a durable S3 event queue. Changing `start_at` alone does not rewind an
+existing checkpoint.
 
 **This contract was measured, not assumed.** Against one production feed,
 `scripts/json_folder_contract_check.py` listed 377,558 objects over roughly
@@ -822,6 +823,61 @@ DynamoDB advances only after the Parquet run's manifest commits. Empty
 intervals also commit, keeping idle sources from rescanning their history.
 Decode, download, or landing failures leave the checkpoint unchanged.
 Incomplete landing runs remain invisible to Bronze.
+
+### Discovery: `full_prefix`
+
+For a location with **no time-based folder layout at all** -- files dropped
+into sub-prefixes that are not partitioned by upload hour, and not
+necessarily known in advance:
+
+```
+s3://exports/rti_shifts/store-001/2026-09-23-to-2026-09-23.json
+s3://exports/rti_shifts/store-002/file2.json
+s3://exports/rti_shifts/store-NNN/...          <- a new store, no config change
+```
+
+```yaml
+discovery:
+  type: full_prefix
+  suffix: ".json"
+
+tables:
+  - name: rti_shifts
+    location: s3://exports/rti_shifts   # the WHOLE path is listed, every run
+    start_at: "2026-01-01T00:00:00Z"
+```
+
+There is no folder to walk. Every run lists the table's `location` in full,
+recursively, and filters by `suffix` and `LastModified` -- the same window
+semantics as `time_partitioned` (exclusive at the previous checkpoint,
+inclusive at the upper bound), just without a folder walk deciding what gets
+listed first. A `store-NNN` that appears next month is found the moment it
+exists; there is no store list to maintain.
+
+Three settings are **specific to `time_partitioned` and are refused if set
+here**: `path_format`, `timezone`, `lookahead_hours`. There is no folder to
+name or walk, so a leftover value from copying a `time_partitioned` config
+would silently do nothing -- refusing it catches the copy-paste rather than
+letting the setting sit there doing nothing.
+
+`checkpoint.lookback_minutes` is **not required to be positive** for this
+type, unlike `time_partitioned`. Lookback exists to keep a folder in the
+walk after its hour has closed; `full_prefix` has no such folder-boundary
+lateness problem, since the whole location is listed every run regardless of
+when a file arrived. `0` is a reasonable default.
+
+**The cost tradeoff is the opposite of `time_partitioned`'s.** A full
+listing costs more per run than a couple of hourly-folder listings, and that
+cost grows with total object count under `location`, not with how much is
+new. It suits a nightly dump or a modest, slowly-growing tree; a location
+with millions of objects and a tight schedule would spend most of a run just
+listing. `time_partitioned` was chosen over this for the project's own
+production feed specifically because that feed's layout has folder
+structure to exploit — see the measurement above.
+
+`config/s3_json_full_prefix.example.yaml` is a complete worked example,
+including a second table under the same source to show how thin adding one
+is.
 
 ### Decoded data and history
 

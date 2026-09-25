@@ -69,7 +69,7 @@ _DOCUMENT_COMPRESSIONS = ("none", "gzip", "zlib", "auto")
 _FRAMINGS = ("object", "array", "jsonl", "auto")
 _FORMATS = ("json",)
 _ENVELOPES = ("none", "cloudevents")
-_DISCOVERY_TYPES = ("time_partitioned",)
+_DISCOVERY_TYPES = ("time_partitioned", "full_prefix")
 
 _COLUMN = re.compile(r"[a-z_][a-z0-9_]*")
 # The landing writer stamps these on every row and refuses a batch that
@@ -93,17 +93,29 @@ _RESERVED_COLUMNS = frozenset({
 
 @dataclass(frozen=True)
 class DiscoveryConfig:
-    """How files are found. Only time-partitioned prefixes for now."""
+    """
+    How files are found.
+
+    `time_partitioned` walks hourly yyyy/mm/dd/hh-style prefixes and needs
+    `path_format`/`timezone`/`lookahead_hours` to do it. `full_prefix` lists
+    the table's whole `location` on every run and ignores all three -- there
+    is no folder to name or walk, so a non-default value for any of them is
+    refused rather than silently ignored (see parse_discovery). It suits a
+    location with no time-based layout at all, including one whose
+    sub-prefixes (e.g. per-store folders) are not known in advance: S3 lists
+    them the moment they exist, with no config change.
+    """
 
     type: str = "time_partitioned"
     path_format: str = "%Y/%m/%d/%H"
     timezone: str = "UTC"
     suffix: str = ".json.gz"
     safety_delay_seconds: int = 120
-    # Folders walked AHEAD of the run's upper bound. A producer whose clock
-    # runs ahead of S3's names a folder for an hour that, by S3's clock, has
-    # not started; walking one hour past `high` catches those in the same run
-    # rather than depending on the next run's lookback reaching back to them.
+    # time_partitioned only. Folders walked AHEAD of the run's upper bound. A
+    # producer whose clock runs ahead of S3's names a folder for an hour
+    # that, by S3's clock, has not started; walking one hour past `high`
+    # catches those in the same run rather than depending on the next run's
+    # lookback reaching back to them.
     lookahead_hours: int = 1
     # Objects fetched concurrently while decoding stays sequential. S3 GET
     # latency dominates a run and releases the GIL; decode does neither.
@@ -206,19 +218,35 @@ def _dotted(section, value):
 def parse_discovery(data):
     settings = DiscoveryConfig(**_known("discovery", data or {}, DiscoveryConfig))
     _choice("discovery", "type", settings.type, _DISCOVERY_TYPES)
-    try:
-        ZoneInfo(settings.timezone)
-    except (TypeError, ValueError, ZoneInfoNotFoundError):
-        raise ConfigurationError("discovery.timezone must be a valid IANA timezone") from None
     if not isinstance(settings.suffix, str) or not settings.suffix:
         raise ConfigurationError("discovery.suffix must be a nonempty string")
-    _validate_path_format(settings.path_format)
     _positive("discovery", "safety_delay_seconds", settings.safety_delay_seconds, 3600)
-    if type(settings.lookahead_hours) is not int or not 0 <= settings.lookahead_hours <= 24:
-        raise ConfigurationError("discovery.lookahead_hours must be an integer from 0 to 24")
     _positive("discovery", "prefetch", settings.prefetch, 32)
     if settings.max_window_hours is not None:
         _positive("discovery", "max_window_hours", settings.max_window_hours, 24 * 366)
+
+    if settings.type == "time_partitioned":
+        try:
+            ZoneInfo(settings.timezone)
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            raise ConfigurationError("discovery.timezone must be a valid IANA timezone") from None
+        _validate_path_format(settings.path_format)
+        if type(settings.lookahead_hours) is not int or not 0 <= settings.lookahead_hours <= 24:
+            raise ConfigurationError("discovery.lookahead_hours must be an integer from 0 to 24")
+    else:
+        # full_prefix has no folder to name or walk. A non-default value here
+        # almost always means the setting was meant for time_partitioned and
+        # was left behind switching types -- refuse it rather than silently
+        # ignore a setting the operator believes is doing something.
+        defaults = DiscoveryConfig()
+        stray = [name for name in ("path_format", "timezone", "lookahead_hours")
+                 if getattr(settings, name) != getattr(defaults, name)]
+        if stray:
+            raise ConfigurationError(
+                f"discovery.{', discovery.'.join(stray)} only apply to "
+                f"discovery.type: time_partitioned; full_prefix lists the whole "
+                f"table location on every run and has no folder to walk"
+            )
     return settings
 
 
