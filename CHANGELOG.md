@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/jtrusty/data-ingest-aws/compare/v1.6.0...v1.6.1) (2026-09-28)
+
+
+### Documentation
+
+* catalog_column_types/super does not fix Spectrum's width limit ([#20](https://github.com/jtrusty/data-ingest-aws/issues/20)) ([73fd24b](https://github.com/jtrusty/data-ingest-aws/commit/73fd24bc1c9d56943319c8fe51582d037d454b00))
+
 ## [1.6.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.5.2...v1.6.0) (2026-09-25)
 
 
