@@ -324,60 +324,77 @@ command and stops. That is also why neither Glue role holds
 
 ### Consumer-facing column types  (`bronze.catalog_column_types`)
 
-Optional, and for one situation: **Redshift Spectrum reading a JSON column
-that can exceed 65,535 bytes.** Leave it out otherwise.
+**Not a fix for a JSON column that can exceed Spectrum's readable width.**
+It was built and shipped as one -- Spectrum takes an Iceberg table's column
+types from its Glue catalog entry, `string` there is a varchar capped at
+65,535 bytes, and declaring the catalog column as `super` was expected to
+let Spectrum read the full document (SUPER's own documented ceiling is far
+larger). Tried against a real `payload_json` column: Spectrum still
+truncated, empirically around 16,000 characters, well under either limit.
+Whatever narrows it that far happens somewhere in Spectrum's own conversion
+path, not in anything this project controls, and declaring `super` here does
+not move it. `payload_json`/`envelope_json` stay `string` (Iceberg's only
+option regardless), and a Spectrum consumer that needs the full document has
+to get it another way -- see below.
 
-Spectrum takes an Iceberg table's column types from its Glue catalog entry,
-where `string` is a varchar capped at 65,535 bytes. A payload longer than
-that is **silently truncated** -- `JSON_PARSE` fails on the row, or a query
-reads a document with its tail missing and nothing reports it. Declaring the
-catalog column as `super` lets Spectrum read it whole (16 MB) and query it
-with dot notation:
+The setting itself still does what it says for a narrower case: declaring
+**some other** Glue-catalog type for a column, for a consumer that reads the
+catalog and where the value in question comfortably fits that type's real
+limit. It is not useful for making an oversized text column readable, which
+is the only reason this project has reached for it so far.
 
 ```yaml
 bronze:
   catalog_column_types:
-    payload_json: super
-    envelope_json: super
+    some_column: some_type
 ```
+
+- **The loader accepts a declared override.** Bronze compares each landing
+  run's schema against the catalog and refuses type changes, because for any
+  undeclared pair that is drift. A by-hand edit is refused as `string ->
+  whatever`; a declared override is treated as a match instead.
+- **It survives.** Athena rewrites the catalog columns from the Iceberg
+  schema on **every commit** -- `CREATE`, `ALTER TABLE`, and each `MERGE` --
+  so a by-hand edit reverts at the next load. The loader re-applies declared
+  overrides after every DDL and after every merge, through Glue's
+  `UpdateTable` with the entry's `VersionId` as an optimistic lock (the same
+  entry holds Iceberg's `metadata_location` pointer, which a stale write
+  would otherwise rewind). The Bronze role already holds `glue:UpdateTable`
+  for schema evolution.
+- Removing the setting does not require touching the catalog by hand either:
+  with nothing left to re-apply, the very next merge's ordinary rewrite
+  leaves the column however Iceberg's own schema says it should be.
+
+### When a document is too wide for Spectrum
+
+For a `payload_json`/`envelope_json` that can exceed what Spectrum will
+actually return, read it through Redshift's **native** ingestion instead of
+Spectrum's external-table path, which is where the width limit lives:
 
 ```sql
-SELECT payload_json.id, payload_json.version FROM bronze_acme.orders;   -- Redshift
+CREATE TABLE acme.orders_payload (
+  order_key   VARCHAR,
+  payload     SUPER
+);
+
+COPY acme.orders_payload
+FROM 's3://<bucket>/bronze/acme/orders/'
+IAM_ROLE '<redshift-role>'
+FORMAT AS PARQUET;
 ```
 
-Iceberg has no such type, so the table deliberately carries **two schemas**:
-Iceberg metadata says `string` (Athena reads that; the merge writes text) and
-the catalog entry says `super` (Spectrum reads that). This setting is where
-that split is declared, and declaring it -- rather than editing the catalog
-by hand -- matters for two reasons:
+`COPY ... FORMAT AS PARQUET` reads the Iceberg table's underlying Parquet
+files directly (not through Spectrum) and can load a `string` column into a
+native `SUPER` column at Redshift's own size limit, not Spectrum's. This is
+materialization, not a live view: it runs on its own schedule (after Bronze,
+same as a Spectrum-reading view would need to), and a merge-based `COPY`
+pattern is needed to keep it current rather than re-loading from scratch.
+Confirm Redshift's own `SUPER` size ceiling against the actual documents
+before relying on this for arbitrarily large payloads -- it is a much larger
+number than Spectrum's, but not unlimited either.
 
-- **The loader accepts it.** Bronze compares each landing run's schema
-  against the catalog and refuses type changes, because for any undeclared
-  pair that is drift. A by-hand `super` was refused as `string -> super` and
-  blocked the load. A declared override is a match.
-- **It survives.** Athena rewrites the catalog columns from the Iceberg
-  schema on **every commit** -- `CREATE`, `ALTER TABLE`, and each `MERGE`.
-  Observed directly: applied before merging, `string` again after the first
-  merge. A by-hand edit therefore lasts until the next load. The loader
-  re-applies declared overrides after every DDL and after every merge.
-
-  The exposure that leaves is the seconds between a merge commit and the
-  re-apply that follows it. A Spectrum query landing in that window reads
-  the column as varchar. On a 15-minute schedule with merges that take
-  seconds, that is a small window, but it is not zero, and a consumer that
-  cannot tolerate it should read through a Redshift view that is refreshed
-  after the Bronze job, not during it.
-
-The re-apply goes through Glue's `UpdateTable` with the entry's `VersionId`
-as an optimistic lock. The same catalog entry holds Iceberg's
-`metadata_location` pointer, which Athena advances on every commit; a stale
-write there would rewind the pointer and corrupt the table, so a stale write
-fails instead. The Bronze role already holds `glue:UpdateTable` for schema
-evolution.
-
-A feed read only through Athena, or whose documents stay under 64 KB, needs
-none of this: `string` everywhere is correct, and the setting's absence is
-the default.
+A feed whose documents comfortably fit Spectrum's readable width, or one
+read only through Athena (which has no such limit), needs none of this.
 
 ### Table naming  (`bronze.table_prefix`)
 
