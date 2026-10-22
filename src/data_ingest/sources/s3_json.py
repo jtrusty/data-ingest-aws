@@ -8,8 +8,8 @@ comes from `document`. So the adapter carries no vocabulary from any one
 producer -- CloudEvents is one preset among others, not a built-in assumption.
 
 Envelope attributes become columns via `envelope_fields`. The payload is
-landed whole as `payload_json` and the outer record as `envelope_json`, so
-promoting payload fields to their own columns stays a Silver decision that
+landed whole as `payload_json` and, when `document.payload.path` names a
+payload inside it, the outer record as `envelope_json`, so promoting payload fields to their own columns stays a Silver decision that
 never requires re-landing.
 
 Folder hours must correspond to object upload time. The configured lookback
@@ -46,8 +46,8 @@ _MAX_ROW_BYTES = 30 * 1024 * 1024
 # count is the cost that matters downstream, so this is deliberately not
 # tiny -- see DocumentConfig.batch_bytes.
 _MAX_FETCH_SIZE = 5_000
-# Landed for every feed: S3 provenance, then the two JSON columns that keep
-# the record whole whatever the configured projection happens to select.
+# Landed for every feed: S3 provenance, then the JSON columns that keep the
+# record whole whatever the configured projection happens to select.
 _LINEAGE_COLUMNS = ('_source_record_id', '_s3_bucket', '_s3_key', '_s3_etag')
 # The payload is landed whole, as one column. Promoting individual payload
 # fields to columns is deliberately a Silver concern: the landing writer pins
@@ -135,13 +135,17 @@ class S3JsonSource(Source):
         self._document = s3_config.document
         self._discovery = s3_config.discovery
         self._cap_bound_last_run = False
+        # With no payload path the record IS the payload, so there is no
+        # separate envelope to keep: envelope_json would only duplicate it.
+        self._json_columns = (_JSON_COLUMNS if self._document.payload.path is not None
+                              else ('payload_json',))
         # Built per table rather than as a module constant: which envelope
         # columns exist is configuration. Order is fixed by the config so the
         # Parquet schema is stable from run to run.
         names = (
             *_LINEAGE_COLUMNS,
             *(column for column, _ in self._envelope_columns),
-            *_JSON_COLUMNS,
+            *self._json_columns,
         )
         self._schema = pa.schema(
             [(name, pa.string()) for name in names]
@@ -306,22 +310,21 @@ class S3JsonSource(Source):
         finally:
             body.close()
 
-    def _row(self, item, ordinal, envelope, payload, payload_json):
+    def _row(self, item, ordinal, envelope, payload_json):
         identity = json.dumps((self.bucket, item['Key'], item['ETag'], ordinal),
                               separators=(',', ':'), ensure_ascii=True).encode('utf-8')
-        return {
+        row = {
             '_source_record_id': hashlib.sha256(identity).hexdigest(),
             '_s3_bucket': self.bucket, '_s3_key': item['Key'], '_s3_etag': item['ETag'],
             '_s3_record_index': ordinal,
             _WATERMARK: _utc(item['LastModified']).replace(tzinfo=None),
             **{column: _value(_at_path(envelope, path), path)
                for column, path in self._envelope_columns},
-            # With no payload path the record IS the payload, and the decoder
-            # already serialized it once; dumps_json is a pure-Python walk, so
-            # don't pay for a byte-identical second copy.
-            'envelope_json': payload_json if envelope is payload else dumps_json(envelope),
             'payload_json': payload_json,
         }
+        if 'envelope_json' in self._json_columns:
+            row['envelope_json'] = dumps_json(envelope)
+        return row
 
     def _prefetched(self, items):
         """
@@ -353,8 +356,8 @@ class S3JsonSource(Source):
     def _rows(self, item, compressed):
         try:
             records = decode_records(compressed, document=self._document)
-            for ordinal, (envelope, payload, payload_json) in enumerate(records):
-                yield self._row(item, ordinal, envelope, payload, payload_json)
+            for ordinal, (envelope, _payload, payload_json) in enumerate(records):
+                yield self._row(item, ordinal, envelope, payload_json)
         except ExtractionError as exc:
             raise ExtractionError(
                 f'Failed to extract object s3://{self.bucket}/{item["Key"]}: {exc}'

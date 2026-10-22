@@ -438,7 +438,7 @@ def test_zero_lookahead_walks_only_to_high():
 def test_records_preset_serializes_each_record_once():
     # With no payload path the record is the payload. The decoder already
     # produced its text; dumps_json is a pure-Python walk, so the row must
-    # reuse it rather than build a byte-identical second copy.
+    # not build a second copy of it.
     from unittest.mock import patch
     import data_ingest.sources.s3_json as module
     source, client, _, _ = setup_source(preset='records')
@@ -446,8 +446,20 @@ def test_records_preset_serializes_each_record_once():
         'Body': io.BytesIO(gzip.compress(b'[{"id": 1}, {"id": 2}]')), 'ContentLength': 30}
     with patch.object(module, 'dumps_json', wraps=module.dumps_json) as spy:
         frame = list(source.extract(None, source.get_current_checkpoint()))[0]
-    assert list(frame['envelope_json']) == list(frame['payload_json']) == ['{"id":1}', '{"id":2}']
+    assert list(frame['payload_json']) == ['{"id":1}', '{"id":2}']
     assert spy.call_count == 0          # the decoder did it; the row did not repeat it
+
+
+def test_no_payload_path_omits_envelope_json():
+    # With no payload path there is no envelope distinct from the payload, so
+    # an envelope_json column would only duplicate payload_json.
+    source, client, _, _ = setup_source(preset='records')
+    client.get_object.return_value = {
+        'Body': io.BytesIO(gzip.compress(b'[{"id": 1}]')), 'ContentLength': 20}
+    frame = list(source.extract(None, source.get_current_checkpoint()))[0]
+    assert 'envelope_json' not in frame.columns
+    assert 'envelope_json' not in source.arrow_schema().names
+    pa.Table.from_pandas(frame, schema=source.arrow_schema(), preserve_index=False)
 
 
 # --- max_window_hours -------------------------------------------------------
