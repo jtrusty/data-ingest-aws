@@ -605,6 +605,11 @@ envelope_json, payload_json                        <- retained whole
 _source_record_id, _s3_last_modified, ...          <- lineage
 ```
 
+`envelope_json` exists only when `document.payload.path` is set. Without one
+the record is the payload, so the table has `payload_json` alone rather than
+two identical columns. A table that already has `envelope_json` keeps it;
+rows from runs that omit it read NULL there.
+
 Promoting payload fields to their own columns is a **Silver** decision:
 
 ```sql
@@ -914,7 +919,7 @@ Bronze retains these fields:
 
 | Columns | Meaning |
 |---|---|
-| `envelope_json` | Complete parent record, including all fields and `data_base64`; numeric precision is preserved. |
+| `envelope_json` | Complete parent record, including all fields and `data_base64`; numeric precision is preserved. Landed only when `document.payload.path` is set. |
 | `payload_json` | Full decoded JSON text, unchanged, including nested keys and arrays. |
 | `event_type`, `event_specversion`, `event_source`, `event_id`, `event_time`, `data_content_type` | CloudEvents core attributes, landed for every feed. |
 | configured `envelope_fields` | One string column per entry, for producer extensions past the CloudEvents core. In the example config: `group_id`, `business_date`, `historical_data_type`. |
