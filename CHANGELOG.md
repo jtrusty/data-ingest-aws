@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.6.0...v1.7.0) (2026-10-23)
+
+
+### Features
+
+* **s3_json:** omit envelope_json when there is no payload path ([#22](https://github.com/jtrusty/data-ingest-aws/issues/22)) ([59373de](https://github.com/jtrusty/data-ingest-aws/commit/59373dea2a99ba33fd58ae9247f632ec19ec1948))
+
+
+### Documentation
+
+* catalog_column_types/super does not fix Spectrum's width limit ([#20](https://github.com/jtrusty/data-ingest-aws/issues/20)) ([73fd24b](https://github.com/jtrusty/data-ingest-aws/commit/73fd24bc1c9d56943319c8fe51582d037d454b00))
+
 ## [1.6.0](https://github.com/jtrusty/data-ingest-aws/compare/v1.5.2...v1.6.0) (2026-09-25)
 
 
